@@ -115,6 +115,10 @@ type, public ::  ocean_public_type
     s_surf => NULL(), & !< SSS on t-cell [ppt]
     u_surf => NULL(), & !< i-velocity at the locations indicated by stagger [m s-1].
     v_surf => NULL(), & !< j-velocity at the locations indicated by stagger [m s-1].
+    u_surf_sym => NULL(), & !< i-velocity at the locations indicated by stagger 
+                            !! including symmetric points [m s-1].
+    v_surf_sym => NULL(), & !< j-velocity at the locations indicated by stagger 
+                            !! including symmetric points [m s-1].
     sea_lev => NULL(), & !< Sea level in m after correction for surface pressure,
                         !! i.e. dzt(1) + eta_t + patm/rho0/grav [m]
     frazil =>NULL(), &  !< Accumulated heating [J m-2] from frazil
@@ -792,6 +796,8 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
              Ocean_sfc%s_surf (isc:iec,jsc:jec), &
              Ocean_sfc%u_surf (isc:iec,jsc:jec), &
              Ocean_sfc%v_surf (isc:iec,jsc:jec), &
+             Ocean_sfc%u_surf_sym (isc-1:iec,jsc:jec), &
+             Ocean_sfc%v_surf_sym (isc:iec,jsc-1:jec), &
              Ocean_sfc%sea_lev(isc:iec,jsc:jec), &
              Ocean_sfc%area   (isc:iec,jsc:jec), &
              Ocean_sfc%melt_potential(isc:iec,jsc:jec), &
@@ -802,6 +808,8 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
   Ocean_sfc%s_surf(:,:)  = 0.0  ! time averaged sss (psu) passed to atmosphere/ice models
   Ocean_sfc%u_surf(:,:)  = 0.0  ! time averaged u-current (m/sec) passed to atmosphere/ice models
   Ocean_sfc%v_surf(:,:)  = 0.0  ! time averaged v-current (m/sec)  passed to atmosphere/ice models
+  Ocean_sfc%u_surf_sym(:,:)  = 0.0  ! time averaged u-current (m/sec) passed to atmosphere/ice models
+  Ocean_sfc%v_surf_sym(:,:)  = 0.0  ! time averaged v-current (m/sec)  passed to atmosphere/ice models
   Ocean_sfc%sea_lev(:,:) = 0.0  ! time averaged thickness of top model grid cell (m) plus patm/rho0/grav
   Ocean_sfc%frazil(:,:)  = 0.0  ! time accumulated frazil (J/m^2) passed to ice model
   Ocean_sfc%melt_potential(:,:)  = 0.0  ! time accumulated melt potential (J/m^2) passed to ice model
@@ -920,6 +928,12 @@ subroutine convert_state_to_ocean_type(sfc_state, Ocean_sfc, G, US, patm, press_
     do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd
       Ocean_sfc%u_surf(i,j) = G%mask2dCu(I+i0,j+j0)*US%L_T_to_m_s * sfc_state%u(I+i0,j+j0)
       Ocean_sfc%v_surf(i,j) = G%mask2dCv(i+i0,J+j0)*US%L_T_to_m_s * sfc_state%v(i+i0,J+j0)
+    enddo ; enddo
+    do j=jsc_bnd,jec_bnd ; do i=isc_bnd-1,iec_bnd
+      Ocean_sfc%u_surf_sym(i,j) = G%mask2dCu(I+i0,j+j0)*US%L_T_to_m_s * sfc_state%u(I+i0,j+j0)
+    enddo ; enddo
+    do j=jsc_bnd-1,jec_bnd ; do i=isc_bnd,iec_bnd    
+      Ocean_sfc%v_surf_sym(i,j) = G%mask2dCv(i+i0,J+j0)*US%L_T_to_m_s * sfc_state%v(i+i0,J+j0)
     enddo ; enddo
   else
     write(val_str, '(I8)') Ocean_sfc%stagger
@@ -1123,12 +1137,14 @@ subroutine ocean_public_type_chksum(id, timestep, ocn)
   outunit = stdout_if_root()
 
   if (root) write(outunit,*) "BEGIN CHECKSUM(ocean_type):: ", id, timestep
-  chks = field_chksum(ocn%t_surf ) ; if (root) write(outunit,100) 'ocean%t_surf   ', chks
-  chks = field_chksum(ocn%s_surf ) ; if (root) write(outunit,100) 'ocean%s_surf   ', chks
-  chks = field_chksum(ocn%u_surf ) ; if (root) write(outunit,100) 'ocean%u_surf   ', chks
-  chks = field_chksum(ocn%v_surf ) ; if (root) write(outunit,100) 'ocean%v_surf   ', chks
-  chks = field_chksum(ocn%sea_lev) ; if (root) write(outunit,100) 'ocean%sea_lev  ', chks
-  chks = field_chksum(ocn%frazil ) ; if (root) write(outunit,100) 'ocean%frazil   ', chks
+  chks = field_chksum(ocn%t_surf    ) ; if (root) write(outunit,100) 'ocean%t_surf    ', chks
+  chks = field_chksum(ocn%s_surf    ) ; if (root) write(outunit,100) 'ocean%s_surf    ', chks
+  chks = field_chksum(ocn%u_surf    ) ; if (root) write(outunit,100) 'ocean%u_surf    ', chks
+  chks = field_chksum(ocn%v_surf    ) ; if (root) write(outunit,100) 'ocean%v_surf    ', chks
+  chks = field_chksum(ocn%u_surf_sym) ; if (root) write(outunit,100) 'ocean%u_surf_sym', chks
+  chks = field_chksum(ocn%v_surf_sym) ; if (root) write(outunit,100) 'ocean%v_surf_sym', chks
+  chks = field_chksum(ocn%sea_lev   ) ; if (root) write(outunit,100) 'ocean%sea_lev   ', chks
+  chks = field_chksum(ocn%frazil    ) ; if (root) write(outunit,100) 'ocean%frazil    ', chks
   chks = field_chksum(ocn%melt_potential) ; if (root) write(outunit,100) 'ocean%melt_potential   ', chks
   call coupler_type_write_chksums(ocn%fields, outunit, 'ocean%')
 100 FORMAT("   CHECKSUM::",A20," = ",Z20)
