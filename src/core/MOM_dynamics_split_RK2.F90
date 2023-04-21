@@ -37,7 +37,7 @@ use MOM_time_manager,      only : time_type, time_type_to_real, operator(+)
 use MOM_time_manager,      only : operator(-), operator(>), operator(*), operator(/)
 
 use MOM_ALE,                   only : ALE_CS, ALE_remap_velocities
-use MOM_barotropic,            only : barotropic_init, btstep, btcalc, bt_mass_source
+use MOM_barotropic,            only : barotropic_init, btstep_0, btstep_1R, btcalc, bt_mass_source
 use MOM_barotropic,            only : register_barotropic_restarts, set_dtbt, barotropic_CS
 use MOM_barotropic,            only : barotropic_end
 use MOM_boundary_update,       only : update_OBC_data, update_OBC_CS
@@ -615,7 +615,11 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   if (showCallTree) call callTree_enter("btstep(), MOM_barotropic.F90")
   ! This is the predictor step call to btstep.
   ! The CS%ADp argument here stores the weights for certain integrated diagnostics.
-  call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+  call btstep_0(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+              CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+              CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
+  call btstep_1R(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
               eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
@@ -835,7 +839,11 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
 
   if (showCallTree) call callTree_enter("btstep(), MOM_barotropic.F90")
   ! This is the corrector step call to btstep.
-  call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+  call btstep_0(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+              CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+              CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av)
+  call btstep_1R(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
               eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av)
