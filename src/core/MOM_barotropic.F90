@@ -1214,49 +1214,9 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     endif
   endif
 
-! Calculate the initial barotropic velocities from the layer's velocities.
-  if (integral_BT_cont) then
-    !$OMP parallel do default(shared)
-    do j=jsvf-1,jevf+1 ; do I=isvf-2,ievf+1
-      ubt(I,j) = 0.0 ; uhbt(I,j) = 0.0 ; u_accel_bt(I,j) = 0.0
-      ubt_int(I,j) = 0.0 ; uhbt_int(I,j) = 0.0
-    enddo ; enddo
-    !$OMP parallel do default(shared)
-    do J=jsvf-2,jevf+1 ; do i=isvf-1,ievf+1
-      vbt(i,J) = 0.0 ; vhbt(i,J) = 0.0 ; v_accel_bt(i,J) = 0.0
-      vbt_int(i,J) = 0.0 ; vhbt_int(i,J) = 0.0
-    enddo ; enddo
-  else
-    !$OMP parallel do default(shared)
-    do j=jsvf-1,jevf+1 ; do I=isvf-2,ievf+1
-      ubt(I,j) = 0.0 ; uhbt(I,j) = 0.0 ; u_accel_bt(I,j) = 0.0
-    enddo ; enddo
-    !$OMP parallel do default(shared)
-    do J=jsvf-2,jevf+1 ; do i=isvf-1,ievf+1
-      vbt(i,J) = 0.0 ; vhbt(i,J) = 0.0 ; v_accel_bt(i,J) = 0.0
-    enddo ; enddo
-  endif
-  !$OMP parallel do default(shared)
-  do j=js,je ; do k=1,nz ; do I=is-1,ie
-    ubt(I,j) = ubt(I,j) + wt_u(I,j,k) * U_in(I,j,k)
-  enddo ; enddo ; enddo
-  !$OMP parallel do default(shared)
-  do J=js-1,je ; do k=1,nz ; do i=is,ie
-    vbt(i,J) = vbt(i,J) + wt_v(i,J,k) * V_in(i,J,k)
-  enddo ; enddo ;  enddo
-  !$OMP parallel do default(shared)
-  do j=js,je ; do I=is-1,ie
-    if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
-  enddo ; enddo
-  !$OMP parallel do default(shared)
-  do J=js-1,je ; do i=is,ie
-    if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
-  enddo ; enddo
-
-  if (apply_OBCs) then
-    ubt_first(:,:) = ubt(:,:) ; vbt_first(:,:) = vbt(:,:)
-  endif
-
+  call btstep_ubt_from_layer(U_in, V_in, wt_u, wt_v, ubt, vbt, u_accel_bt, v_accel_bt, &
+                  uhbt, vhbt, ubt_int, vbt_int, uhbt_int, vhbt_int, ubt_first, vbt_first, &
+                  BT_cont, apply_OBCs, G, GV, CS)
 !   Here the vertical average accelerations due to the Coriolis, advective,
 ! pressure gradient and horizontal viscous terms in the layer momentum
 ! equations are calculated.  These will be used to determine the difference
@@ -2742,6 +2702,114 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   endif
 
 end subroutine btstep
+
+
+subroutine btstep_ubt_from_layer(U_in, V_in, wt_u, wt_v, ubt, vbt, u_accel_bt, v_accel_bt, &
+                  uhbt, vhbt, ubt_int, vbt_int, uhbt_int, vhbt_int, ubt_first, vbt_first, &
+                  BT_cont, apply_OBCs, G, GV, CS)
+  type(barotropic_CS),                     intent(inout) :: CS      !< Barotropic control structure
+  type(ocean_grid_type),                   intent(inout) :: G       !< The ocean's grid structure.
+  type(verticalGrid_type),                   intent(in)  :: GV      !< The ocean's vertical grid structure.
+  type(BT_cont_type),                         pointer    :: BT_cont      !< A structure with elements that describe
+                                                         !! the effective open face areas as a function of barotropic
+                                                         !! flow.  
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), intent(in)  :: U_in    !< The initial (3-D) zonal
+                                                                    !! velocity [L T-1 ~> m s-1].
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), intent(in)  :: V_in    !< The initial (3-D) meridional
+                                                                    !! velocity [L T-1 ~> m s-1].       
+                                                                    
+  real, intent(in) :: wt_u(SZIB_(G),SZJ_(G),SZK_(GV)) ! wt_u and wt_v are the
+  real, intent(in) :: wt_v(SZI_(G),SZJB_(G),SZK_(GV)) ! normalized weights to
+                ! be used in calculating barotropic velocities, possibly with
+                ! sums less than one due to viscous losses [nondim]
+                                                                  
+  logical, intent(in) :: apply_OBCs
+  
+  real, dimension(SZIBW_(CS),SZJW_(CS)), intent(out) :: &
+    ubt, &        ! The zonal barotropic velocity [L T-1 ~> m s-1].
+    u_accel_bt, & ! The difference between the zonal acceleration from the
+                  ! barotropic calculation and BT_force_u [L T-2 ~> m s-2].
+    uhbt, &       ! The zonal barotropic thickness fluxes [H L2 T-1 ~> m3 s-1 or kg s-1].
+    ubt_int, &    ! The running time integral of ubt over the time steps [L ~> m].
+    uhbt_int, &   ! The running time integral of uhbt over the time steps [H L2  ~> m3].
+    ubt_first     ! The starting value of ubt in a series of barotropic steps [L T-1 ~> m s-1].
+  real, dimension(SZIW_(CS),SZJBW_(CS)), intent(out) :: &
+    vbt, &        ! The meridional barotropic velocity [L T-1 ~> m s-1].
+    v_accel_bt, & ! The difference between the meridional acceleration from the
+                  ! barotropic calculation and BT_force_v [L T-2 ~> m s-2].
+    vhbt, &       ! The meridional barotropic thickness fluxes [H L2 T-1 ~> m3 s-1 or kg s-1].
+    vbt_int,&     ! The running time integral of vbt over the time steps [L ~> m].      
+    vhbt_int, &   ! The running time integral of uhbt over the time steps [H L2  ~> m3].                                     
+    vbt_first     ! The starting value of ubt in a series of barotropic steps [L T-1 ~> m s-1].
+  
+! local
+  logical :: use_BT_cont
+  logical :: integral_BT_cont ! If true, update the barotropic continuity equation directly
+                      ! from the initial condition using the time-integrated barotropic velocity.
+  integer :: stencil  ! The stencil size of the algorithm, often 1 or 2.
+  integer :: i, j, k, n
+  integer :: is, ie, js, je, nz, Isq, Ieq, Jsq, Jeq
+  integer :: isvf, ievf, jsvf, jevf, num_cycles
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
+  
+  use_BT_cont = associated(BT_cont)
+  integral_BT_cont = use_BT_cont .and. CS%integral_BT_cont
+  
+  ! Figure out the fullest arrays that could be updated.
+  stencil = 1
+  if ((.not.use_BT_cont) .and. CS%Nonlinear_continuity .and. &
+      (CS%Nonlin_cont_update_period > 0)) stencil = 2
+      
+  num_cycles = 1
+  if (CS%use_wide_halos) &
+    num_cycles = min((is-CS%isdw) / stencil, (js-CS%jsdw) / stencil)
+  isvf = is - (num_cycles-1)*stencil ; ievf = ie + (num_cycles-1)*stencil
+  jsvf = js - (num_cycles-1)*stencil ; jevf = je + (num_cycles-1)*stencil
+  
+  if (integral_BT_cont) then
+    !$OMP parallel do default(shared)
+    do j=jsvf-1,jevf+1 ; do I=isvf-2,ievf+1
+      ubt(I,j) = 0.0 ; uhbt(I,j) = 0.0 ; u_accel_bt(I,j) = 0.0
+      ubt_int(I,j) = 0.0 ; uhbt_int(I,j) = 0.0
+    enddo ; enddo
+    !$OMP parallel do default(shared)
+    do J=jsvf-2,jevf+1 ; do i=isvf-1,ievf+1
+      vbt(i,J) = 0.0 ; vhbt(i,J) = 0.0 ; v_accel_bt(i,J) = 0.0
+      vbt_int(i,J) = 0.0 ; vhbt_int(i,J) = 0.0
+    enddo ; enddo
+  else
+    !$OMP parallel do default(shared)
+    do j=jsvf-1,jevf+1 ; do I=isvf-2,ievf+1
+      ubt(I,j) = 0.0 ; uhbt(I,j) = 0.0 ; u_accel_bt(I,j) = 0.0
+    enddo ; enddo
+    !$OMP parallel do default(shared)
+    do J=jsvf-2,jevf+1 ; do i=isvf-1,ievf+1
+      vbt(i,J) = 0.0 ; vhbt(i,J) = 0.0 ; v_accel_bt(i,J) = 0.0
+    enddo ; enddo
+  endif
+  !$OMP parallel do default(shared)
+  do j=js,je ; do k=1,nz ; do I=is-1,ie
+    ubt(I,j) = ubt(I,j) + wt_u(I,j,k) * U_in(I,j,k)
+  enddo ; enddo ; enddo
+  !$OMP parallel do default(shared)
+  do J=js-1,je ; do k=1,nz ; do i=is,ie
+    vbt(i,J) = vbt(i,J) + wt_v(i,J,k) * V_in(i,J,k)
+  enddo ; enddo ;  enddo
+  !$OMP parallel do default(shared)
+  do j=js,je ; do I=is-1,ie
+    if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
+  enddo ; enddo
+  !$OMP parallel do default(shared)
+  do J=js-1,je ; do i=is,ie
+    if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
+  enddo ; enddo
+
+  if (apply_OBCs) then
+    ubt_first(:,:) = ubt(:,:) ; vbt_first(:,:) = vbt(:,:)
+  endif
+
+end subroutine btstep_ubt_from_layer
 
 !> 
 subroutine btstep_layer_accel(dt, u_accel_bt, v_accel_bt, pbce, gtot_E, gtot_W, gtot_N, gtot_S, &
