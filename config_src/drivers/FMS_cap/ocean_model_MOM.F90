@@ -428,7 +428,8 @@ end subroutine ocean_model_init
 !! storing the new ocean properties in Ocean_state.
 subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_update, &
                               Ocean_coupling_time_step, update_dyn, update_thermo, &
-                              Ocn_fluxes_used, start_cycle, end_cycle, cycle_length)
+                              Ocn_fluxes_used, start_cycle, end_cycle, cycle_length, &
+                              do_stage)
   type(ice_ocean_boundary_type), &
                      intent(in)    :: Ice_ocean_boundary !< A structure containing the various
                                               !! forcing fields coming from the ice and atmosphere.
@@ -456,7 +457,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
                                               !! treated as the last call to step_MOM in a
                                               !! time-stepping cycle; missing is like true.
   real,    optional, intent(in)    :: cycle_length !< The duration of a coupled time stepping cycle [s].
-
+  integer, optional, intent(in)    :: do_stage !! integer for which part of the ocean model update
+                                               !! to do. If 0 (zero) then do all the parts of the update. 
   ! Local variables
   type(time_type) :: Time_seg_start ! Stores the dynamic or thermodynamic ocean model time at the
                             ! start of this call to allow step_MOM to temporarily change the time
@@ -480,6 +482,7 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
   logical :: do_dyn         ! If true, step the ocean dynamics and transport.
   logical :: do_thermo      ! If true, step the ocean thermodynamics.
   logical :: step_thermo    ! If true, take a thermodynamic step.
+  integer :: stage          ! The stage of do_stage
   integer :: is, ie, js, je
 
   call callTree_enter("update_ocean_model(), ocean_model_MOM.F90")
@@ -506,6 +509,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
       "update_ocean_model called without updating either dynamics or thermodynamics.")
   if (do_dyn .and. do_thermo .and. (OS%Time /= OS%Time_dyn)) call MOM_error(FATAL, &
       "update_ocean_model called to update both dynamics and thermodynamics with inconsistent clocks.")
+
+  stage = 0 ; if (present(do_stage)) stage = do_stage
 
   ! This is benign but not necessary if ocean_model_init_sfc was called or if
   ! OS%sfc_state%tr_fields was spawned in ocean_model_init.  Consider removing it.

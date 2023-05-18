@@ -1832,6 +1832,11 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
   endif
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
+  if (CS%debug) call hchksum(u_h, "before set_diffusivity u_h",G%HI)
+  if (CS%debug) call hchksum(v_h, "before set_diffusivity v_h",G%HI)
+  if (CS%debug) call MOM_forcing_chksum("after set_diffusivity ", fluxes, G, US, haloshift=0)
+  if (CS%debug) call MOM_thermovar_chksum("after set_diffusivity ", tv, G, US)
+
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_int, G, GV, US, &
                          CS%set_diff_CSp, Kd_lay=Kd_lay, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)

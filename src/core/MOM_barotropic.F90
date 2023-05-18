@@ -380,6 +380,15 @@ type, private :: memory_size_type
   !>@}
 end type memory_size_type
 
+type, private :: local_BT_Cor_force
+  real, allocatable :: &
+    azon, bzon, & ! _zon and _mer are the values of the Coriolis force which
+    czon, dzon, & ! are applied to the neighboring values of vbtav and ubtav,
+    amer, bmer, & ! respectively to get the barotropic inertial rotation
+    cmer, dmer    ! [T-1 ~> s-1].  
+end type local_BT_Cor_force
+
+
 !>@{ CPU time clock IDs
 integer :: id_clock_sync=-1, id_clock_calc=-1
 integer :: id_clock_calc_pre=-1, id_clock_calc_post=-1
@@ -533,11 +542,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     uhbt_sum, &   ! The sum of uhbt over the time steps [H L2 T-1 ~> m3 s-1 or kg s-1].
     uhbt_int, &   ! The running time integral of uhbt over the time steps [H L2  ~> m3].
     ubt_wtd, &    ! A weighted sum used to find the filtered final ubt [L T-1 ~> m s-1].
-    ubt_trans, &  ! The latest value of ubt used for a transport [L T-1 ~> m s-1].
-    azon, bzon, & ! _zon and _mer are the values of the Coriolis force which
-    czon, dzon, & ! are applied to the neighboring values of vbtav and ubtav,
-    amer, bmer, & ! respectively to get the barotropic inertial rotation
-    cmer, dmer, & ! [T-1 ~> s-1].
+    ubt_trans, &  ! The latest value of ubt used for a transport [L T-1 ~> m s-1].    
     Cor_u, &      ! The zonal Coriolis acceleration [L T-2 ~> m s-2].
     Cor_ref_u, &  ! The zonal barotropic Coriolis acceleration due
                   ! to the reference velocities [L T-2 ~> m s-2].
@@ -614,6 +619,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     BTCL_u        ! A repackaged version of the u-point information in BT_cont.
   type(local_BT_cont_v_type), dimension(SZIW_(CS),SZJBW_(CS)) :: &
     BTCL_v        ! A repackaged version of the v-point information in BT_cont.
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)) :: BTL_SF ! Coriolis and gravitational forces
   ! End of wide-sized variables.
 
   real, dimension(SZIBW_(CS),SZJW_(CS)) :: &
@@ -1344,42 +1350,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
   ! Determine the weighted Coriolis parameters for the neighboring velocities.
   !$OMP parallel do default(shared)
-  do J=jsvf-1,jevf ; do i=isvf-1,ievf+1
-    if (CS%Sadourny) then
-      amer(I-1,j) = DCor_u(I-1,j) * q(I-1,J)
-      bmer(I,j) = DCor_u(I,j) * q(I,J)
-      cmer(I,j+1) = DCor_u(I,j+1) * q(I,J)
-      dmer(I-1,j+1) = DCor_u(I-1,j+1) * q(I-1,J)
-    else
-      amer(I-1,j) = DCor_u(I-1,j) * &
-                    ((q(I,J) + q(I-1,J-1)) + q(I-1,J)) / 3.0
-      bmer(I,j) = DCor_u(I,j) * &
-                  (q(I,J) + (q(I-1,J) + q(I,J-1))) / 3.0
-      cmer(I,j+1) = DCor_u(I,j+1) * &
-                    (q(I,J) + (q(I-1,J) + q(I,J+1))) / 3.0
-      dmer(I-1,j+1) = DCor_u(I-1,j+1) * &
-                      ((q(I,J) + q(I-1,J+1)) + q(I-1,J)) / 3.0
-    endif
-  enddo ; enddo
-
-  !$OMP parallel do default(shared)
-  do j=jsvf-1,jevf+1 ; do I=isvf-1,ievf
-    if (CS%Sadourny) then
-      azon(I,j) = DCor_v(i+1,J) * q(I,J)
-      bzon(I,j) = DCor_v(i,J) * q(I,J)
-      czon(I,j) = DCor_v(i,J-1) * q(I,J-1)
-      dzon(I,j) = DCor_v(i+1,J-1) * q(I,J-1)
-    else
-      azon(I,j) = DCor_v(i+1,J) * &
-                  (q(I,J) + (q(I+1,J) + q(I,J-1))) / 3.0
-      bzon(I,j) = DCor_v(i,J) * &
-                  (q(I,J) + (q(I-1,J) + q(I,J-1))) / 3.0
-      czon(I,j) = DCor_v(i,J-1) * &
-                  ((q(I,J) + q(I-1,J-1)) + q(I,J-1)) / 3.0
-      dzon(I,j) = DCor_v(i+1,J-1) * &
-                  ((q(I,J) + q(I+1,J-1)) + q(I,J-1)) / 3.0
-    endif
-  enddo ; enddo
+  call btstep_find_Cor(q, DCor_u, DCor_v, BTL_SF, isvf, ievf, jsvf, jevf, CS)
 
 ! Complete the previously initiated message passing.
   if (id_clock_calc_pre > 0) call cpu_clock_end(id_clock_calc_pre)
@@ -1403,17 +1374,17 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     if (CS%va_polarity(i,j) < 0.0) call swap(gtot_N(i,j), gtot_S(i,j))
   enddo ; enddo
 
-  !$OMP parallel do default(shared)
+  !$OMP parallel do (shared)
   do j=js,je ; do I=is-1,ie
     Cor_ref_u(I,j) =  &
-        ((azon(I,j) * vbt_Cor(i+1,j) + czon(I,j) * vbt_Cor(i  ,j-1)) + &
-         (bzon(I,j) * vbt_Cor(i  ,j) + dzon(I,j) * vbt_Cor(i+1,j-1)))
+        ((BTL_SF(I,j)%azon * vbt_Cor(i+1,j) + BTL_SF(I,j)%czon * vbt_Cor(i  ,j-1)) + &
+         (BTL_SF(I,j)%bzon * vbt_Cor(i  ,j) + BTL_SF(I,j)%dzon * vbt_Cor(i+1,j-1)))
   enddo ; enddo
   !$OMP parallel do default(shared)
   do J=js-1,je ; do i=is,ie
     Cor_ref_v(i,J) = -1.0 * &
-        ((amer(I-1,j) * ubt_Cor(I-1,j) + cmer(I  ,j+1) * ubt_Cor(I  ,j+1)) + &
-         (bmer(I  ,j) * ubt_Cor(I  ,j) + dmer(I-1,j+1) * ubt_Cor(I-1,j+1)))
+        ((BTL_SF(I-1,j)%amer * ubt_Cor(I-1,j) + BTL_SF(I  ,j+1)%cmer * ubt_Cor(I  ,j+1)) + &
+         (BTL_SF(I  ,j)%bmer * ubt_Cor(I  ,j) + BTL_SF(I-1,j+1)%dmer * ubt_Cor(I-1,j+1)))
   enddo ; enddo
 
   ! Now start new halo updates.
@@ -1766,7 +1737,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       !$OMP do schedule(static)
       call btloop_update_v_first(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, vhbt_int, &
                            Cor_v, PFv, isv, iev, jsv, jev, &
-                           amer, bmer, cmer, dmer, bt_rem_v, BT_force_v, vhbt0, Datv, &
+                           BTL_SF, bt_rem_v, BT_force_v, vhbt0, Datv, &
                            BTCL_v, vbt_prev, vhbt_prev, vhbt_int_prev, Cor_ref_v, Rayleigh_v, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -1775,7 +1746,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       !$OMP do schedule(static) 
       call btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, uhbt_int, &
                            Cor_u, PFu, isv, iev, jsv, jev, &
-                           azon, bzon, czon, dzon, bt_rem_u, BT_force_u, uhbt0, Datu, &
+                           BTL_SF, bt_rem_u, BT_force_u, uhbt0, Datu, &
                            BTCL_u, ubt_prev, uhbt_prev, uhbt_int_prev, Cor_ref_u, Rayleigh_u, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -1785,7 +1756,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       !$OMP do schedule(static)
       call btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, uhbt_int, &
                            Cor_u, PFu, isv, iev, jsv, jev, &
-                           azon, bzon, czon, dzon, bt_rem_u, BT_force_u, uhbt0, Datu, &
+                           BTL_SF, bt_rem_u, BT_force_u, uhbt0, Datu, &
                            BTCL_u, ubt_prev, uhbt_prev, uhbt_int_prev, Cor_ref_u, Rayleigh_u, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -1793,7 +1764,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       ! Now update the meridional velocity.
       call btloop_update_v_second(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, vhbt_int, &
                            Cor_v, PFv, isv, iev, jsv, jev, &
-                           amer, bmer, cmer, dmer, bt_rem_v, BT_force_v, vhbt0, Datv, &
+                           BTL_SF, bt_rem_v, BT_force_v, vhbt0, Datv, &
                            BTCL_v, vbt_prev, vhbt_prev, vhbt_int_prev, Cor_ref_v, Rayleigh_v, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -2084,6 +2055,30 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   call btstep_layer_accel(dt, u_accel_bt, v_accel_bt, pbce, gtot_E, gtot_W, gtot_N, gtot_S, &
                               e_anom, G, GV, CS, accel_layer_u, accel_layer_v)
 
+
+! TJM 
+! The EVP function from the SIS2 model
+!  call EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
+!                    fxat, fyat, fxoc, fyoc, pres_mice, diag_val, del_sh_min_pr, &
+!                    ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc, &
+!                    mi_u, f2dt_u, I1_f2dt2_u, PFu, mi_v, f2dt_v, I1_f2dt2_v, PFv, &
+!                    azon, bzon, czon, dzon, amer, bmer, cmer, dmer, &
+!                    mi_ratio_A_q,  &
+!                    G, US, CS)
+! In need from sea-ice: ci, ui, vi, mice, pres_mice, diag_val (?), del_sh_min_pr (?),
+!                       ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc,
+!                       mi_u, f2dt_u, I1_f2dt2_u, mi_v, f2dt_v, I1_f2dt2_v, 
+!                       azon, bzon, czon, dzon, amer, bmer, cmer, dmer, mi_ratio_A_q
+! Could get somewhere else: fxat, fyat, dt_slow (?)
+! need new version from btstep: uo, vo, PFu, PFv (PF ~ sea level) 
+! Out: pass to SIS2: ui, vi
+! Out: pass to bt_step: fxoc, fyoc
+
+
+
+
+
+
   if (apply_OBCs) then
     ! Correct the accelerations at OBC velocity points, but only in the
     ! symmetric-memory computational domain, not in the wide halo regions.
@@ -2291,6 +2286,59 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   endif
 
 end subroutine btstep
+
+subroutine btstep_find_Cor(q, DCor_u, DCor_v, BTL_SF, isvf, ievf, jsvf, jevf, CS)
+  type(barotropic_CS),                       intent(inout) :: CS           !< Barotropic control structure
+  real, intent(in) :: q(SZIBW_(CS),SZJBW_(CS))  ! A pseudo potential vorticity [T-1 Z-1 ~> s-1 m-1]
+                  ! or [T-1 H-1 ~> s-1 m-1 or m2 s-1 kg-1]
+  real, dimension(SZIBW_(CS),SZJW_(CS)), intent(in) :: &
+    DCor_u        ! An averaged depth or total thickness at u points [Z ~> m] or [H ~> m or kg m-2].
+  real, dimension(SZIW_(CS),SZJBW_(CS)), intent(in) :: &
+    DCor_v        ! An averaged depth or total thickness at v points [Z ~> m] or [H ~> m or kg m-2].
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)), intent(inout) :: BTL_SF ! Coriolis and gravitational forces
+
+  integer, intent(in) :: isvf, ievf, jsvf, jevf
+  integer :: i, j, k, n
+
+  !$OMP parallel do default(shared)
+  do J=jsvf-1,jevf ; do i=isvf-1,ievf+1
+    if (CS%Sadourny) then
+      BTL_SF(I-1,j)%amer = DCor_u(I-1,j) * q(I-1,J)
+      BTL_SF(I,j)%bmer = DCor_u(I,j) * q(I,J)
+      BTL_SF(I,j+1)%cmer = DCor_u(I,j+1) * q(I,J)
+      BTL_SF(I-1,j+1)%dmer = DCor_u(I-1,j+1) * q(I-1,J)
+    else
+      BTL_SF(I-1,j)%amer = DCor_u(I-1,j) * &
+                    ((q(I,J) + q(I-1,J-1)) + q(I-1,J)) / 3.0
+      BTL_SF(I,j)%bmer = DCor_u(I,j) * &
+                  (q(I,J) + (q(I-1,J) + q(I,J-1))) / 3.0
+      BTL_SF(I,j+1)%cmer = DCor_u(I,j+1) * &
+                    (q(I,J) + (q(I-1,J) + q(I,J+1))) / 3.0
+      BTL_SF(I-1,j+1)%dmer = DCor_u(I-1,j+1) * &
+                      ((q(I,J) + q(I-1,J+1)) + q(I-1,J)) / 3.0
+    endif
+  enddo ; enddo
+
+  !$OMP parallel do default(shared)
+  do j=jsvf-1,jevf+1 ; do I=isvf-1,ievf
+    if (CS%Sadourny) then
+      BTL_SF(I,j)%azon = DCor_v(i+1,J) * q(I,J)
+      BTL_SF(I,j)%bzon = DCor_v(i,J) * q(I,J)
+      BTL_SF(I,j)%czon = DCor_v(i,J-1) * q(I,J-1)
+      BTL_SF(I,j)%dzon = DCor_v(i+1,J-1) * q(I,J-1)
+    else
+      BTL_SF(I,j)%azon = DCor_v(i+1,J) * &
+                  (q(I,J) + (q(I+1,J) + q(I,J-1))) / 3.0
+      BTL_SF(I,j)%bzon = DCor_v(i,J) * &
+                  (q(I,J) + (q(I-1,J) + q(I,J-1))) / 3.0
+      BTL_SF(I,j)%czon = DCor_v(i,J-1) * &
+                  ((q(I,J) + q(I-1,J-1)) + q(I,J-1)) / 3.0
+      BTL_SF(I,j)%dzon = DCor_v(i+1,J-1) * &
+                  ((q(I,J) + q(I+1,J-1)) + q(I,J-1)) / 3.0
+    endif
+  enddo ; enddo
+end subroutine btstep_find_Cor
+
 
 subroutine btloop_setup(n, dt, dtbt, ubt, vbt, eta,  ubt_int, vbt_int, uhbt_int, vhbt_int, &
                         Datu, Datv, ubt_int_prev, vbt_int_prev, uhbt_int_prev, vhbt_int_prev, &
@@ -2586,40 +2634,40 @@ subroutine btloop_setup_OBCs(n, apply_OBCs, apply_OBC_flather, apply_OBC_open, &
   integer :: i, j, k
   integer :: ioff, joff
 
- if (apply_OBC_flather .or. apply_OBC_open) then
-      !$OMP do
-      do j=jsv,jev ; do I=isv-2,iev+1
-        ubt_old(I,j) = ubt(I,j)
-      enddo ; enddo
-      !$OMP do
-      do J=jsv-2,jev+1 ; do i=isv,iev
-        vbt_old(i,J) = vbt(i,J)
-      enddo ; enddo
-    endif
+  if (apply_OBC_flather .or. apply_OBC_open) then
+     !$OMP do
+     do j=jsv,jev ; do I=isv-2,iev+1
+       ubt_old(I,j) = ubt(I,j)
+     enddo ; enddo
+     !$OMP do
+     do J=jsv-2,jev+1 ; do i=isv,iev
+       vbt_old(i,J) = vbt(i,J)
+     enddo ; enddo
+   endif
 
-    if (apply_OBCs) then
-      if (MOD(n+G%first_direction,2)==1) then
-        ioff = 1; joff = 0
-      else
-        ioff = 0; joff = 1
-      endif
+   if (apply_OBCs) then
+     if (MOD(n+G%first_direction,2)==1) then
+       ioff = 1; joff = 0
+     else
+       ioff = 0; joff = 1
+     endif
 
-      if (CS%BT_OBC%apply_u_OBCs) then  ! save the old value of ubt and uhbt
-        !$OMP do
-        do j=jsv-joff,jev+joff ; do I=isv-1,iev
-          ubt_prev(I,j) = ubt(I,j) ; uhbt_prev(I,j) = uhbt(I,j)
-          ubt_sum_prev(I,j) = ubt_sum(I,j) ; uhbt_sum_prev(I,j) = uhbt_sum(I,j) ; ubt_wtd_prev(I,j) = ubt_wtd(I,j)
-        enddo ; enddo
-      endif
+     if (CS%BT_OBC%apply_u_OBCs) then  ! save the old value of ubt and uhbt
+       !$OMP do
+       do j=jsv-joff,jev+joff ; do I=isv-1,iev
+         ubt_prev(I,j) = ubt(I,j) ; uhbt_prev(I,j) = uhbt(I,j)
+         ubt_sum_prev(I,j) = ubt_sum(I,j) ; uhbt_sum_prev(I,j) = uhbt_sum(I,j) ; ubt_wtd_prev(I,j) = ubt_wtd(I,j)
+       enddo ; enddo
+     endif
 
-      if (CS%BT_OBC%apply_v_OBCs) then  ! save the old value of vbt and vhbt
-        !$OMP do
-        do J=jsv-1,jev ; do i=isv-ioff,iev+ioff
-          vbt_prev(i,J) = vbt(i,J) ; vhbt_prev(i,J) = vhbt(i,J)
-          vbt_sum_prev(i,J) = vbt_sum(i,J) ; vhbt_sum_prev(i,J) = vhbt_sum(i,J) ; vbt_wtd_prev(i,J) = vbt_wtd(i,J)
-        enddo ; enddo
-      endif
-    endif
+     if (CS%BT_OBC%apply_v_OBCs) then  ! save the old value of vbt and vhbt
+       !$OMP do
+       do J=jsv-1,jev ; do i=isv-ioff,iev+ioff
+         vbt_prev(i,J) = vbt(i,J) ; vhbt_prev(i,J) = vhbt(i,J)
+         vbt_sum_prev(i,J) = vbt_sum(i,J) ; vhbt_sum_prev(i,J) = vhbt_sum(i,J) ; vbt_wtd_prev(i,J) = vbt_wtd(i,J)
+       enddo ; enddo
+     endif
+   endif
     
 end subroutine btloop_setup_OBCs    
     
@@ -2627,7 +2675,7 @@ end subroutine btloop_setup_OBCs
 
 subroutine btloop_update_v_first(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, vhbt_int, &
                            Cor_v, PFv, isv, iev, jsv, jev, &                           
-                           amer, bmer, cmer, dmer, bt_rem_v, BT_force_v, vhbt0, Datv, &
+                           BTL_SF, bt_rem_v, BT_force_v, vhbt0, Datv, &
                            BTCL_v, vbt_prev, vhbt_prev, vhbt_int_prev, Cor_ref_v, Rayleigh_v, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -2639,10 +2687,10 @@ subroutine btloop_update_v_first(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, v
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
   type(barotropic_CS),                       intent(inout) :: CS           !< Barotropic control structure
   type(ocean_OBC_type),                       pointer    :: OBC          !< The open boundary condition structure.
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)), intent(in) :: BTL_SF ! Coriolis and gravitational forces
+    
   real, dimension(SZIBW_(CS),SZJW_(CS)), intent(inout) :: &
-    ubt, &        ! The zonal barotropic velocity [L T-1 ~> m s-1].
-    amer, bmer, & ! respectively to get the barotropic inertial rotation
-    cmer, dmer ! [T-1 ~> s-1]
+    ubt           ! The zonal barotropic velocity [L T-1 ~> m s-1].
   real, dimension(SZIW_(CS),SZJBW_(CS)), intent(inout) :: &
     vbt, &        ! The meridional barotropic velocity [L T-1 ~> m s-1].
     bt_rem_v, &   ! The fraction of the barotropic meridional velocity that
@@ -2719,10 +2767,10 @@ subroutine btloop_update_v_first(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, v
   integer :: l_seg
 
   Idtbt = 1.0 / dtbt
-  
+
       do J=jsv-1,jev ; do i=isv-1,iev+1
-      Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
-             (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+      Cor_v(i,J) = -1.0*((BTL_SF(I-1,j)%amer * ubt(I-1,j) + BTL_SF(I,j+1)%cmer * ubt(I,j+1)) + &
+             (BTL_SF(I,j)%bmer * ubt(I,j) + BTL_SF(I-1,j+1)%dmer * ubt(I-1,j+1))) - Cor_ref_v(i,J)
       PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                    (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
                  dgeo_de * CS%IdyCv(i,J)
@@ -2798,7 +2846,7 @@ end subroutine btloop_update_v_first
 
 subroutine btloop_update_v_second(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, vhbt_int, &
                            Cor_v, PFv, isv, iev, jsv, jev, &                           
-                           amer, bmer, cmer, dmer, bt_rem_v, BT_force_v, vhbt0, Datv, &
+                           BTL_SF, bt_rem_v, BT_force_v, vhbt0, Datv, &
                            BTCL_v, vbt_prev, vhbt_prev, vhbt_int_prev, Cor_ref_v, Rayleigh_v, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -2810,10 +2858,10 @@ subroutine btloop_update_v_second(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, 
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
   type(barotropic_CS),                       intent(inout) :: CS           !< Barotropic control structure
   type(ocean_OBC_type),                       pointer    :: OBC          !< The open boundary condition structure.
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)), intent(in) :: BTL_SF ! Coriolis and gravitational forces
+    
   real, dimension(SZIBW_(CS),SZJW_(CS)), intent(inout) :: &
-    ubt, &        ! The zonal barotropic velocity [L T-1 ~> m s-1].
-    amer, bmer, & ! respectively to get the barotropic inertial rotation
-    cmer, dmer ! [T-1 ~> s-1]
+    ubt           ! The zonal barotropic velocity [L T-1 ~> m s-1].
   real, dimension(SZIW_(CS),SZJBW_(CS)), intent(inout) :: &
     vbt, &        ! The meridional barotropic velocity [L T-1 ~> m s-1].
     bt_rem_v, &   ! The fraction of the barotropic meridional velocity that
@@ -2890,12 +2938,12 @@ subroutine btloop_update_v_second(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, 
   integer :: l_seg
 
   Idtbt = 1.0 / dtbt
-  
+ 
       if (CS%use_old_coriolis_bracket_bug) then
        !$OMP do schedule(static)
        do J=jsv-1,jev ; do i=isv,iev
-         Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + bmer(I,j) * ubt(I,j)) + &
-                 (cmer(I,j+1) * ubt(I,j+1) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+         Cor_v(i,J) = -1.0*((BTL_SF(I-1,j)%amer * ubt(I-1,j) + BTL_SF(I,j)%bmer * ubt(I,j)) + &
+                 (BTL_SF(I,j+1)%cmer * ubt(I,j+1) + BTL_SF(I-1,j+1)%dmer * ubt(I-1,j+1))) - Cor_ref_v(i,J)
          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                       (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
                      dgeo_de * CS%IdyCv(i,J)
@@ -2904,8 +2952,8 @@ subroutine btloop_update_v_second(n, dtbt, ubt, vbt, v_accel_bt, vhbt, vbt_int, 
       else
        !$OMP do schedule(static)
        do J=jsv-1,jev ; do i=isv,iev
-         Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
-                 (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+         Cor_v(i,J) = -1.0*((BTL_SF(I-1,j)%amer * ubt(I-1,j) + BTL_SF(I,j+1)%cmer * ubt(I,j+1)) + &
+                 (BTL_SF(I,j)%bmer * ubt(I,j) + BTL_SF(I-1,j+1)%dmer * ubt(I-1,j+1))) - Cor_ref_v(i,J)
          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                       (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
                      dgeo_de * CS%IdyCv(i,J)
@@ -2983,7 +3031,7 @@ end subroutine btloop_update_v_second
 
 subroutine btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, uhbt_int, &
                            Cor_u, PFu, isv, iev, jsv, jev, &
-                           azon, bzon, czon, dzon, bt_rem_u, BT_force_u, uhbt0, Datu, &
+                           BTL_SF, bt_rem_u, BT_force_u, uhbt0, Datu, &
                            BTCL_u, ubt_prev, uhbt_prev, uhbt_int_prev, Cor_ref_u, Rayleigh_u, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -2995,6 +3043,8 @@ subroutine btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, u
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
   type(barotropic_CS),                       intent(inout) :: CS           !< Barotropic control structure
   type(ocean_OBC_type),                       pointer    :: OBC          !< The open boundary condition structure.
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)), intent(in) :: BTL_SF ! Coriolis and gravitational forces
+  
   real, dimension(SZIBW_(CS),SZJW_(CS)), intent(inout) :: &
     ubt, &        ! The zonal barotropic velocity [L T-1 ~> m s-1].
     bt_rem_u, &   ! The fraction of the barotropic meridional velocity that
@@ -3007,8 +3057,6 @@ subroutine btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, u
                   ! the same velocities [H L2 T-1 ~> m3 s-1 or kg s-1].
     Datu, &       ! Basin depth at v-velocity grid points times the x-grid
                   ! spacing [H L ~> m2 or kg m-1].
-    azon, bzon, & ! _zon and _mer are the values of the Coriolis force which
-    czon, dzon, & ! are applied to the neighboring values of vbtav and ubtav,
     Cor_ref_u, &  ! The meridional barotropic Coriolis acceleration due
                   ! to the reference velocities [L T-2 ~> m s-2].
     Rayleigh_u    ! A Rayleigh drag timescale operating at v-points [T-1 ~> s-1].
@@ -3073,12 +3121,12 @@ subroutine btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, u
   integer :: l_seg
 
   Idtbt = 1.0 / dtbt
-  
+
         ! On even steps, update u first.
       !$OMP do schedule(static)
       do j=jsv-1,jev+1 ; do I=isv-1,iev
-        Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
-                      (bzon(I,j) * vbt(i,J) +  dzon(I,j) * vbt(i+1,J-1))) - &
+        Cor_u(I,j) = ((BTL_SF(I,j)%azon * vbt(i+1,J) + BTL_SF(I,j)%czon * vbt(i,J-1)) + &
+                      (BTL_SF(I,j)%bzon * vbt(i,J) +  BTL_SF(I,j)%dzon * vbt(i+1,J-1))) - &
                      Cor_ref_u(I,j)
         PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
                      (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
@@ -3156,7 +3204,7 @@ end subroutine btloop_update_u_first
 
 subroutine btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, uhbt_int, &
                            Cor_u, PFu, isv, iev, jsv, jev, &
-                           azon, bzon, czon, dzon, bt_rem_u, BT_force_u, uhbt0, Datu, &
+                           BTL_SF, bt_rem_u, BT_force_u, uhbt0, Datu, &
                            BTCL_u, ubt_prev, uhbt_prev, uhbt_int_prev, Cor_ref_u, Rayleigh_u, &
                            eta_PF_BT, eta_PF, gtot_E, gtot_W, gtot_S, gtot_N, p_surf_dyn, dgeo_de, &
                            wt_accel_n, trans_wt1, trans_wt2, &
@@ -3168,6 +3216,8 @@ subroutine btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, 
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
   type(barotropic_CS),                       intent(inout) :: CS           !< Barotropic control structure
   type(ocean_OBC_type),                       pointer    :: OBC          !< The open boundary condition structure.
+  type(local_BT_Cor_force), dimension(SZIBW_(CS),SZJW_(CS)), intent(in) :: BTL_SF ! Coriolis and gravitational forces
+
   real, dimension(SZIBW_(CS),SZJW_(CS)), intent(inout) :: &
     ubt, &        ! The zonal barotropic velocity [L T-1 ~> m s-1].
     bt_rem_u, &   ! The fraction of the barotropic meridional velocity that
@@ -3180,8 +3230,6 @@ subroutine btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, 
                   ! the same velocities [H L2 T-1 ~> m3 s-1 or kg s-1].
     Datu, &       ! Basin depth at v-velocity grid points times the x-grid
                   ! spacing [H L ~> m2 or kg m-1].
-    azon, bzon, & ! _zon and _mer are the values of the Coriolis force which
-    czon, dzon, & ! are applied to the neighboring values of vbtav and ubtav,
     Cor_ref_u, &  ! The meridional barotropic Coriolis acceleration due
                   ! to the reference velocities [L T-2 ~> m s-2].
     Rayleigh_u    ! A Rayleigh drag timescale operating at v-points [T-1 ~> s-1].
@@ -3232,6 +3280,9 @@ subroutine btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, 
   integer, intent(in)  :: isv, iev, jsv, jev ! The valid array size at the end of a step.
    
 !! LOCAL
+  real, dimension(SZIBW_(CS),SZJW_(CS)) :: &
+    azon, bzon, & ! _zon and _mer are the values of the Coriolis force which
+    czon, dzon ! are applied to the neighboring values of vbtav and ubtav,
   real :: vel_prev    ! The previous velocity [L T-1 ~> m s-1].
   
   real, dimension(SZIBW_(CS),SZJW_(CS)) :: &
@@ -3248,8 +3299,8 @@ subroutine btloop_update_u_second(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, 
   Idtbt = 1.0 / dtbt
   
         do j=jsv,jev ; do I=isv-1,iev
-        Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
-                      (bzon(I,j) * vbt(i,J) + dzon(I,j) * vbt(i+1,J-1))) - &
+        Cor_u(I,j) = ((BTL_SF(I,j)%azon * vbt(i+1,J) + BTL_SF(I,j)%czon * vbt(i,J-1)) + &
+                      (BTL_SF(I,j)%bzon * vbt(i,J) + BTL_SF(I,j)%dzon * vbt(i+1,J-1))) - &
                      Cor_ref_u(I,j)
         PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
                      (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
