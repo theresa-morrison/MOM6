@@ -162,7 +162,7 @@ use MOM_offline_main,          only : offline_fw_fluxes_into_ocean, offline_fw_f
 use MOM_offline_main,          only : offline_advection_layer, offline_transport_end
 use MOM_ice_shelf,             only : ice_shelf_CS, ice_shelf_query, initialize_ice_shelf
 use MOM_particles_mod,         only : particles, particles_init, particles_run, particles_save_restart, particles_end
-
+use MOM_particles_mod,         only : particles_to_k_space, particles_to_z_space
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -438,7 +438,7 @@ type, public :: MOM_control_struct ; private
 end type MOM_control_struct
 
 public initialize_MOM, finish_MOM_initialization, MOM_end
-public step_MOM, step_offline
+public step_MOM, step_offline, save_MOM6_internal_state
 public extract_surface_state, get_ocean_stocks
 public get_MOM_state_elements, MOM_state_is_synchronized
 public allocate_surface_state, deallocate_surface_state
@@ -651,6 +651,8 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
     call create_group_pass(pass_tau_ustar_psurf, forces%taux, forces%tauy, G%Domain)
     if (associated(forces%ustar)) &
       call create_group_pass(pass_tau_ustar_psurf, forces%ustar, G%Domain)
+    if (associated(forces%tau_mag)) &
+      call create_group_pass(pass_tau_ustar_psurf, forces%tau_mag, G%Domain)
     if (associated(forces%p_surf)) &
       call create_group_pass(pass_tau_ustar_psurf, forces%p_surf, G%Domain)
     if (G%nonblocking_updates) then
@@ -669,8 +671,9 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
     dt_therm = dt ; ntstep = 1
     if (associated(fluxes%p_surf)) p_surf => fluxes%p_surf
     CS%tv%p_surf => NULL()
-    if (associated(fluxes%p_surf)) then
-      if (CS%use_p_surf_in_EOS) CS%tv%p_surf => fluxes%p_surf
+    if (CS%use_p_surf_in_EOS .and. associated(fluxes%p_surf)) then
+      CS%tv%p_surf => fluxes%p_surf
+      if (allocated(CS%tv%SpV_avg)) call pass_var(fluxes%p_surf, G%Domain, clock=id_clock_pass)
     endif
     if (CS%UseWaves) call pass_var(fluxes%ustar, G%Domain, clock=id_clock_pass)
   endif
@@ -1087,7 +1090,7 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
   call cpu_clock_end(id_clock_stoch)
   call cpu_clock_begin(id_clock_varT)
   if (CS%use_stochastic_EOS) then
-    call MOM_calc_varT(G, GV, h, CS%tv, CS%stoch_eos_CS, dt)
+    call MOM_calc_varT(G, GV, US, h, CS%tv, CS%stoch_eos_CS, dt)
     if (associated(CS%tv%varT)) call pass_var(CS%tv%varT, G%Domain, clock=id_clock_pass, halo=1)
   endif
   call cpu_clock_end(id_clock_varT)
@@ -1108,6 +1111,8 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
     endif
 
     if (CS%interface_filter) then
+      if (allocated(CS%tv%SpV_avg)) call pass_var(CS%tv%SpV_avg, G%Domain, clock=id_clock_pass)
+      CS%tv%valid_SpV_halo = min(G%Domain%nihalo, G%Domain%njhalo)
       call cpu_clock_begin(id_clock_int_filter)
       call interface_filter(h, CS%uhtr, CS%vhtr, CS%tv, dt_thermo, G, GV, US, &
                             CS%CDp, CS%interface_filter_CSp)
@@ -1243,6 +1248,8 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
     endif
 
     if (CS%interface_filter) then
+      if (allocated(CS%tv%SpV_avg)) call pass_var(CS%tv%SpV_avg, G%Domain, clock=id_clock_pass)
+      CS%tv%valid_SpV_halo = min(G%Domain%nihalo, G%Domain%njhalo)
       call cpu_clock_begin(id_clock_int_filter)
       call interface_filter(h, CS%uhtr, CS%vhtr, CS%tv, dt_thermo, G, GV, US, &
                             CS%CDp, CS%interface_filter_CSp)
@@ -1390,6 +1397,8 @@ subroutine step_MOM_tracer_dyn(CS, G, GV, US, h, Time_local)
 
   if (associated(CS%tv%T)) then
     call extract_diabatic_member(CS%diabatic_CSp, diabatic_halo=halo_sz)
+    ! The bottom boundary layer calculation may need halo values of SpV_avg, including the corners.
+    if (allocated(CS%tv%SpV_avg)) halo_sz = max(halo_sz, 1)
     if (halo_sz > 0) then
       call create_group_pass(pass_T_S, CS%tv%T, G%Domain, To_All, halo=halo_sz)
       call create_group_pass(pass_T_S, CS%tv%S, G%Domain, To_All, halo=halo_sz)
@@ -1405,7 +1414,7 @@ subroutine step_MOM_tracer_dyn(CS, G, GV, US, h, Time_local)
 
     ! Update derived thermodynamic quantities.
     if (allocated(CS%tv%SpV_avg)) then
-      call calc_derived_thermo(CS%tv, h, G, GV, US, halo=halo_sz)
+      call calc_derived_thermo(CS%tv, h, G, GV, US, halo=halo_sz, debug=CS%debug)
     endif
   endif
 
@@ -1532,6 +1541,10 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
       call preAle_tracer_diagnostics(CS%tracer_Reg, G, GV)
 
+      if (CS%use_particles) then
+        call particles_to_z_space(CS%particles, h)
+      endif
+
       if (CS%debug) then
         call MOM_state_chksum("Pre-ALE ", u, v, h, CS%uh, CS%vh, G, GV, US, omit_corners=.true.)
         call hchksum(tv%T,"Pre-ALE T", G%HI, haloshift=1, omit_corners=.true., scale=US%C_to_degC)
@@ -1557,6 +1570,7 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
       ! Remap all variables from the old grid h onto the new grid h_new
       call ALE_remap_tracers(CS%ALE_CSp, G, GV, h, h_new, CS%tracer_Reg, showCallTree, dtdia, PCM_cell)
       call ALE_remap_velocities(CS%ALE_CSp, G, GV, h, h_new, u, v, CS%OBC, dzRegrid, showCallTree, dtdia)
+      if (allocated(tv%SpV_avg)) tv%valid_SpV_halo = -1   ! Record that SpV_avg is no longer valid.
 
       if (CS%remap_aux_vars) then
         if (CS%split) &
@@ -1578,6 +1592,11 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
       call cpu_clock_end(id_clock_ALE)
     endif   ! endif for the block "if ( CS%use_ALE_algorithm )"
 
+
+    if (CS%use_particles) then
+      call particles_to_k_space(CS%particles, h)
+    endif
+
     dynamics_stencil = min(3, G%Domain%nihalo, G%Domain%njhalo)
     call create_group_pass(pass_uv_T_S_h, u, v, G%Domain, halo=dynamics_stencil)
     if (associated(tv%T)) &
@@ -1589,7 +1608,7 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
     ! Update derived thermodynamic quantities.
     if (allocated(tv%SpV_avg)) then
-      call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil)
+      call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
     endif
 
     if (CS%debug .and. CS%use_ALE_algorithm) then
@@ -1645,7 +1664,7 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
       ! Update derived thermodynamic quantities.
       if (allocated(tv%SpV_avg)) then
-        call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil)
+        call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
       endif
     endif
 
@@ -1818,6 +1837,7 @@ subroutine step_offline(forces, fluxes, sfc_state, Time_start, time_interval, CS
       ! are used are intended to ensure that in the case where transports don't quite conserve,
       ! the offline layer thicknesses do not drift too far away from the online model.
       call ALE_remap_tracers(CS%ALE_CSp, G, GV, CS%h, h_new, CS%tracer_Reg, debug=CS%debug)
+      if (allocated(CS%tv%SpV_avg)) CS%tv%valid_SpV_halo = -1   ! Record that SpV_avg is no longer valid.
 
       ! Update the tracer grid.
       do k=1,nz ; do j=js-1,je+1 ; do i=is-1,ie+1
@@ -2845,6 +2865,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   ! Allocate any derived equation of state fields.
   if (use_temperature .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     allocate(CS%tv%SpV_avg(isd:ied,jsd:jed,nz), source=0.0)
+    CS%tv%valid_SpV_halo = -1  ! This array does not yet have any valid data.
   endif
 
   if (use_ice_shelf .and. CS%debug) then
@@ -2893,6 +2914,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
     endif
     call callTree_waypoint("Calling adjustGridForIntegrity() to remap initial conditions (initialize_MOM)")
     call adjustGridForIntegrity(CS%ALE_CSp, G, GV, CS%h )
+    if (allocated(CS%tv%SpV_avg)) call calc_derived_thermo(CS%tv, CS%h, G, GV, US, halo=1)
     call pre_ALE_adjustments(G, GV, US, CS%h, CS%tv, CS%tracer_Reg, CS%ALE_CSp, CS%u, CS%v)
 
     call callTree_waypoint("Calling ALE_regrid() to remap initial conditions (initialize_MOM)")
@@ -2909,6 +2931,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
     ! Remap all variables from the old grid h onto the new grid h_new
     call ALE_remap_tracers(CS%ALE_CSp, G, GV, CS%h, h_new, CS%tracer_Reg, CS%debug, PCM_cell=PCM_cell)
     call ALE_remap_velocities(CS%ALE_CSp, G, GV, CS%h, h_new, CS%u, CS%v, CS%OBC, dzRegrid, debug=CS%debug)
+    if (allocated(CS%tv%SpV_avg)) CS%tv%valid_SpV_halo = -1   ! Record that SpV_avg is no longer valid.
 
     ! Replace the old grid with new one.  All remapping must be done at this point.
     !$OMP parallel do default(shared)
@@ -2988,7 +3011,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   call cpu_clock_end(id_clock_MOM_init)
 
   if (CS%use_dbclient) call database_comms_init(param_file, CS%dbcomms_CS)
-  CS%useMEKE = MEKE_init(Time, G, US, param_file, diag, CS%dbcomms_CS, CS%MEKE_CSp, CS%MEKE, &
+  CS%useMEKE = MEKE_init(Time, G, GV, US, param_file, diag, CS%dbcomms_CS, CS%MEKE_CSp, CS%MEKE, &
                          restart_CSp, CS%MEKE_in_dynamics)
 
   call VarMix_init(Time, G, GV, US, param_file, diag, CS%VarMix)
@@ -2999,7 +3022,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
 
   new_sim = is_new_run(restart_CSp)
   if (use_temperature) then
-    CS%use_stochastic_EOS = MOM_stoch_eos_init(Time, G, US, param_file, diag, CS%stoch_eos_CS, restart_CSp)
+    CS%use_stochastic_EOS = MOM_stoch_eos_init(Time, G, GV, US, param_file, diag, CS%stoch_eos_CS, restart_CSp)
   else
     CS%use_stochastic_EOS = .false.
   endif
@@ -3135,7 +3158,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
 
   ! Update derived thermodynamic quantities.
   if (allocated(CS%tv%SpV_avg)) then
-    call calc_derived_thermo(CS%tv, CS%h, G, GV, US, halo=dynamics_stencil)
+    call calc_derived_thermo(CS%tv, CS%h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
   endif
 
   if (associated(CS%visc%Kv_shear)) &
@@ -3218,7 +3241,7 @@ subroutine finish_MOM_initialization(Time, dirs, CS, restart_CSp)
   G => CS%G ; GV => CS%GV ; US => CS%US
 
   if (CS%use_particles) then
-    call particles_init(CS%particles, G, CS%Time, CS%dt_therm, CS%u, CS%v)
+    call particles_init(CS%particles, G, CS%Time, CS%dt_therm, CS%u, CS%v, CS%h)
   endif
 
   ! Write initial conditions
@@ -3902,13 +3925,33 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, on_PE_only)
 
 end subroutine get_ocean_stocks
 
+
+!> Trigger a writing of restarts for the MOM6 internal state
+!!
+!! Currently this applies to the state that does not take the form
+!! of simple arrays for which the generic save_restart() function
+!! can be used.
+!!
+!! Todo:
+!! [ ] update particles to use Time and directories
+!! [ ] move the call to generic save_restart() in here.
+subroutine save_MOM6_internal_state(CS, dirs, time, stamp_time)
+  type(MOM_control_struct), intent(inout) :: CS         !< MOM control structure
+  character(len=*),         intent(in)    :: dirs  !< The directory where the restart
+                                                        !! files are to be written
+  type(time_type),          intent(in)    :: time       !< The current model time
+  logical,       optional,  intent(in)    :: stamp_time !< If present and true, add time-stamp
+
+    ! Could call save_restart(CS%restart_CSp) here
+
+    if (CS%use_particles) call particles_save_restart(CS%particles, CS%h)
+
+end subroutine save_MOM6_internal_state
+
+
 !> End of ocean model, including memory deallocation
 subroutine MOM_end(CS)
   type(MOM_control_struct), intent(inout) :: CS   !< MOM control structure
-
-  if (CS%use_particles) then
-    call particles_save_restart(CS%particles)
-  endif
 
   call MOM_sum_output_end(CS%sum_output_CSp)
 
@@ -3944,7 +3987,7 @@ subroutine MOM_end(CS)
   endif
 
   if (CS%use_particles) then
-    call particles_end(CS%particles)
+    call particles_end(CS%particles, CS%h)
     deallocate(CS%particles)
   endif
 

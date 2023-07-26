@@ -27,6 +27,7 @@ use MOM_get_input,        only : Get_MOM_Input, directories
 use MOM_grid,             only : ocean_grid_type
 use MOM_interpolate,      only : init_external_field, time_interp_external
 use MOM_interpolate,      only : time_interp_external_init
+use MOM_interpolate,      only : external_field
 use MOM_io,               only : slasher, write_version_number, MOM_read_data
 use MOM_io,               only : read_netCDF_data
 use MOM_io,               only : stdout_if_root
@@ -61,7 +62,7 @@ type, public :: surface_forcing_CS ; private
                                 !! from MOM_domains) to indicate the staggering of
                                 !! the winds that are being provided in calls to
                                 !! update_ocean_model.
-  logical :: use_temperature    !< If true, temp and saln used as state variables
+  logical :: use_temperature    !< If true, temp and saln used as state variables.
   real :: wind_stress_multiplier !< A multiplier applied to incoming wind stress [nondim].
 
   real :: Rho0                  !< Boussinesq reference density [R ~> kg m-3]
@@ -153,8 +154,10 @@ type, public :: surface_forcing_CS ; private
                                               !! in inputdir/temp_restore_mask.nc and the field should
                                               !! be named 'mask'
   real, pointer, dimension(:,:) :: trestore_mask => NULL() !< Mask for SST restoring [nondim]
-  integer :: id_srestore = -1  !< An id number for time_interp_external.
-  integer :: id_trestore = -1  !< An id number for time_interp_external.
+  type(external_field) :: srestore_handle
+    !< Handle for time-interpolated salt restoration field
+  type(external_field) :: trestore_handle
+    !< Handle for time-interpolated temperature restoration field
 
   type(forcing_diags), public :: handles !< Diagnostics handles
 
@@ -172,6 +175,7 @@ type, public :: ice_ocean_boundary_type
   real, pointer, dimension(:,:) :: t_flux          =>NULL() !< sensible heat flux [W m-2]
   real, pointer, dimension(:,:) :: q_flux          =>NULL() !< specific humidity flux [kg m-2 s-1]
   real, pointer, dimension(:,:) :: salt_flux       =>NULL() !< salt flux [kg m-2 s-1]
+  real, pointer, dimension(:,:) :: excess_salt     =>NULL() !< salt left behind by brine rejection [kg m-2 s-1]
   real, pointer, dimension(:,:) :: lw_flux         =>NULL() !< long wave radiation [W m-2]
   real, pointer, dimension(:,:) :: sw_flux_vis_dir =>NULL() !< direct visible sw radiation [W m-2]
   real, pointer, dimension(:,:) :: sw_flux_vis_dif =>NULL() !< diffuse visible sw radiation [W m-2]
@@ -301,6 +305,8 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     call safe_alloc_ptr(fluxes%heat_added,isd,ied,jsd,jed)
     call safe_alloc_ptr(fluxes%salt_flux_added,isd,ied,jsd,jed)
 
+    if (associated(IOB%excess_salt)) call safe_alloc_ptr(fluxes%salt_left_behind,isd,ied,jsd,jed)
+
     do j=js-2,je+2 ; do i=is-2,ie+2
       fluxes%TKE_tidal(i,j)   = CS%TKE_tidal(i,j)
       fluxes%ustar_tidal(i,j) = CS%ustar_tidal(i,j)
@@ -345,7 +351,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
   ! Salinity restoring logic
   if (CS%restore_salt) then
-    call time_interp_external(CS%id_srestore, Time, data_restore, scale=US%ppt_to_S)
+    call time_interp_external(CS%srestore_handle, Time, data_restore, scale=US%ppt_to_S)
     ! open_ocn_mask indicates where to restore salinity (1 means restore, 0 does not)
     open_ocn_mask(:,:) = 1.0
     if (CS%mask_srestore_under_ice) then ! Do not restore under sea-ice
@@ -403,7 +409,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
   ! SST restoring logic
   if (CS%restore_temp) then
-    call time_interp_external(CS%id_trestore, Time, data_restore, scale=US%degC_to_C)
+    call time_interp_external(CS%trestore_handle, Time, data_restore, scale=US%degC_to_C)
     if ( CS%trestore_SPEAR_ECDA ) then
       do j=js,je ; do i=is,ie
         if (abs(data_restore(i,j)+1.8*US%degC_to_C) < 0.0001*US%degC_to_C) then
@@ -573,6 +579,11 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
         call check_mask_val_consistency(IOB%salt_flux(i-i0,j-j0), G%mask2dT(i,j), i, j, 'salt_flux', G)
     enddo ; enddo
   endif
+  if (associated(IOB%excess_salt)) then
+    do j=js,je ; do i=is,ie
+      fluxes%salt_left_behind(i,j) = G%mask2dT(i,j)*(kg_m2_s_conversion*IOB%excess_salt(i-i0,j-j0))
+    enddo ; enddo
+  endif
 
 !#CTRL# if (associated(CS%ctrl_forcing_CSp)) then
 !#CTRL#   do j=js,je ; do i=is,ie
@@ -621,13 +632,16 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
   endif
 
   ! Set the wind stresses and ustar.
-  if (associated(fluxes%ustar) .and. associated(fluxes%ustar_gustless)) then
+  if (associated(fluxes%ustar) .and. associated(fluxes%ustar_gustless) .and. associated(fluxes%tau_mag)) then
     call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, ustar=fluxes%ustar, &
-                              gustless_ustar=fluxes%ustar_gustless)
-  elseif (associated(fluxes%ustar)) then
-    call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, ustar=fluxes%ustar)
-  elseif (associated(fluxes%ustar_gustless)) then
-    call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, gustless_ustar=fluxes%ustar_gustless)
+                              mag_tau=fluxes%tau_mag, gustless_ustar=fluxes%ustar_gustless)
+  else
+    if (associated(fluxes%ustar)) &
+      call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, ustar=fluxes%ustar)
+    if (associated(fluxes%ustar_gustless)) &
+      call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, gustless_ustar=fluxes%ustar_gustless)
+    if (associated(fluxes%tau_mag)) &
+      call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, mag_tau=fluxes%tau_mag)
   endif
 
   if (coupler_type_initialized(fluxes%tr_fluxes) .and. &
@@ -671,7 +685,8 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
   real, dimension(SZI_(G),SZJ_(G)) :: &
     rigidity_at_h, &  ! Ice rigidity at tracer points [L4 Z-1 T-1 ~> m3 s-1]
     net_mass_src, &   ! A temporary of net mass sources [R Z T-1 ~> kg m-2 s-1].
-    ustar_tmp         ! A temporary array of ustar values [Z T-1 ~> m s-1].
+    ustar_tmp, &      ! A temporary array of ustar values [Z T-1 ~> m s-1].
+    tau_mag_tmp       ! A temporary array of surface stress magnitudes [R Z L T-2 ~> Pa]
 
   real :: I_GEarth      ! The inverse of the gravitational acceleration [T2 Z L-2 ~> s2 m-1]
   real :: Kv_rho_ice    ! (CS%Kv_sea_ice / CS%density_sea_ice) [L4 Z-2 T-1 R-1 ~> m5 s-1 kg-1]
@@ -775,12 +790,13 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
   ! Set the wind stresses and ustar.
   if (wt1 <= 0.0) then
     call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux=forces%taux, tauy=forces%tauy, &
-                              ustar=forces%ustar, tau_halo=1)
+                              ustar=forces%ustar, mag_tau=forces%tau_mag, tau_halo=1)
   else
     call extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux=forces%taux, tauy=forces%tauy, &
-                              ustar=ustar_tmp, tau_halo=1)
+                              ustar=ustar_tmp, mag_tau=tau_mag_tmp, tau_halo=1)
     do j=js,je ; do i=is,ie
       forces%ustar(i,j) = wt1*forces%ustar(i,j) + wt2*ustar_tmp(i,j)
+      forces%tau_mag(i,j) = wt1*forces%tau_mag(i,j) + wt2*tau_mag_tmp(i,j)
     enddo ; enddo
   endif
 
@@ -877,7 +893,7 @@ end subroutine convert_IOB_to_forces
 !! Ice_ocean_boundary_type into optional argument arrays, including changes of units, sign
 !! conventions, and putting the fields into arrays with MOM-standard sized halos.
 subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, ustar, &
-                                gustless_ustar, tau_halo)
+                                gustless_ustar, mag_tau, tau_halo)
   type(ice_ocean_boundary_type), &
                    target, intent(in)    :: IOB  !< An ice-ocean boundary type with fluxes to drive
                                                  !! the ocean in a coupled model
@@ -897,6 +913,9 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
   real, dimension(SZI_(G),SZJ_(G)), &
                  optional, intent(out)   :: gustless_ustar !< The surface friction velocity without
                                                  !! any contributions from gustiness [Z T-1 ~> m s-1].
+  real, dimension(SZI_(G),SZJ_(G)), &
+                 optional, intent(inout) :: mag_tau !< The magintude of the wind stress at tracer points
+                                                 !! including subgridscale variability and gustiness [R Z L T-2 ~> Pa]
   integer,       optional, intent(in)    :: tau_halo !< The halo size of wind stresses to set, 0 by default.
 
   ! Local variables
@@ -913,7 +932,7 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
   real :: tau_mag       ! magnitude of the wind stress [R Z L T-2 ~> Pa]
   real :: stress_conversion ! A unit conversion factor from Pa times any stress multiplier [R Z L T-2 Pa-1 ~> 1]
 
-  logical :: do_ustar, do_gustless
+  logical :: do_ustar, do_gustless, do_tau_mag
   integer :: wind_stagger  ! AGRID, BGRID_NE, or CGRID_NE (integers from MOM_domains)
   integer :: i, j, is, ie, js, je, ish, ieh, jsh, jeh, Isqh, Ieqh, Jsqh, Jeqh, i0, j0, halo
 
@@ -926,7 +945,7 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
   IRho0 = US%L_to_Z / CS%Rho0
   stress_conversion = US%Pa_to_RLZ_T2 * CS%wind_stress_multiplier
 
-  do_ustar = present(ustar) ; do_gustless = present(gustless_ustar)
+  do_ustar = present(ustar) ; do_gustless = present(gustless_ustar) ; do_tau_mag = present(mag_tau)
 
   wind_stagger = CS%wind_stagger
   if ((IOB%wind_stagger == AGRID) .or. (IOB%wind_stagger == BGRID_NE) .or. &
@@ -1019,13 +1038,13 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
     endif   ! endif for extracting wind stress fields with various staggerings
   endif
 
-  if (do_ustar .or. do_gustless) then
+  if (do_ustar .or. do_tau_mag .or. do_gustless) then
     ! Set surface friction velocity directly or as a function of staggering.
     ! ustar is required for the bulk mixed layer formulation and other turbulent mixing
     ! parametizations. The background gustiness (for example with a relatively small value
     ! of 0.02 Pa) is intended to give reasonable behavior in regions of very weak winds.
     if (associated(IOB%stress_mag)) then
-      if (do_ustar) then ; do j=js,je ; do i=is,ie
+      if (do_ustar .or. do_tau_mag) then ; do j=js,je ; do i=is,ie
         gustiness = CS%gust_const
         if (CS%read_gust_2d) then
           if ((wind_stagger == CGRID_NE) .or. &
@@ -1035,7 +1054,10 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
                 (G%mask2dBu(I,J-1) + G%mask2dBu(I-1,J))) > 0.0)) ) &
             gustiness = CS%gust(i,j)
         endif
-        ustar(i,j) = sqrt(gustiness*IRho0 + IRho0*US%Pa_to_RLZ_T2*IOB%stress_mag(i-i0,j-j0))
+        if (do_tau_mag) &
+          mag_tau(i,j) = gustiness + US%Pa_to_RLZ_T2*IOB%stress_mag(i-i0,j-j0)
+        if (do_ustar) &
+          ustar(i,j) = sqrt(gustiness*IRho0 + IRho0*US%Pa_to_RLZ_T2*IOB%stress_mag(i-i0,j-j0))
       enddo ; enddo ; endif
       if (CS%answer_date < 20190101) then
         if (do_gustless) then ; do j=js,je ; do i=is,ie
@@ -1059,6 +1081,7 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
           if (CS%read_gust_2d) gustiness = CS%gust(i,j)
         endif
         if (do_ustar) ustar(i,j) = sqrt(gustiness*IRho0 + IRho0 * tau_mag)
+        if (do_tau_mag) mag_tau(i,j) = gustiness + tau_mag
         if (CS%answer_date < 20190101) then
           if (do_gustless) gustless_ustar(i,j) = sqrt(US%L_to_Z*tau_mag / CS%Rho0)
         else
@@ -1071,6 +1094,7 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
         gustiness = CS%gust_const
         if (CS%read_gust_2d .and. (G%mask2dT(i,j) > 0.0)) gustiness = CS%gust(i,j)
         if (do_ustar) ustar(i,j) = sqrt(gustiness*IRho0 + IRho0 * tau_mag)
+        if (do_tau_mag) mag_tau(i,j) = gustiness + tau_mag
         if (CS%answer_date < 20190101) then
           if (do_gustless) gustless_ustar(i,j) = sqrt(US%L_to_Z*tau_mag / CS%Rho0)
         else
@@ -1092,6 +1116,7 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
         if (CS%read_gust_2d) gustiness = CS%gust(i,j)
 
         if (do_ustar) ustar(i,j) = sqrt(gustiness*IRho0 + IRho0 * tau_mag)
+        if (do_tau_mag) mag_tau(i,j) = gustiness + tau_mag
         if (CS%answer_date < 20190101) then
           if (do_gustless) gustless_ustar(i,j) = sqrt(US%L_to_Z*tau_mag / CS%Rho0)
         else
@@ -1610,7 +1635,7 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, wind_stagger)
 
   if (CS%restore_salt) then
     salt_file = trim(CS%inputdir) // trim(CS%salt_restore_file)
-    CS%id_srestore = init_external_field(salt_file, CS%salt_restore_var_name, MOM_domain=G%Domain)
+    CS%srestore_handle = init_external_field(salt_file, CS%salt_restore_var_name, MOM_domain=G%Domain)
     call safe_alloc_ptr(CS%srestore_mask,isd,ied,jsd,jed); CS%srestore_mask(:,:) = 1.0
     if (CS%mask_srestore) then ! read a 2-d file containing a mask for restoring fluxes
       flnam = trim(CS%inputdir) // 'salt_restore_mask.nc'
@@ -1620,7 +1645,7 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, wind_stagger)
 
   if (CS%restore_temp) then
     temp_file = trim(CS%inputdir) // trim(CS%temp_restore_file)
-    CS%id_trestore = init_external_field(temp_file, CS%temp_restore_var_name, MOM_domain=G%Domain)
+    CS%trestore_handle = init_external_field(temp_file, CS%temp_restore_var_name, MOM_domain=G%Domain)
     call safe_alloc_ptr(CS%trestore_mask,isd,ied,jsd,jed); CS%trestore_mask(:,:) = 1.0
     if (CS%mask_trestore) then  ! read a 2-d file containing a mask for restoring fluxes
       flnam = trim(CS%inputdir) // 'temp_restore_mask.nc'
@@ -1711,6 +1736,9 @@ subroutine ice_ocn_bnd_type_chksum(id, timestep, iobt)
   endif
   if (associated(iobt%mass_berg)) then
     chks = field_chksum( iobt%mass_berg  ) ; if (root) write(outunit,100) 'iobt%mass_berg      ', chks
+  endif
+  if (associated(iobt%excess_salt)) then
+    chks = field_chksum( iobt%excess_salt    ) ; if (root) write(outunit,100) 'iobt%excess_salt    ', chks
   endif
 100 FORMAT("   CHECKSUM::",A20," = ",Z20)
 

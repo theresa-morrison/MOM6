@@ -21,6 +21,7 @@ use MOM_hor_index,         only : hor_index_type
 use MOM_interface_heights, only : find_eta
 use MOM_interpolate,       only : init_external_field, time_interp_external
 use MOM_interpolate,       only : time_interp_external_init
+use MOM_interpolate,       only : external_field
 use MOM_io,                only : vardesc, var_desc, slasher
 use MOM_isopycnal_slopes,  only : calc_isoneutral_slopes
 use MOM_restart,           only : MOM_restart_CS, register_restart_field, query_initialized
@@ -129,7 +130,7 @@ type, public :: MEKE_CS ; private
   integer :: id_Lrhines = -1, id_Leady = -1
   integer :: id_MEKE_equilibrium = -1
   !>@}
-  integer :: id_eke = -1 !< Handle for reading in EKE from a file
+  type(external_field) :: eke_handle   !< Handle for reading in EKE from a file
   ! Infrastructure
   integer :: id_clock_pass !< Clock for group pass calls
   type(group_pass_type) :: pass_MEKE !< Group halo pass handle for MEKE%MEKE and maybe MEKE%Kh_diff
@@ -627,7 +628,7 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
     endif
 
   case(EKE_FILE)
-    call time_interp_external(CS%id_eke, Time, data_eke, scale=US%m_s_to_L_T**2)
+    call time_interp_external(CS%eke_handle, Time, data_eke, scale=US%m_s_to_L_T**2)
     do j=js,je ; do i=is,ie
       MEKE%MEKE(i,j) = data_eke(i,j) * G%mask2dT(i,j)
     enddo; enddo
@@ -1087,12 +1088,13 @@ end subroutine MEKE_lengthScales_0d
 
 !> Initializes the MOM_MEKE module and reads parameters.
 !! Returns True if module is to be used, otherwise returns False.
-logical function MEKE_init(Time, G, US, param_file, diag, dbcomms_CS, CS, MEKE, restart_CS, meke_in_dynamics)
+logical function MEKE_init(Time, G, GV, US, param_file, diag, dbcomms_CS, CS, MEKE, restart_CS, meke_in_dynamics)
   type(time_type),         intent(in)    :: Time       !< The current model time.
   type(ocean_grid_type),   intent(inout) :: G          !< The ocean's grid structure.
+  type(verticalGrid_type), intent(in)    :: GV         !< Ocean vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US         !< A dimensional unit scaling type
   type(param_file_type),   intent(in)    :: param_file !< Parameter file parser structure.
-  type(dbcomms_CS_type),  intent(in)     :: dbcomms_CS !< Database communications control structure
+  type(dbcomms_CS_type),   intent(in)    :: dbcomms_CS !< Database communications control structure
   type(diag_ctrl), target, intent(inout) :: diag       !< Diagnostics structure.
   type(MEKE_CS),           intent(inout) :: CS         !< MEKE control structure.
   type(MEKE_type),         intent(inout) :: MEKE       !< MEKE fields
@@ -1101,7 +1103,7 @@ logical function MEKE_init(Time, G, US, param_file, diag, dbcomms_CS, CS, MEKE, 
                                                              !! otherwise in tracer dynamics
 
   ! Local variables
-  real    :: MEKE_restoring_timescale ! The timescale used to nudge MEKE toward its equilibrium value [T ~> s]
+  real :: MEKE_restoring_timescale ! The timescale used to nudge MEKE toward its equilibrium value [T ~> s]
   real :: cdrag            ! The default bottom drag coefficient [nondim].
   character(len=200) :: eke_filename, eke_varname, inputdir
   character(len=16) :: eke_source_str
@@ -1153,7 +1155,7 @@ logical function MEKE_init(Time, G, US, param_file, diag, dbcomms_CS, CS, MEKE, 
     inputdir = slasher(inputdir)
 
     eke_filename = trim(inputdir) // trim(eke_filename)
-    CS%id_eke = init_external_field(eke_filename, eke_varname, domain=G%Domain%mpp_domain)
+    CS%eke_handle = init_external_field(eke_filename, eke_varname, domain=G%Domain%mpp_domain)
   case("prog")
     CS%eke_src = EKE_PROG
     ! Read all relevant parameters and write them to the model log.
@@ -1576,7 +1578,8 @@ subroutine ML_MEKE_calculate_features(G, GV, US, CS, Rd_dx_h, u, v, tv, h, dt, f
     h_v(i,J,k) = 0.5*(h(i,j,k)*G%mask2dT(i,j) + h(i,j+1,k)*G%mask2dT(i,j+1)) + GV%Angstrom_H
   enddo; enddo; enddo;
   call find_eta(h, tv, G, GV, US, e, halo_size=2)
-  call calc_isoneutral_slopes(G, GV, US, h, e, tv, dt*1.e-7, .false., slope_x, slope_y)
+  ! Note the hard-coded dimenisional constant in the following line.
+  call calc_isoneutral_slopes(G, GV, US, h, e, tv, dt*1.e-7*GV%m2_s_to_HZ_T, .false., slope_x, slope_y)
   call pass_vector(slope_x, slope_y, G%Domain)
   do j=js-1,je+1; do i=is-1,ie+1
     slope_x_vert_avg(I,j) = vertical_average_interface(slope_x(i,j,:), h_u(i,j,:), GV%H_subroundoff)

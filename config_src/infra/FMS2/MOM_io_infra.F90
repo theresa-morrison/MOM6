@@ -17,6 +17,7 @@ use fms2_io_mod,          only : register_field, write_data, register_variable_a
 use fms2_io_mod,          only : variable_att_exists, get_variable_attribute, get_variable_num_dimensions
 use fms2_io_mod,          only : get_variable_dimension_names, is_dimension_registered, get_dimension_size
 use fms2_io_mod,          only : is_dimension_unlimited, register_axis, unlimited
+use fms2_io_mod,          only : get_dimension_names
 use fms2_io_mod,          only : get_global_io_domain_indices
 use fms_io_utils_mod,     only : fms2_file_exist => file_exists
 use fms_io_utils_mod,     only : get_filename_appendix
@@ -65,7 +66,7 @@ end interface
 !> Read a data field from a file
 interface read_field
   module procedure read_field_4d
-  module procedure read_field_3d
+  module procedure read_field_3d, read_field_3d_region
   module procedure read_field_2d, read_field_2d_region
   module procedure read_field_1d, read_field_1d_int
   module procedure read_field_0d, read_field_0d_int
@@ -335,7 +336,7 @@ subroutine open_file(IO_handle, filename, action, MOM_domain, threading, fileset
   if ((file_mode == APPEND_FILE) .and. file_exists(filename_tmp, MOM_Domain)) then
     ! Determine the latest file time and number of records so far.
     success = fms2_open_file(fileObj_read, trim(filename_tmp), "read", MOM_domain%mpp_domain)
-    call get_unlimited_dimension_name(fileObj_read, dim_unlim_name)
+    dim_unlim_name = find_unlimited_dimension_name(fileObj_read)
     if (len_trim(dim_unlim_name) > 0) &
       call get_dimension_size(fileObj_read, trim(dim_unlim_name), IO_handle%num_times)
     if (IO_handle%num_times > 0) &
@@ -477,7 +478,7 @@ subroutine get_file_info(IO_handle, ndim, nvar, ntime)
   if (present(nvar)) nvar = get_num_variables(IO_handle%fileobj)
   if (present(ntime)) then
     ntime = 0
-    call get_unlimited_dimension_name(IO_handle%fileobj, dim_unlim_name)
+    dim_unlim_name = find_unlimited_dimension_name(IO_handle%fileobj)
     if (len_trim(dim_unlim_name) > 0) &
       call get_dimension_size(IO_handle%fileobj, trim(dim_unlim_name), ntime)
   endif
@@ -500,8 +501,9 @@ subroutine get_file_times(IO_handle, time_values, ntime)
   if (present(ntime)) ntime = ntimes
   if (ntimes > 0) then
     allocate(time_values(ntimes))
-    call get_unlimited_dimension_name(IO_handle%fileobj, dim_unlim_name)
-    call fms2_read_data(IO_handle%fileobj, trim(dim_unlim_name), time_values)
+    dim_unlim_name = find_unlimited_dimension_name(IO_handle%fileobj)
+    if (len_trim(dim_unlim_name) > 0) &
+      call fms2_read_data(IO_handle%fileobj, trim(dim_unlim_name), time_values)
   endif
 end subroutine get_file_times
 
@@ -1027,6 +1029,74 @@ subroutine read_field_3d(filename, fieldname, data, MOM_Domain, &
   endif ; endif
 
 end subroutine read_field_3d
+
+!> This routine uses the fms_io subroutine read_data to read a region from a distributed or
+!! global 3-D data field named "fieldname" from file "filename".
+subroutine read_field_3d_region(filename, fieldname, data, start, nread, MOM_domain, &
+                                no_domain, scale)
+  character(len=*),       intent(in)    :: filename  !< The name of the file to read
+  character(len=*),       intent(in)    :: fieldname !< The variable name of the data in the file
+  real, dimension(:,:,:),   intent(inout) :: data      !< The 3-dimensional array into which the data
+                                                     !! should be read
+  integer, dimension(:),  intent(in)    :: start     !< The starting index to read in each of 3
+                                                     !! dimensions.  For this 3-d read, the
+                                                     !! 4th value is always 1.
+  integer, dimension(:),  intent(in)    :: nread     !< The number of points to read in each of 4
+                                                     !! dimensions.  For this 3-d read, the
+                                                     !! 4th values are always 1.
+  type(MOM_domain_type), &
+                optional, intent(in)    :: MOM_Domain !< The MOM_Domain that describes the decomposition
+  logical,      optional, intent(in)    :: no_domain !< If present and true, this variable does not
+                                                     !! use domain decomposion.
+  real,         optional, intent(in)    :: scale     !< A scaling factor that the field is multiplied
+                                                     !! by before it is returned.
+
+  ! Local variables
+  type(FmsNetcdfFile_t)       :: fileObj ! A handle to a non-domain-decomposed file
+  type(FmsNetcdfDomainFile_t) :: fileobj_DD ! A handle to a domain-decomposed file object
+  character(len=96) :: var_to_read ! Name of variable to read from the netcdf file
+  logical :: success               ! True if the file was successfully opened
+
+  if (present(MOM_Domain)) then
+    ! Open the FMS2 file-set.
+    success = fms2_open_file(fileobj_DD, filename, "read", MOM_domain%mpp_domain)
+    if (.not.success) call MOM_error(FATAL, "Failed to open "//trim(filename))
+
+    ! Find the matching case-insensitive variable name in the file and prepare to read it.
+    call prepare_to_read_var(fileobj_DD, fieldname, "read_field_2d_region: ", &
+                             filename, var_to_read)
+
+    ! Read the data.
+    call fms2_read_data(fileobj_DD, var_to_read, data, corner=start(1:3), edge_lengths=nread(1:3))
+
+    ! Close the file-set.
+    if (check_if_open(fileobj_DD)) call fms2_close_file(fileobj_DD)
+  else
+    ! Open the FMS2 file-set.
+    success = fms2_open_file(fileObj, trim(filename), "read")
+    if (.not.success) call MOM_error(FATAL, "Failed to open "//trim(filename))
+
+    ! Find the matching case-insensitive variable name in the file, and determine whether it
+    ! has a time dimension.
+    call find_varname_in_file(fileObj, fieldname, "read_field_2d_region: ", filename, var_to_read)
+
+    ! Read the data.
+    call fms2_read_data(fileobj, var_to_read, data, corner=start(1:3), edge_lengths=nread(1:3))
+
+    ! Close the file-set.
+    if (check_if_open(fileobj)) call fms2_close_file(fileobj)
+  endif
+
+  if (present(scale)) then ; if (scale /= 1.0) then
+    if (present(MOM_Domain)) then
+      call rescale_comp_data(MOM_Domain, data, scale)
+    else
+      ! Dangerously rescale the whole array
+      data(:,:,:) = scale*data(:,:,:)
+    endif
+  endif ; endif
+
+end subroutine read_field_3d_region
 
 !> This routine uses the fms_io subroutine read_data to read a distributed
 !! 4-D data field named "fieldname" from file "filename".  Valid values for
@@ -1747,9 +1817,10 @@ integer function write_time_if_later(IO_handle, field_time)
   if ((field_time > IO_handle%file_time) .or. (IO_handle%num_times == 0)) then
     IO_handle%file_time = field_time
     IO_handle%num_times = IO_handle%num_times + 1
-    call get_unlimited_dimension_name(IO_handle%fileobj, dim_unlim_name)
-    call write_data(IO_handle%fileobj, trim(dim_unlim_name), (/field_time/), &
-                    corner=(/IO_handle%num_times/), edge_lengths=(/1/))
+    dim_unlim_name = find_unlimited_dimension_name(IO_handle%fileobj)
+    if (len_trim(dim_unlim_name) > 0) &
+      call write_data(IO_handle%fileobj, trim(dim_unlim_name), [field_time], &
+                      corner=[IO_handle%num_times], edge_lengths=[1])
   endif
 
   write_time_if_later = IO_handle%num_times
@@ -1934,5 +2005,35 @@ subroutine write_metadata_global(IO_handle, name, attribute)
 
   call register_global_attribute(IO_handle%fileobj, name, attribute, len_trim(attribute))
 end subroutine write_metadata_global
+
+!> Return unlimited dimension name in file, or empty string if none exists.
+function find_unlimited_dimension_name(fileobj) result(label)
+  type(FmsNetcdfDomainFile_t), intent(in) :: fileobj
+    !< File handle
+  character(len=:), allocatable :: label
+    !< Unlimited dimension name, or empty string if none exists
+
+  integer :: ndims
+    !< Number of dimensions
+  character(len=256), allocatable :: dim_names(:)
+    !< File handle dimension names
+  integer :: i
+    !< Loop index
+
+  ndims = get_num_dimensions(fileobj)
+  allocate(dim_names(ndims))
+  call get_dimension_names(fileobj, dim_names)
+
+  do i = 1, ndims
+    if (is_dimension_unlimited(fileobj, dim_names(i))) then
+      label = trim(dim_names(i))
+      exit
+    endif
+  enddo
+  deallocate(dim_names)
+
+  if (.not. allocated(label)) &
+    label = ''
+end function find_unlimited_dimension_name
 
 end module MOM_io_infra
