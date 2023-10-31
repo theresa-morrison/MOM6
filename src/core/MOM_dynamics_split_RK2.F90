@@ -77,7 +77,7 @@ implicit none ; private
 #include <MOM_memory.h>
 
 !> MOM_dynamics_split_RK2 module control structure
-type, public :: MOM_dyn_split_RK2_CS ; private
+type, public :: MOM_dyn_split_RK2_CS ; ! private
   real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_,NKMEM_) :: &
     CAu, &    !< CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
     CAu_pred, & !< The predictor step value of CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
@@ -180,6 +180,8 @@ type, public :: MOM_dyn_split_RK2_CS ; private
 
   !>@{ Diagnostic IDs
   integer :: id_uh     = -1, id_vh     = -1
+  integer :: id_uh_diag_precon= -1, id_vh_diag_precon= -1
+  integer :: id_uh_diag_pstcon= -1, id_vh_diag_pstcon= -1
   integer :: id_umo    = -1, id_vmo    = -1
   integer :: id_umo_2d = -1, id_vmo_2d = -1
   integer :: id_PFu    = -1, id_PFv    = -1
@@ -342,6 +344,18 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_in ! The meridional mass transports that would be
                                 ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
 
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_precon ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_precon ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_precon  ! Diagnosed thickness [H ~> m or kg m-2].
+
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_pstcon ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_pstcon ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_pstcon  ! Diagnosed thickness [H ~> m or kg m-2].
+  
   real, dimension(SZI_(G),SZJ_(G)) :: eta_pred ! The predictor value of the free surface height
                                                ! or column mass [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJ_(G)) :: SpV_avg  ! The column averaged specific volume [R-1 ~> m3 kg-1]
@@ -416,6 +430,9 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     call check_redundant("Start predictor u ", u, v, G, unscale=US%L_T_to_m_s)
     call check_redundant("Start predictor uh ", uh, vh, G, unscale=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
   endif
+ ! TJM
+  !call continuity(u, v, h, h_diag, uh_diag, vh_diag, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+   !                visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v, BT_cont=CS%BT_cont)
 
   dyn_p_surf = associated(p_surf_begin) .and. associated(p_surf_end)
   if (dyn_p_surf) then
@@ -929,6 +946,9 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     call do_group_pass(CS%pass_uv, G%Domain, clock=id_clock_pass)
   endif
 
+ ! TJM
+  call continuity(u, v, h, h_diag_precon, uh_diag_precon, vh_diag_precon, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+                  visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v, BT_cont=CS%BT_cont)
   ! uh = u_av * h
   ! h  = h + dt * div . uh
   ! u_av and v_av adjusted so their mass transports match uhbt and vhbt.
@@ -937,6 +957,10 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
                   CS%uhbt, CS%vhbt, CS%visc_rem_u, CS%visc_rem_v, u_av, v_av)
   call cpu_clock_end(id_clock_continuity)
   call do_group_pass(CS%pass_h, G%Domain, clock=id_clock_pass)
+
+ ! TJM
+  call continuity(u, v, h, h_diag_pstcon, uh_diag_pstcon, vh_diag_pstcon, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+                  visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v, BT_cont=CS%BT_cont)
   ! Whenever thickness changes let the diag manager know, target grids
   ! for vertical remapping may need to be regenerated.
   call diag_update_remap_grids(CS%diag)
@@ -1007,6 +1031,12 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   if (CS%id_vav        > 0) call post_data(CS%id_vav, v_av,                 CS%diag)
   if (CS%id_u_BT_accel > 0) call post_data(CS%id_u_BT_accel, CS%u_accel_bt, CS%diag)
   if (CS%id_v_BT_accel > 0) call post_data(CS%id_v_BT_accel, CS%v_accel_bt, CS%diag)
+  
+  if (CS%id_uh_diag_precon> 0) call post_data(CS%id_uh_diag_precon, uh_diag_precon, CS%diag)
+  if (CS%id_vh_diag_precon> 0) call post_data(CS%id_vh_diag_precon, vh_diag_precon, CS%diag)
+
+  if (CS%id_uh_diag_pstcon> 0) call post_data(CS%id_uh_diag_pstcon, uh_diag_pstcon, CS%diag)
+  if (CS%id_vh_diag_pstcon> 0) call post_data(CS%id_vh_diag_pstcon, vh_diag_pstcon, CS%diag)
 
   ! Calculate effective areas and post data
   if (CS%id_ueffA > 0) then
@@ -1526,6 +1556,19 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
       'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
       y_cell_method='sum', v_extensive=.true.)
   CS%id_vh = register_diag_field('ocean_model', 'vh', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+
+  CS%id_uh_diag_precon = register_diag_field('ocean_model', 'uh_diag_precon', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  CS%id_vh_diag_precon = register_diag_field('ocean_model', 'vh_diag_precon', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+  CS%id_uh_diag_pstcon = register_diag_field('ocean_model', 'uh_diag_pstcon', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  CS%id_vh_diag_pstcon = register_diag_field('ocean_model', 'vh_diag_pstcon', diag%axesCvL, Time, &
       'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
       x_cell_method='sum', v_extensive=.true.)
 

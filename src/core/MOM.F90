@@ -147,6 +147,10 @@ use MOM_verticalGrid,          only : get_thickness_units, get_flux_units, get_t
 use MOM_wave_interface,        only : wave_parameters_CS, waves_end, waves_register_restarts
 use MOM_wave_interface,        only : Update_Stokes_Drift
 
+use MOM_continuity,            only : continuity, continuity_CS
+use MOM_variables,    only : vertvisc_type, thermo_var_ptrs, porous_barrier_type
+use MOM_verticalGrid,          only : get_flux_units, get_tr_flux_units
+
 ! Database client used for machine-learning interface
 use MOM_database_comms,       only : dbcomms_CS_type, database_comms_init, dbclient_type
 
@@ -181,6 +185,10 @@ type MOM_diag_IDs
   !>@}
   !> 2-d state field diagnostic ID
   integer :: id_ssh_inst = -1
+  integer :: id_uh_diag_preALE= -1, id_vh_diag_preALE= -1
+  integer :: id_uh_diag_pstALE= -1, id_vh_diag_pstALE= -1
+  integer :: id_uh_diag_preDIA= -1, id_vh_diag_preDIA= -1
+  integer :: id_uh_diag_pstDIA= -1, id_vh_diag_pstDIA= -1
 end type MOM_diag_IDs
 
 !> Control structure for the MOM module, including the variables that describe
@@ -1494,6 +1502,28 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
   type(wave_parameters_CS), &
                   optional, pointer       :: Waves  !< Container for wave related parameters
                                                     !! the fields in Waves are intent in here.
+  
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_preALE ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_preALE ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_preALE  ! Diagnosed thickness [H ~> m or kg m-2].
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_pstALE ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_pstALE ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_pstALE  ! Diagnosed thickness [H ~> m or kg m-2].
+
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_preDIA ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_preDIA ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_preDIA  ! Diagnosed thickness [H ~> m or kg m-2].
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_pstDIA ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_pstDIA ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_pstDIA  ! Diagnosed thickness [H ~> m or kg m-2].
 
   real :: h_new(SZI_(G),SZJ_(G),SZK_(GV))      ! Layer thicknesses after regridding [H ~> m or kg m-2]
   real :: dzRegrid(SZI_(G),SZJ_(G),SZK_(GV)+1) ! The change in grid interface positions due to regridding,
@@ -1566,6 +1596,10 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
       call MOM_forcing_chksum("Pre-diabatic", fluxes, G, US, haloshift=0)
     endif
 
+    ! TJM
+    call continuity(u, v, h, h_diag_preDIA, uh_diag_preDIA, vh_diag_preDIA, dtdia, G, GV, US, CS%dyn_split_RK2_CSp%continuity_CSp, CS%dyn_split_RK2_CSp%OBC, CS%pbv, &
+                    visc_rem_u=CS%dyn_split_RK2_CSp%visc_rem_u, visc_rem_v=CS%dyn_split_RK2_CSp%visc_rem_v, BT_cont=CS%dyn_split_RK2_CSp%BT_cont)
+    
     call cpu_clock_begin(id_clock_diabatic)
 
     call diabatic(u, v, h, tv, CS%Hml, fluxes, CS%visc, CS%ADp, CS%CDp, dtdia, &
@@ -1574,6 +1608,9 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
     if (showCallTree) call callTree_waypoint("finished diabatic (step_MOM_thermo)")
 
+    ! TJM
+    call continuity(u, v, h, h_diag_pstDIA, uh_diag_pstDIA, vh_diag_pstDIA, dtdia, G, GV, US, CS%dyn_split_RK2_CSp%continuity_CSp, CS%dyn_split_RK2_CSp%OBC, CS%pbv, &
+                    visc_rem_u=CS%dyn_split_RK2_CSp%visc_rem_u, visc_rem_v=CS%dyn_split_RK2_CSp%visc_rem_v, BT_cont=CS%dyn_split_RK2_CSp%BT_cont)
     ! Regridding/remapping is done here, at end of thermodynamics time step
     ! (that may comprise several dynamical time steps)
     ! The routine 'ALE_regrid' can be found in 'MOM_ALE.F90'.
@@ -1601,6 +1638,10 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
         call hchksum(tv%S,"Pre-ALE S", G%HI, haloshift=1, omit_corners=.true., scale=US%S_to_ppt)
         call check_redundant("Pre-ALE ", u, v, G, unscale=US%L_T_to_m_s)
       endif
+      ! TJM
+      call continuity(u, v, h, h_diag_preALE, uh_diag_preALE, vh_diag_preALE, dtdia, G, GV, US, CS%dyn_split_RK2_CSp%continuity_CSp, CS%dyn_split_RK2_CSp%OBC, CS%pbv, &
+                      visc_rem_u=CS%dyn_split_RK2_CSp%visc_rem_u, visc_rem_v=CS%dyn_split_RK2_CSp%visc_rem_v, BT_cont=CS%dyn_split_RK2_CSp%BT_cont)
+
       call cpu_clock_begin(id_clock_ALE)
 
       call pre_ALE_diagnostics(G, GV, US, h, u, v, tv, CS%ALE_CSp)
@@ -1670,6 +1711,9 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
       call hchksum(tv%S, "Post-ALE S", G%HI, haloshift=1, scale=US%S_to_ppt)
       call check_redundant("Post-ALE ", u, v, G, unscale=US%L_T_to_m_s)
     endif
+    ! TJM
+    call continuity(u, v, h, h_diag_pstALE, uh_diag_pstALE, vh_diag_pstALE, dtdia, G, GV, US, CS%dyn_split_RK2_CSp%continuity_CSp, CS%dyn_split_RK2_CSp%OBC, CS%pbv, &
+                    visc_rem_u=CS%dyn_split_RK2_CSp%visc_rem_u, visc_rem_v=CS%dyn_split_RK2_CSp%visc_rem_v, BT_cont=CS%dyn_split_RK2_CSp%BT_cont)
 
     ! Whenever thickness changes let the diag manager know, target grids
     ! for vertical remapping may need to be regenerated. This needs to
@@ -1678,6 +1722,18 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
     !### Consider moving this up into the if ALE block.
     call postALE_tracer_diagnostics(CS%tracer_Reg, G, GV, CS%diag, dtdia)
+
+    if (CS%IDs%id_uh_diag_preALE> 0) call post_data(CS%IDs%id_uh_diag_preALE, uh_diag_preALE, CS%diag)
+    if (CS%IDs%id_vh_diag_preALE> 0) call post_data(CS%IDs%id_vh_diag_preALE, vh_diag_preALE, CS%diag)
+
+    if (CS%IDs%id_uh_diag_pstALE> 0) call post_data(CS%IDs%id_uh_diag_pstALE, uh_diag_pstALE, CS%diag)
+    if (CS%IDs%id_vh_diag_pstALE> 0) call post_data(CS%IDs%id_vh_diag_pstALE, vh_diag_pstALE, CS%diag)
+    
+    if (CS%IDs%id_uh_diag_preDIA> 0) call post_data(CS%IDs%id_uh_diag_preDIA, uh_diag_preDIA, CS%diag)
+    if (CS%IDs%id_vh_diag_preDIA> 0) call post_data(CS%IDs%id_vh_diag_preDIA, vh_diag_preDIA, CS%diag)
+
+    if (CS%IDs%id_uh_diag_pstDIA> 0) call post_data(CS%IDs%id_uh_diag_pstDIA, uh_diag_pstDIA, CS%diag)
+    if (CS%IDs%id_vh_diag_pstDIA> 0) call post_data(CS%IDs%id_vh_diag_pstDIA, vh_diag_pstDIA, CS%diag)
 
     if (CS%debug) then
       call uvchksum("Post-diabatic u", u, v, G%HI, haloshift=2, scale=US%L_T_to_m_s)
@@ -3344,6 +3400,7 @@ subroutine register_diags(Time, G, GV, US, IDs, diag)
   type(diag_ctrl),         intent(inout) :: diag  !< regulates diagnostic output
 
   character(len=48) :: thickness_units
+  character(len=48) :: flux_units
 
   thickness_units = get_thickness_units(GV)
 
@@ -3357,6 +3414,33 @@ subroutine register_diags(Time, G, GV, US, IDs, diag)
       v_extensive=.true.)
   IDs%id_ssh_inst = register_diag_field('ocean_model', 'SSH_inst', diag%axesT1, &
       Time, 'Instantaneous Sea Surface Height', 'm', conversion=US%Z_to_m)
+
+  flux_units = get_flux_units(GV)
+  IDs%id_uh_diag_preALE = register_diag_field('ocean_model', 'uh_diag_preALE', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  IDs%id_vh_diag_preALE = register_diag_field('ocean_model', 'vh_diag_preALE', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+  IDs%id_uh_diag_pstALE = register_diag_field('ocean_model', 'uh_diag_pstALE', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  IDs%id_vh_diag_pstALE = register_diag_field('ocean_model', 'vh_diag_pstALE', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+  IDs%id_uh_diag_preDIA = register_diag_field('ocean_model', 'uh_diag_preDIA', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  IDs%id_vh_diag_preDIA = register_diag_field('ocean_model', 'vh_diag_preDIA', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+  IDs%id_uh_diag_pstDIA = register_diag_field('ocean_model', 'uh_diag_pstDIA', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  IDs%id_vh_diag_pstDIA = register_diag_field('ocean_model', 'vh_diag_pstDIA', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+
 
 end subroutine register_diags
 

@@ -95,12 +95,12 @@ subroutine continuity(u, v, hin, h, uh, vh, dt, G, GV, US, CS, OBC, pbv, uhbt, v
       "MOM_continuity: Either both u_cor and v_cor or neither"// &
        " one must be present in call to continuity.")
 
-  if (CS%continuity_scheme == PPM_SCHEME) then
+  !if (CS%continuity_scheme == PPM_SCHEME) then
     call continuity_PPM(u, v, hin, h, uh, vh, dt, G, GV, US, CS%PPM, OBC, pbv, uhbt, vhbt, &
                         visc_rem_u, visc_rem_v, u_cor, v_cor, BT_cont=BT_cont)
-  else
-    call MOM_error(FATAL, "continuity: Unrecognized value of continuity_scheme")
-  endif
+  !else
+  !  call MOM_error(FATAL, "continuity: Unrecognized value of continuity_scheme")
+  !endif
 
 end subroutine continuity
 
