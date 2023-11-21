@@ -133,6 +133,12 @@ type, public :: MOM_dyn_split_RK2_CS ; ! private
   real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_)        :: vhbt   !< average y-volume or mass flux determined by the
                                                                   !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
                                                                   !! vhbt is roughly equal to vertical sum of vh.
+  real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_)        :: uhbt_recon!< average x-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! uhbt is roughly equal to the vertical sum of uh.
+  real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_)        :: vhbt_recon!< average y-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! vhbt is roughly equal to vertical sum of vh.
   real ALLOCABLE_, dimension(NIMEM_,NJMEM_,NKMEM_)      :: pbce   !< pbce times eta gives the baroclinic pressure
                                                                   !! anomaly in each layer due to free surface height
                                                                   !! anomalies [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2].
@@ -656,7 +662,8 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, SpV_avg, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, &
+              last_step=.false., uhbt_recon=CS%uhbt_recon, vhbt_recon=CS%vhbt_recon)
   if (showCallTree) call callTree_leave("btstep()")
   call cpu_clock_end(id_clock_btstep)
 
@@ -878,7 +885,8 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, SpV_avg, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av)
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av, &
+              last_step=.true., uhbt_recon=CS%uhbt_recon, vhbt_recon=CS%vhbt_recon)
   if (CS%id_deta_dt>0) then
     do j=js,je ; do i=is,ie ; deta_dt(i,j) = (eta_pred(i,j) - eta(i,j))*Idt_bc ; enddo ; enddo
   endif
@@ -1171,6 +1179,9 @@ subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_C
   ALLOC_(CS%v_av(isd:ied,JsdB:JedB,nz)) ; CS%v_av(:,:,:) = 0.0
   ALLOC_(CS%h_av(isd:ied,jsd:jed,nz))   ; CS%h_av(:,:,:) = GV%Angstrom_H
 
+  ALLOC_(CS%uhbt_recon(IsdB:IedB,jsd:jed)) ; CS%uhbt_recon(:,:) = 0.0
+  ALLOC_(CS%vhbt_recon(isd:ied,JsdB:JedB)) ; CS%vhbt_recon(:,:) = 0.0
+
   thickness_units = get_thickness_units(GV)
   flux_units = get_flux_units(GV)
 
@@ -1214,6 +1225,11 @@ subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_C
   call register_restart_pair(CS%diffu, CS%diffv, vd(1), vd(2), .false., restart_CS, &
                              conversion=US%L_T2_to_m_s2)
 
+  vd(1) = var_desc("uhbt_recon", flux_units, "Zonal thickness flux", 'u', z_grid='1', t_grid='s')
+  vd(2) = var_desc("vhbt_recon", flux_units, "Meridional thickness flux", 'v', z_grid='1', t_grid='s')
+  call register_restart_pair(CS%uhbt_recon, CS%vhbt_recon, vd(1), vd(2), .false., restart_CS, &
+                             conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
+  
   call register_barotropic_restarts(HI, GV, US, param_file, CS%barotropic_CSp, restart_CS)
 
 end subroutine register_restarts_dyn_split_RK2
@@ -1385,6 +1401,9 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
   ALLOC_(CS%PFu_Stokes(IsdB:IedB,jsd:jed,nz)) ; CS%PFu_Stokes(:,:,:) = 0.0
   ALLOC_(CS%PFv_Stokes(isd:ied,JsdB:JedB,nz)) ; CS%PFv_Stokes(:,:,:) = 0.0
 
+  !ALLOC_(CS%uhbt_recon(IsdB:IedB,jsd:jed))       ; CS%uhbt_recon(:,:)      = 0.0
+  !ALLOC_(CS%vhbt_recon(isd:ied,JsdB:JedB))       ; CS%vhbt_recon(:,:)      = 0.0
+
   MIS%diffu      => CS%diffu
   MIS%diffv      => CS%diffv
   MIS%PFu        => CS%PFu
@@ -1539,6 +1558,13 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
       endif
     endif
   endif
+
+  if (.not. query_initialized(CS%uhbt_recon, "uhbt_recon", restart_CS)) &
+    call set_initialized(CS%uhbt_recon, "uhbt_recon", restart_CS)
+
+  if (.not. query_initialized(CS%vhbt_recon, "vhbt_recon", restart_CS)) &
+    call set_initialized(CS%vhbt_recon, "vhbt_recon", restart_CS)
+ 
   call cpu_clock_begin(id_clock_pass_init)
   call create_group_pass(pass_av_h_uvh, CS%u_av, CS%v_av, G%Domain, halo=2)
   if (CS%CAu_pred_stored) then
@@ -1788,6 +1814,7 @@ subroutine end_dyn_split_RK2(CS)
   if (associated(CS%taux_bot)) deallocate(CS%taux_bot)
   if (associated(CS%tauy_bot)) deallocate(CS%tauy_bot)
   DEALLOC_(CS%uhbt) ; DEALLOC_(CS%vhbt)
+  DEALLOC_(CS%uhbt_recon) ; DEALLOC_(CS%vhbt_recon)
   DEALLOC_(CS%u_accel_bt) ; DEALLOC_(CS%v_accel_bt)
   DEALLOC_(CS%visc_rem_u) ; DEALLOC_(CS%visc_rem_v)
 
