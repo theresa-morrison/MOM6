@@ -315,6 +315,7 @@ type, public :: barotropic_CS ; private
   integer :: id_ubt = -1, id_vbt = -1, id_eta_bt = -1, id_ubtav = -1, id_vbtav = -1
   integer :: id_ubt_recon = -1, id_vbt_recon = -1 
   integer :: id_uhbt_recon = -1, id_vhbt_recon = -1 
+  integer :: id_uhbt_wtd = -1, id_vhbt_wtd = -1 
   integer :: id_ubt_st = -1, id_vbt_st = -1, id_eta_st = -1
   integer :: id_ubtdt = -1, id_vbtdt = -1
   integer :: id_ubt_hifreq = -1, id_vbt_hifreq = -1, id_eta_hifreq = -1
@@ -721,6 +722,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   real :: sum_wt_eta     ! The sum of the raw weights used to find average eta [nondim]
   real :: sum_wt_accel   ! The sum of the raw weights used to find average accelerations [nondim]
   real :: sum_wt_trans   ! The sum of the raw weights used to find average transports [nondim]
+  real :: I_sum_wt_recon ! The inverse of the sum of the raw weights used to find 
   real :: I_sum_wt_vel   ! The inverse of the sum of the raw weights used to find average velocities [nondim]
   real :: I_sum_wt_eta   ! The inverse of the sum of the raw weights used to find eta [nondim]
   real :: I_sum_wt_accel ! The inverse of the sum of the raw weights used to find average accelerations [nondim]
@@ -1412,19 +1414,19 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   !if (CS%gradual_BT_ICs) then
   !  !$OMP parallel do default(shared)
     do j=js,je ; do I=is-1,ie
-    !  ubt_recon(I,j) = uhbt_to_ubt(uhbt_recon(I,j)*dt, BTCL_u(I,j)) * Idt
-    !  ubt(I,j) = ubt_recon(I,j)
-    !  if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
-    !  BT_force_u(I,j) = BT_force_u(I,j) + (ubt(I,j) - ubt_recon(I,j)) * Idt
+      ubt_recon(I,j) = uhbt_to_ubt(uhbt_recon(I,j), BTCL_u(I,j)) 
+  !    BT_force_u(I,j) = BT_force_u(I,j) + (ubt(I,j) - ubt_recon(I,j)) * Idt
+  !    ubt(I,j) = ubt_recon(I,j)
+  !    if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
     enddo ; enddo
-  !  !$OMP parallel do default(shared)
+  !!  !$OMP parallel do default(shared)
     do J=js-1,je ; do i=is,ie
-    !  vbt_recon(i,J) = vhbt_to_vbt(vhbt_recon(i,J)*dt, BTCL_v(i,J)) * Idt
-    !  vbt(i,J) = vbt_recon(i,J)
-    !  if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
-    ! BT_force_v(i,J) = BT_force_v(i,J) + (vbt(I,j) - vbt_recon(i,J)) * Idt
+      vbt_recon(i,J) = vhbt_to_vbt(vhbt_recon(i,J), BTCL_v(i,J)) 
+   !   BT_force_v(i,J) = BT_force_v(i,J) + (vbt(i,J) - vbt_recon(i,J)) * Idt
+   !   vbt(i,J) = vbt_recon(i,J)
+   !   if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
     enddo ; enddo
-  !endif
+ ! !endif
 
   if ((Isq > is-1) .or. (Jsq > js-1)) then
     ! Non-symmetric memory is being used, so the edge values need to be
@@ -1836,13 +1838,17 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   do n=nstep+nfilter,1,-1
     wt_trans(n) = wt_trans(n+1) + wt_eta(n)
     wt_accel(n) = wt_accel(n+1) + wt_vel(n)
+   !wt_recon(n) = wt_recon(n+1) + wt_eta(n)
     sum_wt_accel = sum_wt_accel + wt_accel(n) ; sum_wt_trans = sum_wt_trans + wt_trans(n)
+   !sum_wt_recon = sum_wt_recon + wt_recon(n) 
   enddo
   ! Normalize the weights.
   I_sum_wt_vel = 1.0 / sum_wt_vel ; I_sum_wt_accel = 1.0 / sum_wt_accel
   I_sum_wt_eta = 1.0 / sum_wt_eta ; I_sum_wt_trans = 1.0 / sum_wt_trans
+  I_sum_wt_recon = 1.0 / sum_wt_recon 
   do n=1,nstep+nfilter
     wt_vel(n) = wt_vel(n) * I_sum_wt_vel
+    wt_recon(n) = wt_recon(n) * I_sum_wt_recon
     if (CS%answer_date < 20190101) then
       wt_accel2(n) = wt_accel(n)
      ! wt_trans(n) = wt_trans(n) * I_sum_wt_trans
@@ -2406,19 +2412,19 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     !$OMP end do nowait
 
     ! TJM
-    do j=js,je ; do I=is-1,ie
-      ubt_recon(I,j) = uhbt_to_ubt(uhbt_wtd(I,j)*dt, BTCL_u(I,j))*Idt
+    !do j=js,je ; do I=is-1,ie
+    !  ubt_recon(I,j) = uhbt_to_ubt(uhbt_wtd(I,j), BTCL_u(I,j))
     !  ubt(I,j) = ubt_recon(I,j)
     !  if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
     !  BT_force_u(I,j) = BT_force_u(I,j) + (ubt(I,j) - ubt_recon(I,j)) * Idt
-    enddo ; enddo
+    !enddo ; enddo
   !  !$OMP parallel do default(shared)
-    do J=js-1,je ; do i=is,ie
-      vbt_recon(i,J) = vhbt_to_vbt(vhbt_wtd(i,J)*dt, BTCL_v(i,J))*Idt
+    !do J=js-1,je ; do i=is,ie
+    !  vbt_recon(i,J) = vhbt_to_vbt(vhbt_wtd(i,J), BTCL_v(i,J))
     !  vbt(i,J) = vbt_recon(i,J)
     !  if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
     ! BT_force_v(i,J) = BT_force_v(i,J) + (vbt(I,j) - vbt_recon(i,J)) * Idt
-    enddo ; enddo
+    !enddo ; enddo
 
     if (apply_OBCs) then
 
@@ -2536,23 +2542,29 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
   enddo ! end of do n=1,ntimestep
   if (is_last_step) then
-    uhbt_recon(:,:) = uhbt_wtd(:,:)
-    vhbt_recon(:,:) = vhbt_wtd(:,:)
-  endif
     ! TJM
     do j=js,je ; do I=is-1,ie
-      ubt_recon(I,j) = uhbt_to_ubt(uhbt_wtd(I,j), BTCL_u(I,j))
+    !  uhbt_recon(I,j) = uhbt_wtd(I,j)
+    !  uhbt_recon(I,j) = find_uhbt(ubt_wtd(I,j), BTCL_u(I,j))
+    !  uhbt_recon(I,j) = find_uhbt(ubt(I,j), BTCL_u(I,j))
+      uhbt_recon(I,j) = find_uhbt(ubt_trans(I,j), BTCL_u(I,j)) ! + uhbt0(I,j)
+    !  ubt_recon(I,j)  = uhbt_to_ubt(uhbt_recon(I,j), BTCL_u(I,j))
     !  ubt(I,j) = ubt_recon(I,j)
     !  if (abs(ubt(I,j)) < CS%vel_underflow) ubt(I,j) = 0.0
     !  BT_force_u(I,j) = BT_force_u(I,j) + (ubt(I,j) - ubt_recon(I,j)) * Idt
     enddo ; enddo
   !  !$OMP parallel do default(shared)
     do J=js-1,je ; do i=is,ie
-      vbt_recon(i,J) = vhbt_to_vbt(vhbt_wtd(i,J), BTCL_v(i,J)) 
+    !  vhbt_recon(i,J) = vhbt_wtd(i,J)
+    !  vhbt_recon(i,J) = find_vhbt(vbt_wtd(i,J), BTCL_v(i,J))
+    !  vhbt_recon(i,J) = find_vhbt(vbt(i,J), BTCL_v(i,J))
+      vhbt_recon(i,J) = find_vhbt(vbt_trans(i,J), BTCL_v(i,J)) ! + vhbt0(i,J)
+    !  vbt_recon(i,J)  = vhbt_to_vbt(vhbt_recon(i,J), BTCL_v(i,J)) 
     !  vbt(i,J) = vbt_recon(i,J)
     !  if (abs(vbt(i,J)) < CS%vel_underflow) vbt(i,J) = 0.0
     ! BT_force_v(i,J) = BT_force_v(i,J) + (vbt(I,j) - vbt_recon(i,J)) * Idt
     enddo ; enddo
+  endif
 
   if (id_clock_calc > 0) call cpu_clock_end(id_clock_calc)
   if (id_clock_calc_post > 0) call cpu_clock_begin(id_clock_calc_post)
@@ -2775,6 +2787,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     if (CS%id_frhatu1 > 0) call post_data(CS%id_frhatu1, CS%frhatu1, CS%diag)
     if (CS%id_frhatv1 > 0) call post_data(CS%id_frhatv1, CS%frhatv1, CS%diag)
 
+    if (CS%id_uhbt_wtd > 0) call post_data(CS%id_uhbt_wtd, uhbt_wtd(IsdB:IedB,jsd:jed), CS%diag)
+    if (CS%id_vhbt_wtd > 0) call post_data(CS%id_vhbt_wtd, vhbt_wtd(isd:ied,JsdB:JedB), CS%diag)
     if (CS%id_uhbt_recon > 0) call post_data(CS%id_uhbt_recon, uhbt_recon(IsdB:IedB,jsd:jed), CS%diag)
     if (CS%id_vhbt_recon > 0) call post_data(CS%id_vhbt_recon, vhbt_recon(isd:ied,JsdB:JedB), CS%diag)
     if (CS%id_ubt_recon  > 0) call post_data(CS%id_ubt_recon , ubt_recon(IsdB:IedB,jsd:jed), CS%diag)
@@ -5055,11 +5069,17 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
       'Barotropic end zonal velocity', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_vbt_recon = register_diag_field('ocean_model', 'vbt_recon', diag%axesCv1, Time, &
       'Barotropic end meridional velocity', 'm s-1', conversion=US%L_T_to_m_s)
-  CS%id_uhbt_recon = register_diag_field('ocean_model', 'uhbt_recon', diag%axesCu1, Time, &
-      'Barotropic zonal transport IC', &
+!  CS%id_uhbt_recon = register_diag_field('ocean_model', 'uhbt_recon', diag%axesCu1, Time, &
+!      'Barotropic zonal transport IC', &
+!      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
+!  CS%id_vhbt_recon = register_diag_field('ocean_model', 'vhbt_recon', diag%axesCv1, Time, &
+!      'Barotropic meridional transport IC', &
+!      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
+  CS%id_uhbt_wtd = register_diag_field('ocean_model', 'uhbt_wtd', diag%axesCu1, Time, &
+      'Barotropic zonal transport - Weighted', &
       'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
-  CS%id_vhbt_recon = register_diag_field('ocean_model', 'vhbt_recon', diag%axesCv1, Time, &
-      'Barotropic meridional transport IC', &
+  CS%id_vhbt_wtd = register_diag_field('ocean_model', 'vhbt_wtd', diag%axesCv1, Time, &
+      'Barotropic meridional transport - Weighted', &
       'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
   CS%id_eta_st = register_diag_field('ocean_model', 'eta_st', diag%axesT1, Time, &
       'Barotropic start SSH', thickness_units, conversion=GV%H_to_MKS)
