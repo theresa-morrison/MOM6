@@ -80,7 +80,7 @@ implicit none ; private
 #include <MOM_memory.h>
 
 !> MOM_dynamics_split_RK2 module control structure
-type, public :: MOM_dyn_split_RK2_CS ; private
+type, public :: MOM_dyn_split_RK2_CS ; ! private
   real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_,NKMEM_) :: &
     CAu, &    !< CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
     CAu_pred, & !< The predictor step value of CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
@@ -136,6 +136,18 @@ type, public :: MOM_dyn_split_RK2_CS ; private
   real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_)        :: vhbt   !< average y-volume or mass flux determined by the
                                                                   !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
                                                                   !! vhbt is roughly equal to vertical sum of vh.
+  real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_)        :: uhbt_recon_bt!< average x-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! uhbt is roughly equal to the vertical sum of uh.
+  real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_)        :: vhbt_recon_bt!< average y-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! vhbt is roughly equal to vertical sum of vh.
+  real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_)        :: uhbt_recon!< average x-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! uhbt is roughly equal to the vertical sum of uh.
+  real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_)        :: vhbt_recon!< average y-volume or mass flux determined by the
+                                                                  !! barotropic solver [H L2 T-1 ~> m3 s-1 or kg s-1].
+                                                                  !! vhbt is roughly equal to vertical sum of vh.
   real ALLOCABLE_, dimension(NIMEM_,NJMEM_,NKMEM_)      :: pbce   !< pbce times eta gives the baroclinic pressure
                                                                   !! anomaly in each layer due to free surface height
                                                                   !! anomalies [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2].
@@ -186,6 +198,10 @@ type, public :: MOM_dyn_split_RK2_CS ; private
   !>@{ Diagnostic IDs
   integer :: id_uold   = -1, id_vold   = -1
   integer :: id_uh     = -1, id_vh     = -1
+  integer :: id_uh_diag_precon= -1, id_vh_diag_precon= -1
+  integer :: id_uh_diag_pstcon= -1, id_vh_diag_pstcon= -1
+  integer :: id_uhbt_recon= -1, id_vhbt_recon= -1
+  integer :: id_uhbt_recon_bt= -1, id_vhbt_recon_bt= -1
   integer :: id_umo    = -1, id_vmo    = -1
   integer :: id_umo_2d = -1, id_vmo_2d = -1
   integer :: id_PFu    = -1, id_PFv    = -1
@@ -333,6 +349,7 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)) :: up  ! Predicted zonal velocity [L T-1 ~> m s-1].
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: vp  ! Predicted meridional velocity [L T-1 ~> m s-1].
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV))  :: hp  ! Predicted thickness [H ~> m or kg m-2].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV))  :: h0  ! 
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV))  :: dz  ! Distance between the interfaces around a layer [Z ~> m]
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)) :: ueffA   ! Effective Area of U-Faces [H L ~> m2]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: veffA   ! Effective Area of V-Faces [H L ~> m2]
@@ -348,6 +365,23 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_in ! The meridional mass transports that would be
                                 ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
 
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)) :: uh0 ! The zonal mass transports that would be
+                                ! obtained using the final velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: vh0 ! The meridional mass transports that would be
+                                ! obtained using the final velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_precon ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_precon ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_precon  ! Diagnosed thickness [H ~> m or kg m-2].
+
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), target :: uh_diag_pstcon ! The zonal mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), target :: vh_diag_pstcon ! The meridional mass transports that would be
+                                ! obtained using the initial velocities [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), target  :: h_diag_pstcon  ! Diagnosed thickness [H ~> m or kg m-2].
+  
   real, dimension(SZI_(G),SZJ_(G)) :: eta_pred ! The predictor value of the free surface height
                                                ! or column mass [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJ_(G)) :: SpV_avg  ! The column averaged specific volume [R-1 ~> m3 kg-1]
@@ -427,6 +461,9 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     call check_redundant("Start predictor u ", u, v, G, unscale=US%L_T_to_m_s)
     call check_redundant("Start predictor uh ", uh, vh, G, unscale=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
   endif
+ ! TJM
+  !call continuity(u, v, h, h_diag, uh_diag, vh_diag, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+   !                visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v, BT_cont=CS%BT_cont)
 
   dyn_p_surf = associated(p_surf_begin) .and. associated(p_surf_end)
   if (dyn_p_surf) then
@@ -650,7 +687,8 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, SpV_avg, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, &
+              last_step=.false., uhbt_recon=CS%uhbt_recon_bt, vhbt_recon=CS%vhbt_recon_bt)
   if (showCallTree) call callTree_leave("btstep()")
   call cpu_clock_end(id_clock_btstep)
 
@@ -902,11 +940,14 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
               CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
               CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, SpV_avg, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av)
+              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av, &
+              last_step=.true., uhbt_recon=CS%uhbt_recon_bt, vhbt_recon=CS%vhbt_recon_bt)
   if (CS%id_deta_dt>0) then
     do j=js,je ; do i=is,ie ; deta_dt(i,j) = (eta_pred(i,j) - eta(i,j))*Idt_bc ; enddo ; enddo
   endif
   do j=js,je ; do i=is,ie ; eta(i,j) = eta_pred(i,j) ; enddo ; enddo
+  CS%uhbt_recon_bt(:,:) = CS%uhbt_recon_bt(:,:)
+  CS%vhbt_recon_bt(:,:) = CS%vhbt_recon_bt(:,:)
 
   call cpu_clock_end(id_clock_btstep)
   if (showCallTree) call callTree_leave("btstep()")
@@ -929,7 +970,20 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     enddo ; enddo
   enddo
   call cpu_clock_end(id_clock_mom_update)
+  
+  ! call continuity(u, v, h, h0, uh0, vh0, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+  !                 CS%uhbt, CS%vhbt, CS%visc_rem_u, CS%visc_rem_v, u_av, v_av)
+  ! ! Calculate and save [uv]hbt_recon which comes from the sum of the layer fluxes
+  !   do j=js,je ; do I=is-1,ie ; CS%uhbt_recon(I,j) = 0.0 ; enddo ; enddo
+  !   do J=js-1,je ; do i=is,ie ; CS%vhbt_recon(i,J) = 0.0 ; enddo ; enddo
+  !   do j=js,je ; do k=1,nz ; do I=is-1,ie
+  !     CS%uhbt_recon(I,j) = CS%uhbt_recon(I,j) + uh0(I,j,k)
+  !   enddo ; enddo ; enddo
+  !   do J=js-1,je ; do k=1,nz ; do i=is,ie
+  !     CS%vhbt_recon(i,J) = CS%vhbt_recon(i,J) + vh0(i,J,k)
+  !   enddo ; enddo ; enddo
 
+  ! Calculate and save [uv]hbt_recon which comes from the sum of the layer fluxes
   if (CS%debug) then
     call uvchksum("Corrector 1 [uv]", u, v, G%HI, haloshift=0, symmetric=sym, scale=US%L_T_to_m_s)
     call hchksum(h, "Corrector 1 h", G%HI, haloshift=1, scale=GV%H_to_MKS)
@@ -996,6 +1050,9 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     call do_group_pass(CS%pass_uv, G%Domain, clock=id_clock_pass)
   endif
 
+ ! TJM
+  call continuity(u, v, h, h_diag_precon, uh_diag_precon, vh_diag_precon, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+                  visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v)
   ! uh = u_av * h
   ! h  = h + dt * div . uh
   ! u_av and v_av adjusted so their mass transports match uhbt and vhbt.
@@ -1004,6 +1061,24 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
                   CS%uhbt, CS%vhbt, CS%visc_rem_u, CS%visc_rem_v, u_av, v_av)
   call cpu_clock_end(id_clock_continuity)
   call do_group_pass(CS%pass_h, G%Domain, clock=id_clock_pass)
+
+ ! TJM
+  call continuity(u, v, h, h_diag_pstcon, uh_diag_pstcon, vh_diag_pstcon, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
+                  visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v)
+
+  ! Calculate and save [uv]hbt_recon which comes from the sum of the layer fluxes
+  call continuity(u_av, v_av, h, h0, uh0, vh0, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv)
+    do j=js,je ; do I=is-1,ie ; CS%uhbt_recon(I,j) = 0.0 ; enddo ; enddo
+    do J=js-1,je ; do i=is,ie ; CS%vhbt_recon(i,J) = 0.0 ; enddo ; enddo
+    do j=js,je ; do k=1,nz ; do I=is-1,ie
+      CS%uhbt_recon(I,j) = CS%uhbt_recon(I,j) + uh0(I,j,k)
+    !  CS%uhbt_recon(I,j) = CS%uhbt(I,j)
+    enddo ; enddo ; enddo
+    do J=js-1,je ; do k=1,nz ; do i=is,ie
+      CS%vhbt_recon(i,J) = CS%vhbt_recon(i,J) + vh0(i,J,k)
+    !  CS%vhbt_recon(i,J) = CS%vhbt(i,J) 
+    enddo ; enddo ; enddo
+ 
   ! Whenever thickness changes let the diag manager know, target grids
   ! for vertical remapping may need to be regenerated.
   call diag_update_remap_grids(CS%diag)
@@ -1078,6 +1153,18 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   if (CS%id_vav        > 0) call post_data(CS%id_vav, v_av,                 CS%diag)
   if (CS%id_u_BT_accel > 0) call post_data(CS%id_u_BT_accel, CS%u_accel_bt, CS%diag)
   if (CS%id_v_BT_accel > 0) call post_data(CS%id_v_BT_accel, CS%v_accel_bt, CS%diag)
+  
+  if (CS%id_uh_diag_precon> 0) call post_data(CS%id_uh_diag_precon, uh_diag_precon, CS%diag)
+  if (CS%id_vh_diag_precon> 0) call post_data(CS%id_vh_diag_precon, vh_diag_precon, CS%diag)
+
+  if (CS%id_uh_diag_pstcon> 0) call post_data(CS%id_uh_diag_pstcon, uh_diag_pstcon, CS%diag)
+  if (CS%id_vh_diag_pstcon> 0) call post_data(CS%id_vh_diag_pstcon, vh_diag_pstcon, CS%diag)
+
+  if (CS%id_uhbt_recon_bt> 0) call post_data(CS%id_uhbt_recon_bt, CS%uhbt_recon_bt, CS%diag)
+  if (CS%id_vhbt_recon_bt> 0) call post_data(CS%id_vhbt_recon_bt, CS%vhbt_recon_bt, CS%diag)
+
+  if (CS%id_uhbt_recon> 0) call post_data(CS%id_uhbt_recon, CS%uhbt_recon, CS%diag)
+  if (CS%id_vhbt_recon> 0) call post_data(CS%id_vhbt_recon, CS%vhbt_recon, CS%diag)
 
   ! Calculate effective areas and post data
   if (CS%id_ueffA > 0) then
@@ -1212,6 +1299,12 @@ subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_C
   ALLOC_(CS%v_av(isd:ied,JsdB:JedB,nz)) ; CS%v_av(:,:,:) = 0.0
   ALLOC_(CS%h_av(isd:ied,jsd:jed,nz))   ; CS%h_av(:,:,:) = GV%Angstrom_H
 
+  ALLOC_(CS%uhbt_recon_bt(IsdB:IedB,jsd:jed)) ; CS%uhbt_recon_bt(:,:) = 0.0
+  ALLOC_(CS%vhbt_recon_bt(isd:ied,JsdB:JedB)) ; CS%vhbt_recon_bt(:,:) = 0.0
+
+  ALLOC_(CS%uhbt_recon(IsdB:IedB,jsd:jed)) ; CS%uhbt_recon(:,:) = 0.0
+  ALLOC_(CS%vhbt_recon(isd:ied,JsdB:JedB)) ; CS%vhbt_recon(:,:) = 0.0
+
   thickness_units = get_thickness_units(GV)
   flux_units = get_flux_units(GV)
 
@@ -1255,6 +1348,16 @@ subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_C
   call register_restart_pair(CS%diffu, CS%diffv, vd(1), vd(2), .false., restart_CS, &
                              conversion=US%L_T2_to_m_s2)
 
+  vd(1) = var_desc("uhbt_recon_bt", flux_units, "Zonal thickness flux", 'u', z_grid='1', t_grid='s')
+  vd(2) = var_desc("vhbt_recon_bt", flux_units, "Meridional thickness flux", 'v', z_grid='1', t_grid='s')
+  call register_restart_pair(CS%uhbt_recon_bt, CS%vhbt_recon_bt, vd(1), vd(2), .false., restart_CS, &
+                             conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
+  
+  vd(1) = var_desc("uhbt_recon", flux_units, "Zonal thickness flux", 'u', z_grid='1', t_grid='s')
+  vd(2) = var_desc("vhbt_recon", flux_units, "Meridional thickness flux", 'v', z_grid='1', t_grid='s')
+  call register_restart_pair(CS%uhbt_recon, CS%vhbt_recon, vd(1), vd(2), .false., restart_CS, &
+                             conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
+  
   call register_barotropic_restarts(HI, GV, US, param_file, CS%barotropic_CSp, restart_CS)
 
 end subroutine register_restarts_dyn_split_RK2
@@ -1434,6 +1537,9 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
   ALLOC_(CS%PFu_Stokes(IsdB:IedB,jsd:jed,nz)) ; CS%PFu_Stokes(:,:,:) = 0.0
   ALLOC_(CS%PFv_Stokes(isd:ied,JsdB:JedB,nz)) ; CS%PFv_Stokes(:,:,:) = 0.0
 
+  !ALLOC_(CS%uhbt_recon(IsdB:IedB,jsd:jed))       ; CS%uhbt_recon(:,:)      = 0.0
+  !ALLOC_(CS%vhbt_recon(isd:ied,JsdB:JedB))       ; CS%vhbt_recon(:,:)      = 0.0
+
   MIS%diffu      => CS%diffu
   MIS%diffv      => CS%diffv
   MIS%PFu        => CS%PFu
@@ -1588,6 +1694,19 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
       endif
     endif
   endif
+
+  if (.not. query_initialized(CS%uhbt_recon, "uhbt_recon", restart_CS)) &
+    call set_initialized(CS%uhbt_recon, "uhbt_recon", restart_CS)
+
+  if (.not. query_initialized(CS%vhbt_recon, "vhbt_recon", restart_CS)) &
+    call set_initialized(CS%vhbt_recon, "vhbt_recon", restart_CS)
+ 
+  if (.not. query_initialized(CS%uhbt_recon_bt, "uhbt_recon_bt", restart_CS)) &
+    call set_initialized(CS%uhbt_recon_bt, "uhbt_recon_bt", restart_CS)
+
+  if (.not. query_initialized(CS%vhbt_recon_bt, "vhbt_recon_bt", restart_CS)) &
+    call set_initialized(CS%vhbt_recon_bt, "vhbt_recon_bt", restart_CS)
+ 
   call cpu_clock_begin(id_clock_pass_init)
   call create_group_pass(pass_av_h_uvh, CS%u_av, CS%v_av, G%Domain, halo=2)
   if (CS%CAu_pred_stored) then
@@ -1607,6 +1726,33 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
   CS%id_vh = register_diag_field('ocean_model', 'vh', diag%axesCvL, Time, &
       'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
       x_cell_method='sum', v_extensive=.true.)
+
+  CS%id_uh_diag_precon = register_diag_field('ocean_model', 'uh_diag_precon', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  CS%id_vh_diag_precon = register_diag_field('ocean_model', 'vh_diag_precon', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+  CS%id_uh_diag_pstcon = register_diag_field('ocean_model', 'uh_diag_pstcon', diag%axesCuL, Time, &
+      'Zonal Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      y_cell_method='sum', v_extensive=.true.)
+  CS%id_vh_diag_pstcon = register_diag_field('ocean_model', 'vh_diag_pstcon', diag%axesCvL, Time, &
+      'Meridional Thickness Flux', flux_units, conversion=GV%H_to_MKS*US%L_to_m**2*US%s_to_T, &
+      x_cell_method='sum', v_extensive=.true.)
+
+  CS%id_uhbt_recon_bt = register_diag_field('ocean_model', 'uhbt_recon_bt', diag%axesCu1, Time, &
+      'Barotropic zonal transport IC', &
+      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
+  CS%id_vhbt_recon_bt = register_diag_field('ocean_model', 'vhbt_recon_bt', diag%axesCv1, Time, &
+      'Barotropic meridional transport IC', &
+      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
+  
+  CS%id_uhbt_recon = register_diag_field('ocean_model', 'uhbt_recon', diag%axesCu1, Time, &
+      'Barotropic zonal transport IC', &
+      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
+  CS%id_vhbt_recon = register_diag_field('ocean_model', 'vhbt_recon', diag%axesCv1, Time, &
+      'Barotropic meridional transport IC', &
+      'm3 s-1', conversion=GV%H_to_m*US%L_to_m*US%L_T_to_m_s)
 
   CS%id_CAu = register_diag_field('ocean_model', 'CAu', diag%axesCuL, Time, &
       'Zonal Coriolis and Advective Acceleration', 'm s-2', conversion=US%L_T2_to_m_s2)
@@ -1824,6 +1970,8 @@ subroutine end_dyn_split_RK2(CS)
   if (associated(CS%taux_bot)) deallocate(CS%taux_bot)
   if (associated(CS%tauy_bot)) deallocate(CS%tauy_bot)
   DEALLOC_(CS%uhbt) ; DEALLOC_(CS%vhbt)
+  DEALLOC_(CS%uhbt_recon_bt) ; DEALLOC_(CS%vhbt_recon_bt)
+  DEALLOC_(CS%uhbt_recon) ; DEALLOC_(CS%vhbt_recon)
   DEALLOC_(CS%u_accel_bt) ; DEALLOC_(CS%v_accel_bt)
   DEALLOC_(CS%visc_rem_u) ; DEALLOC_(CS%visc_rem_v)
 
