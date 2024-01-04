@@ -314,6 +314,8 @@ type, public :: barotropic_CS ; private
   integer :: id_visc_rem_u = -1, id_visc_rem_v = -1, id_eta_cor = -1
   integer :: id_ubt = -1, id_vbt = -1, id_eta_bt = -1, id_ubtav = -1, id_vbtav = -1
   integer :: id_ubt_st = -1, id_vbt_st = -1, id_eta_st = -1
+  integer :: id_uo_st = -1, id_vo_st = -1
+  integer :: id_uo_hifreq = -1, id_vo_hifreq = -1, id_uo_cont_hifreq = -1, id_vo_cont_hifreq = -1
   integer :: id_ubtdt = -1, id_vbtdt = -1
   integer :: id_ubt_hifreq = -1, id_vbt_hifreq = -1, id_eta_hifreq = -1
   integer :: id_uhbt_hifreq = -1, id_vhbt_hifreq = -1, id_eta_pred_hifreq = -1
@@ -519,12 +521,18 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     av_rem_u, &   ! The weighted average of visc_rem_u [nondim]
     tmp_u, &      ! A temporary array at u points [L T-2 ~> m s-2] or [nondim]
     ubt_st, &     ! The zonal barotropic velocity at the start of timestep [L T-1 ~> m s-1].
-    ubt_dt        ! The zonal barotropic velocity tendency [L T-2 ~> m s-2].
+    ubt_dt, &     ! The zonal barotropic velocity tendency [L T-2 ~> m s-2].
+    uo_st, &      ! The zonal surface (k=1) velocity at the start of timestep [L T-1 ~> m s-1].
+    uo, &         ! The approximated zonal surface (k=1) velocity [L T-1 ~> m s-1].
+    uo_cont       ! The zonal surface (k=1) velocity using the continuty solver [L T-1 ~> m s-1].
   real, dimension(SZI_(G),SZJB_(G)) :: &
     av_rem_v, &   ! The weighted average of visc_rem_v [nondim]
     tmp_v, &      ! A temporary array at v points [L T-2 ~> m s-2] or [nondim]
     vbt_st, &     ! The meridional barotropic velocity at the start of timestep [L T-1 ~> m s-1].
-    vbt_dt        ! The meridional barotropic velocity tendency [L T-2 ~> m s-2].
+    vbt_dt, &     ! The meridional barotropic velocity tendency [L T-2 ~> m s-2].
+    vo_st, &      ! The meridional surface (k=1) velocity at the start of timestep [L T-1 ~> m s-1].
+    vo, &         ! The approximated meridional surface (k=1) velocity [L T-1 ~> m s-1].
+    vo_cont       ! The meridional surface (k=1) velocity using the continuity solver [L T-1 ~> m s-1].
   real, dimension(SZI_(G),SZJ_(G)) :: &
     tmp_h, &      ! A temporary array at h points [nondim]
     e_anom        ! The anomaly in the sea surface height or column mass
@@ -1671,11 +1679,23 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       vbt_st(i,J) = vbt(i,J)
     enddo ; enddo
   endif
+    
+  do j=js-1,je+1 ; do I=is-1,ie
+    uo_st(I,j) = U_in(I,j,1)
+  enddo ; enddo
+  do J=js-1,je ; do i=is-1,ie+1
+    vo_st(i,J) = V_in(i,J,1)
+    !vo_st(i,j) = G%mask2dCv(i+i0,J+j0)*US%L_T_to_m_s * sfc_state%v(i+i0,J+j0)
+  enddo ; enddo
+  do j=js,je ; do I=is-1,ie ; uo(I,j) = uo_st(I,j) ; uo_cont(I,j) = uo_st(I,j) ; enddo ; enddo
+  do J=js-1,je ; do i=is,ie ; vo(i,J) = vo_st(i,J) ; vo_cont(i,J) = vo_st(i,J) ; enddo ; enddo
 
   if (query_averaging_enabled(CS%diag)) then
     if (CS%id_eta_st > 0) call post_data(CS%id_eta_st, eta(isd:ied,jsd:jed), CS%diag)
     if (CS%id_ubt_st > 0) call post_data(CS%id_ubt_st, ubt(IsdB:IedB,jsd:jed), CS%diag)
     if (CS%id_vbt_st > 0) call post_data(CS%id_vbt_st, vbt(isd:ied,JsdB:JedB), CS%diag)
+    if (CS%id_uo_st  > 0) call post_data(CS%id_uo_st , uo_st(IsdB:IedB,jsd:jed), CS%diag)
+    if (CS%id_vo_st  > 0) call post_data(CS%id_vo_st , vo_st(isd:ied,JsdB:JedB), CS%diag)
   endif
 
   if (id_clock_calc_pre > 0) call cpu_clock_end(id_clock_calc_pre)
@@ -1810,7 +1830,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                            wt_accel_n, trans_wt1, trans_wt2, &
                            G, GV, US, CS, OBC, integral_BT_cont, use_BT_cont)
     endif
-
+    
     ! This might need to be moved outside of the OMP do loop directives.
     if (CS%debug_bt) then
       write(mesg,'("BT vel update ",I4)') n
@@ -1941,6 +1961,17 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     endif
     !$OMP end parallel
 
+    ! update estimate of surface velocity
+    do j=jsv-1,jev+1 ; do I=isv-1,iev
+      uo(i,j) = uo_st(i,j) + dt*(u_accel_bt(i,j))
+      vo(i,j) = vo_st(i,j) + dt*(v_accel_bt(i,j))
+      !uo(i,j) = (uo_st(i,j) - ubt_st(i,j)) + ubt_sum(i,j)
+      !vo(i,j) = (vo_st(i,j) - vbt_st(i,j)) + vbt_sum(i,j)
+      !uo(i,j) = (uo_st(i,j) - ubt_st(i,j)) + ubt(i,j)
+      !vo(i,j) = (vo_st(i,j) - vbt_st(i,j)) + vbt(i,j)
+    enddo ; enddo
+    ! u = u + dt*( u_bc_accel + u_accel_bt )
+    
     if (do_hifreq_output) then
       time_step_end = time_bt_start + real_to_time(n*US%T_to_s*dtbt_diag)
       call enable_averages(dtbt, time_step_end, CS%diag)
@@ -1950,6 +1981,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       if (CS%id_uhbt_hifreq > 0) call post_data(CS%id_uhbt_hifreq, uhbt(IsdB:IedB,jsd:jed), CS%diag)
       if (CS%id_vhbt_hifreq > 0) call post_data(CS%id_vhbt_hifreq, vhbt(isd:ied,JsdB:JedB), CS%diag)
       if (CS%id_eta_pred_hifreq > 0) call post_data(CS%id_eta_pred_hifreq, eta_PF_BT(isd:ied,jsd:jed), CS%diag)
+      if (CS%id_uo_hifreq > 0) call post_data(CS%id_uo_hifreq, uo(IsdB:IedB,jsd:jed), CS%diag)
+      if (CS%id_vo_hifreq > 0) call post_data(CS%id_vo_hifreq, vo(isd:ied,JsdB:JedB), CS%diag)
     endif
 
     if (CS%debug_bt) then
@@ -2096,6 +2129,26 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                               e_anom, G, GV, CS, accel_layer_u, accel_layer_v)
 
 
+  ! update estimate of surface velocity
+  !do j=jsv-1,jev+1 ; do I=isv-1,iev
+  !  uo(i,j) = uo_st(i,j) + dt*(u_accel_bt(i,j))
+  !  vo(i,j) = vo_st(i,j) + dt*(v_accel_bt(i,j))
+  !  !uo(i,j) = (uo_st(i,j) - ubt_st(i,j)) + ubt_sum(i,j)
+  !  !vo(i,j) = (vo_st(i,j) - vbt_st(i,j)) + vbt_sum(i,j)
+  !  !uo(i,j) = (uo_st(i,j) - ubt_st(i,j)) + ubt(i,j)
+  !  !vo(i,j) = (vo_st(i,j) - vbt_st(i,j)) + vbt(i,j)
+  !enddo ; enddo
+  ! u = u + dt*( u_bc_accel + u_accel_bt )
+  do j=jsv-1,jev+1 ; do I=isv-1,iev
+    uo_cont(i,j) = uo_st(i,j) + dt*(accel_layer_u(i,j,1) + u_accel_bt(i,j))
+    vo_cont(i,j) = vo_st(i,j) + dt*(accel_layer_v(i,j,1) + v_accel_bt(i,j))
+  enddo ; enddo
+
+  !if (CS%id_uo_hifreq > 0) call post_data(CS%id_uo_hifreq, uo(IsdB:IedB,jsd:jed), CS%diag)
+  !if (CS%id_vo_hifreq > 0) call post_data(CS%id_vo_hifreq, vo(isd:ied,JsdB:JedB), CS%diag)
+  !if (CS%id_uo_cont_hifreq > 0) call post_data(CS%id_uo_cont_hifreq, uo_cont(IsdB:IedB,jsd:jed), CS%diag)
+  !if (CS%id_vo_cont_hifreq > 0) call post_data(CS%id_vo_cont_hifreq, vo_cont(isd:ied,JsdB:JedB), CS%diag)
+ 
 ! TJM 
 ! The EVP function from the SIS2 model
 !  call EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
@@ -3128,7 +3181,7 @@ subroutine btloop_update_u_first(n, dtbt, ubt, vbt, u_accel_bt, uhbt, ubt_int, u
                   ! stability this may be made larger than the physical
                   ! problem would suggest.
   real, intent(in) :: wt_accel_n  ! The raw or relative weights of each of the barotropic timesteps
-                                    ! in determining the average accelerations [nondim]
+                                  ! in determining the average accelerations [nondim]
   real, intent(in) :: trans_wt1, trans_wt2
   real, intent(in) :: dtbt            !< The barotropic time step [T ~> s].
   logical, intent(in) :: integral_BT_cont, use_BT_cont
@@ -5751,6 +5804,10 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
       'Barotropic start zonal velocity', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_vbt_st = register_diag_field('ocean_model', 'vbt_st', diag%axesCv1, Time, &
       'Barotropic start meridional velocity', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_uo_st = register_diag_field('ocean_model', 'uo_st', diag%axesCu1, Time, &
+      'Start zonal surface  velocity', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_vo_st = register_diag_field('ocean_model', 'vo_st', diag%axesCv1, Time, &
+      'Start meridional surface  velocity', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_ubtav = register_diag_field('ocean_model', 'ubtav', diag%axesCu1, Time, &
       'Barotropic time-average zonal velocity', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_vbtav = register_diag_field('ocean_model', 'vbtav', diag%axesCv1, Time, &
@@ -5775,6 +5832,14 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
       'High Frequency Barotropic zonal velocity', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_vbt_hifreq = register_diag_field('ocean_model', 'vbt_hifreq', diag%axesCv1, Time, &
       'High Frequency Barotropic meridional velocity', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_uo_hifreq = register_diag_field('ocean_model', 'uo_hifreq', diag%axesCu1, Time, &
+      'High Frequency zonal surface velocity', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_vo_hifreq = register_diag_field('ocean_model', 'vo_hifreq', diag%axesCv1, Time, &
+      'High Frequency meridional surface velocity', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_uo_cont_hifreq = register_diag_field('ocean_model', 'uo_cont_hifreq', diag%axesCu1, Time, &
+      'High Frequency zonal surface velocity from layer accel', 'm s-1', conversion=US%L_T_to_m_s)
+  CS%id_vo_cont_hifreq = register_diag_field('ocean_model', 'vo_cont_hifreq', diag%axesCv1, Time, &
+      'High Frequency meridional surface velocity from layer accel', 'm s-1', conversion=US%L_T_to_m_s)
   CS%id_eta_pred_hifreq = register_diag_field('ocean_model', 'eta_pred_hifreq', diag%axesT1, Time, &
       'High Frequency Predictor Barotropic SSH', thickness_units, conversion=GV%H_to_MKS)
   CS%id_uhbt_hifreq = register_diag_field('ocean_model', 'uhbt_hifreq', diag%axesCu1, Time, &
