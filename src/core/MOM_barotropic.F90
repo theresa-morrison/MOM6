@@ -468,10 +468,10 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                                                          !! to the barotropic calculation [L T-2 ~> m s-2].
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), intent(out) :: accel_layer_v !< The meridional acceleration of each layer
                                                          !! due to the barotropic calculation [L T-2 ~> m s-2].
-  !real, dimension(SZIB_(G),SZJ_(G),SZK_(GV))              :: accel_layer_uo!< The zonal acceleration of each layer due
-  !                                                       !! to the barotropic calculation [L T-2 ~> m s-2].
-  !real, dimension(SZI_(G),SZJB_(G),SZK_(GV))              :: accel_layer_vo!< The meridional acceleration of each layer
-  !                                                       !! due to the barotropic calculation [L T-2 ~> m s-2].
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV))              :: accel_layer_uo!< The zonal acceleration of each layer due
+                                                         !! to the barotropic calculation [L T-2 ~> m s-2].
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV))              :: accel_layer_vo!< The meridional acceleration of each layer
+                                                         !! due to the barotropic calculation [L T-2 ~> m s-2].
   real, dimension(SZI_(G),SZJ_(G)),          intent(out) :: eta_out       !< The final barotropic free surface
                                                          !! height anomaly or column mass anomaly [H ~> m or kg m-2].
   real, dimension(SZIB_(G),SZJ_(G)),         intent(out) :: uhbtav        !< the barotropic zonal volume or mass
@@ -1972,10 +1972,14 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       !uo(i,j) = uo_st(i,j)
       !vo(i,j) = vo_st(i,j)
     do j=js,je ; do I=is-1,ie
-      uo(i,j) = uo_st(i,j) + dt*(u_accel_bt(i,j))
+      !uo(i,j) = uo_st(i,j) + dt*(u_accel_bt(i,j))
+      !uo(i,j) = (uo_st(i,j) - ubt_st(i,j)) + ubt(i,j)
+       uo(i,j) = uo_st(i,j) + (dt*(n*dtbt/dt))*(u_accel_bt(i,j))
     enddo ; enddo
     do j=js-1,je ; do I=is,ie
-      vo(i,j) = vo_st(i,j) + dt*(v_accel_bt(i,j))
+      !vo(i,j) = vo_st(i,j) + dt*(v_accel_bt(i,j))
+      !vo(i,j) = (vo_st(i,j) - vbt_st(i,j)) + vbt(i,j)
+       vo(i,j) = vo_st(i,j) + (dt*(n*dtbt/dt))*(v_accel_bt(i,j))
     enddo ; enddo
       !uo(i,j) = uo_st(i,j) + (dt*(n*dtbt/dt))*(u_accel_bt(i,j))
       !vo(i,j) = vo_st(i,j) + (dt*(n*dtbt/dt))*(v_accel_bt(i,j))
@@ -1987,16 +1991,18 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     ! u = u + dt*( u_bc_accel + u_accel_bt )
 
     ! calculate each layer's accelerations for 
-    ! call btstep_layer_accel(dt, u_accel_bt, v_accel_bt, pbce, gtot_E, gtot_W, gtot_N, gtot_S, &
-    !                          e_anom, G, GV, CS, accel_layer_uo, accel_layer_vo)
+     call btstep_layer_accel(dt, u_accel_bt, v_accel_bt, pbce, gtot_E, gtot_W, gtot_N, gtot_S, &
+                              e_anom, G, GV, CS, accel_layer_uo, accel_layer_vo)
 
     !do j=js,je ; do I=is,ie
-    !do j=js,je ; do I=is-1,ie
-    !  uo_cont(i,j) = uo_st(i,j) + dt*(accel_layer_uo(i,j,1) + u_accel_bt(i,j))
-    !enddo ; enddo
-    !do j=js-1,je ; do I=is,ie
-    !  vo_cont(i,j) = vo_st(i,j) + dt*(accel_layer_vo(i,j,1) + v_accel_bt(i,j))
-    !enddo ; enddo
+    do j=js,je ; do I=is-1,ie
+      !uo_cont(i,j) = uo_st(i,j) + dt*(accel_layer_uo(i,j,1) + u_accel_bt(i,j))
+      uo_cont(i,j) = uo_st(i,j) + (dt*(n*dtbt/dt))*(accel_layer_uo(i,j,1) + u_accel_bt(i,j))
+    enddo ; enddo
+    do j=js-1,je ; do I=is,ie
+      !vo_cont(i,j) = vo_st(i,j) + dt*(accel_layer_vo(i,j,1) + v_accel_bt(i,j))
+      vo_cont(i,j) = vo_st(i,j) + (dt*(n*dtbt/dt))*(accel_layer_vo(i,j,1) + v_accel_bt(i,j))
+    enddo ; enddo
       !uo(i,j) = uo_st(i,j) + (dt*(n*dt_bt/dt))*(accel_layer_u(i,j,1) + u_accel_bt(i,j))
       !vo(i,j) = vo_st(i,j) + (dt*(n*dt_bt/dt))*(accel_layer_v(i,j,1) + v_accel_bt(i,j))
     !enddo ; enddo
@@ -2012,8 +2018,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       if (CS%id_eta_pred_hifreq > 0) call post_data(CS%id_eta_pred_hifreq, eta_PF_BT(isd:ied,jsd:jed), CS%diag)
       if (CS%id_uo_hifreq > 0) call post_data(CS%id_uo_hifreq, uo(IsdB:IedB,jsd:jed), CS%diag)
       if (CS%id_vo_hifreq > 0) call post_data(CS%id_vo_hifreq, vo(isd:ied,JsdB:JedB), CS%diag)
-      !if (CS%id_uo_cont_hifreq > 0) call post_data(CS%id_uo_cont_hifreq, uo_cont(IsdB:IedB,jsd:jed), CS%diag)
-      !if (CS%id_vo_cont_hifreq > 0) call post_data(CS%id_vo_cont_hifreq, vo_cont(isd:ied,JsdB:JedB), CS%diag)
+      if (CS%id_uo_cont_hifreq > 0) call post_data(CS%id_uo_cont_hifreq, uo_cont(IsdB:IedB,jsd:jed), CS%diag)
+      if (CS%id_vo_cont_hifreq > 0) call post_data(CS%id_vo_cont_hifreq, vo_cont(isd:ied,JsdB:JedB), CS%diag)
     endif
 
     if (CS%debug_bt) then
