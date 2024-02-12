@@ -543,6 +543,9 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   ! averaged between the beginning and end of the time step,
                   ! relative to eta_PF, with SAL effects included [H ~> m or kg m-2].
 
+  real, dimension(SZIB_(G),SZJ_(G)) :: fxoc ! ice-to-ocn stress
+  real, dimension(SZI_(G),SZJB_(G)) :: fyoc !
+  
   ! These are always allocated with symmetric memory and wide halos.
   real :: q(SZIBW_(CS),SZJBW_(CS)) ! A pseudo potential vorticity [T-1 H-1 ~> s-1 m-1 or m2 s-1 kg-1]
   real, dimension(SZIBW_(CS),SZJW_(CS)) :: &
@@ -1859,10 +1862,12 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     ! Update the surface velocity estimate
     do j=js,je ; do I=is-1,ie
-       uo(i,j) = uo_st(i,j) + (dt*(n*dtbt/dt))*(u_accel_bt(i,j))
+       !uo(i,j) = uo_st(i,j) + (n*dtbt)*(u_accel_bt(i,j) + wt_u(I,j,1) * bc_accel_u(I,j,1))
+       uo(i,j) = uo_st(i,j) + (n*dtbt)*(u_accel_bt(i,j) + BT_force_u(i,j)) 
     enddo ; enddo
     do j=js-1,je ; do I=is,ie
-       vo(i,j) = vo_st(i,j) + (dt*(n*dtbt/dt))*(v_accel_bt(i,j))
+       !vo(i,j) = vo_st(i,j) + (n*dtbt)*(v_accel_bt(i,j) + wt_u(i,j,1) * bc_accel_v(I,j,1))
+       vo(i,j) = vo_st(i,j) + (n*dtbt)*(v_accel_bt(i,j) + BT_force_v(i,j))
     enddo ; enddo
     
     if (find_PF) then
@@ -1975,13 +1980,15 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     ! calculate each layer's accelerations for 
     !call btstep_layer_accel(dt, u_accel_bt, v_accel_bt, pbce, gtot_E, gtot_W, gtot_N, gtot_S, &
-    !                          e_anom, G, GV, CS, accel_layer_uo, accel_layer_vo)
+    !                          eta_wtd, G, GV, CS, accel_layer_uo, accel_layer_vo)
 
     !do j=js,je ; do I=is-1,ie
-    !  uo_cont(i,j) = uo_st(i,j) + (dt*(n*dtbt/dt))*(accel_layer_uo(i,j,1) + u_accel_bt(i,j))
+    !  !uo_cont(i,j) = uo_st(i,j) + (n*dtbt)*(accel_layer_uo(i,j,1) + u_accel_bt(i,j) + wt_u(i,j,1) * bc_accel_u(i,j,1))
+    !  uo_cont(i,j) = uo_st(i,j) + (n*dtbt)*(accel_layer_uo(i,j,1) + u_accel_bt(i,j) + BT_force_u(i,j))
     !enddo ; enddo
     !do j=js-1,je ; do I=is,ie
-    !  vo_cont(i,j) = vo_st(i,j) + (dt*(n*dtbt/dt))*(accel_layer_vo(i,j,1) + v_accel_bt(i,j))
+    !  !vo_cont(i,j) = vo_st(i,j) + (n*dtbt)*(accel_layer_vo(i,j,1) + v_accel_bt(i,j) + wt_u(i,j,1) * bc_accel_v(i,j,1))
+    !  vo_cont(i,j) = vo_st(i,j) + (n*dtbt)*(accel_layer_vo(i,j,1) + v_accel_bt(i,j) + BT_force_v(i,j))
     !enddo ; enddo
 
     if (do_hifreq_output) then
@@ -1995,8 +2002,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       if (CS%id_eta_pred_hifreq > 0) call post_data(CS%id_eta_pred_hifreq, eta_PF_BT(isd:ied,jsd:jed), CS%diag)
       if (CS%id_uo_hifreq > 0) call post_data(CS%id_uo_hifreq, uo(IsdB:IedB,jsd:jed), CS%diag)
       if (CS%id_vo_hifreq > 0) call post_data(CS%id_vo_hifreq, vo(isd:ied,JsdB:JedB), CS%diag)
-      !if (CS%id_uo_cont_hifreq > 0) call post_data(CS%id_uo_cont_hifreq, uo_cont(IsdB:IedB,jsd:jed), CS%diag)
-      !if (CS%id_vo_cont_hifreq > 0) call post_data(CS%id_vo_cont_hifreq, vo_cont(isd:ied,JsdB:JedB), CS%diag)
+    !  if (CS%id_uo_cont_hifreq > 0) call post_data(CS%id_uo_cont_hifreq, uo_cont(IsdB:IedB,jsd:jed), CS%diag)
+    !  if (CS%id_vo_cont_hifreq > 0) call post_data(CS%id_vo_cont_hifreq, vo_cont(isd:ied,JsdB:JedB), CS%diag)
     endif
 
     if (CS%debug_bt) then
@@ -2155,13 +2162,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
  
 ! TJM 
 ! The EVP function from the SIS2 model
-!  call EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
-!                    fxat, fyat, fxoc, fyoc, pres_mice, diag_val, del_sh_min_pr, &
-!                    ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc, &
-!                    mi_u, f2dt_u, I1_f2dt2_u, PFu, mi_v, f2dt_v, I1_f2dt2_v, PFv, &
-!                    azon, bzon, czon, dzon, amer, bmer, cmer, dmer, &
-!                    mi_ratio_A_q,  &
-!                    G, US, CS)
+  call EVP_step_loop(forces, uo, vo, PFu, PFv, fxoc, fyoc)
 ! In need from sea-ice: ci, ui, vi, mice, pres_mice, diag_val (?), del_sh_min_pr (?),
 !                       ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc,
 !                       mi_u, f2dt_u, I1_f2dt2_u, mi_v, f2dt_v, I1_f2dt2_v, 

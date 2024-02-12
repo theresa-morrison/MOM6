@@ -40,6 +40,7 @@ use MOM_variables,        only : surface
 use user_revise_forcing,  only : user_alter_forcing, user_revise_forcing_init
 use user_revise_forcing,  only : user_revise_forcing_CS
 use iso_fortran_env, only : int64
+use MOM_forcing_type,      only : SIS_C_EVP_state
 
 implicit none ; private
 
@@ -208,6 +209,7 @@ type, public :: ice_ocean_boundary_type
                                       !! This flag may be set by the flux-exchange code, based on what
                                       !! the sea-ice model is providing.  Otherwise, the value from
                                       !! the surface_forcing_CS is used.
+  type(SIS_C_EVP_state) :: EVP_type
 end type ice_ocean_boundary_type
 
 integer :: id_clock_forcing !< A CPU time clock
@@ -715,6 +717,9 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
   i0 = is - isc_bnd ; j0 = js - jsc_bnd
 
   kg_m2_s_conversion = US%kg_m2s_to_RZ_T
+
+  ! copy EVP info to something that will be able to make it to MOM_barotropic
+  forces%EVPT = IOB%EVP_type
 
   ! allocation and initialization if this is the first time that this
   ! mechanical forcing type has been used.

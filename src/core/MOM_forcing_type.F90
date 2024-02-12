@@ -64,6 +64,55 @@ end interface find_ustar
 ! their mks counterparts with notation like "a velocity [Z T-1 ~> m s-1]".  If the units
 ! vary with the Boussinesq approximation, the Boussinesq variant is given first.
 
+!> The control structure with the state that is used and updated in the EVP loop
+type, public :: SIS_C_EVP_state
+  real, allocatable, dimension(:,:) :: ci  !< Sea ice concentration [nondim]
+  real, allocatable, dimension(:,:) :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
+  real, allocatable, dimension(:,:) :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
+  real, allocatable, dimension(:,:) :: mice  !< Mass per unit ocean area of sea ice [R Z ~> kg m-2]
+  real, allocatable, dimension(:,:) :: fxat  !< Zonal air stress on ice [R Z L T-2 ~> Pa]
+  real, allocatable, dimension(:,:) :: fyat  !< Meridional air stress on ice [R Z L T-2 ~> Pa]
+
+  real, allocatable, dimension(:,:) :: &
+    pres_mice, & ! The ice internal pressure per unit column mass [L2 T-2 ~> N m kg-1].
+    diag_val, & ! A temporary diagnostic array.
+    del_sh_min_pr     ! When multiplied by pres_mice, this gives the minimum
+                ! value of del_sh that is used in the calculation of zeta [T-1 ~> s-1].
+                ! This is set based on considerations of numerical stability,
+                ! and varies with the grid spacing.  
+
+  real, allocatable, dimension(:,:) :: &
+    ui_min_trunc, &  ! The range of v-velocities beyond which the velocities
+    ui_max_trunc, &  ! are truncated [L T-1 ~> m s-1], or 0 for land cells
+    mi_u, &  ! The total ice and snow mass interpolated to u points [R Z ~> kg m-2].
+    f2dt_u, &! The squared effective Coriolis parameter at u-points times a
+             ! time step [T-1 ~> s-1].
+    PFu, &   ! Zonal hydrostatic pressure driven acceleration [L T-2 ~> m s-2].
+    I1_f2dt2_u  ! 1 / ( 1 + f^2 dt^2) at u-points [nondim].
+             
+  real, allocatable, dimension(:,:) :: &
+    vi_min_trunc, &  ! The range of v-velocities beyond which the velocities
+    vi_max_trunc, &  ! are truncated [L T-1 ~> m s-1], or 0 for land cells.
+    mi_v, &  ! The total ice and snow mass interpolated to v points [R Z ~> kg m-2].
+    f2dt_v, &! The squared effective Coriolis parameter at v-points times a
+             ! time step [T-1 ~> s-1].
+    PFv, &   !  hydrostatic pressure driven acceleration [L T-2 ~> m s-2].
+    I1_f2dt2_v  ! 1 / ( 1 + f^2 dt^2) at v-points [nondim].
+    
+  real, allocatable, dimension(:,:) :: &
+    azon, bzon, & !  _zon & _mer are the values of the Coriolis force which
+    czon, dzon, & ! are applied to the neighboring values of vi & ui,
+    amer, bmer, & ! respectively to get the barotropic inertial rotation,
+    cmer, dmer    ! in units of [T-1 ~> s-1].  azon and amer couple the same pair of
+                  ! velocities, but with the influence going in opposite
+                  ! directions.
+                  
+  real, allocatable, dimension(:,:) :: &
+    mi_ratio_A_q    ! A ratio of the masses interpolated to the faces around a
+             ! vorticity point that ranges between (4 mi_min/mi_max) and 1,
+             ! divided by the sum of the ocean areas around a point [L-2 ~> m-2].                              
+end type SIS_C_EVP_state
+
 !> Structure that contains pointers to the boundary forcing used to drive the
 !! liquid ocean simulated by MOM.
 !!
@@ -293,6 +342,7 @@ type, public :: mech_forcing
                                 !! 3rd dimension - wavenumber
 
   logical :: initialized = .false. !< This indicates whether the appropriate arrays have been initialized.
+  type(SIS_C_EVP_state) :: EVPT !! the info for the sea-ice
 end type mech_forcing
 
 !> Structure that defines the id handles for the forcing type
