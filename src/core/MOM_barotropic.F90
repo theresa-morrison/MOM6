@@ -30,6 +30,7 @@ use MOM_unit_scaling, only : unit_scale_type
 use MOM_variables, only : BT_cont_type, alloc_bt_cont_type
 use MOM_verticalGrid, only : verticalGrid_type
 use MOM_variables, only : accel_diag_ptrs
+use MOM_SIS_dyn_evp, only : EVP_step_loop
 
 implicit none ; private
 
@@ -2162,7 +2163,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
  
 ! TJM 
 ! The EVP function from the SIS2 model
-  call EVP_step_loop(forces, uo, vo, PFu, PFv, fxoc, fyoc)
+  call EVP_step_loop(forces, G, uo, vo, PFu, PFv, fxoc, fyoc)
 ! In need from sea-ice: ci, ui, vi, mice, pres_mice, diag_val (?), del_sh_min_pr (?),
 !                       ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc,
 !                       mi_u, f2dt_u, I1_f2dt2_u, mi_v, f2dt_v, I1_f2dt2_v, 

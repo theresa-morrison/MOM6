@@ -66,6 +66,7 @@ end interface find_ustar
 
 !> The control structure with the state that is used and updated in the EVP loop
 type, public :: SIS_C_EVP_state
+  real ::  dt_slow 
   real, allocatable, dimension(:,:) :: ci  !< Sea ice concentration [nondim]
   real, allocatable, dimension(:,:) :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
   real, allocatable, dimension(:,:) :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
