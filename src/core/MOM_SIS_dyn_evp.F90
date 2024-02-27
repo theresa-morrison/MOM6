@@ -20,8 +20,9 @@ use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, MOM_mesg
 use MOM_domains,       only : pass_var, pass_vector, CGRID_NE, CORNER, pe_here
 use MOM_time_manager,  only : time_type, real_to_time, operator(+), operator(-)
 use MOM_unit_scaling,  only : unit_scale_type
+use MOM_diag_mediator, only : disable_averaging, post_data, safe_alloc_ptr
 
-!use SIS_diag_mediator, only : post_SIS_data, SIS_diag_ctrl
+!use SIS_diag_mediator, only : post_data, SIS_diag_ctrl
 !use SIS_diag_mediator, only : query_SIS_averaging_enabled, enable_SIS_averaging
 !use SIS_diag_mediator, only : register_diag_field=>register_SIS_diag_field
 !use SIS_debugging,     only : chksum, Bchksum, hchksum, uvchksum
@@ -629,28 +630,28 @@ subroutine EVP_step_loop(forces, G, uo, vo, PFu, PFv, fxoc, fyoc)
     if (do_hifreq_output) then
       time_step_end = time_it_start + real_to_time(n*US%T_to_s*dt)
       call enable_SIS_averaging(US%T_to_s*dt, time_step_end, CS%diag)
-      if (CS%id_ui_hifreq > 0) call post_SIS_data(CS%id_ui_hifreq, ui, CS%diag)
-      if (CS%id_vi_hifreq > 0) call post_SIS_data(CS%id_vi_hifreq, vi, CS%diag)
-      if (CS%id_str_d_hifreq > 0) call post_SIS_data(CS%id_str_d_hifreq, CS%str_d, CS%diag)
-      if (CS%id_str_t_hifreq > 0) call post_SIS_data(CS%id_str_t_hifreq, CS%str_t, CS%diag)
-      if (CS%id_str_s_hifreq > 0) call post_SIS_data(CS%id_str_s_hifreq, CS%str_s, CS%diag)
-      if (CS%id_sh_d_hifreq > 0) call post_SIS_data(CS%id_sh_d_hifreq, sh_Dd, CS%diag)
-      if (CS%id_sh_t_hifreq > 0) call post_SIS_data(CS%id_sh_t_hifreq, sh_Dt, CS%diag)
-      if (CS%id_sh_s_hifreq > 0) call post_SIS_data(CS%id_sh_s_hifreq, sh_Ds, CS%diag)
+      if (CS%id_ui_hifreq > 0) call post_data(CS%id_ui_hifreq, ui, CS%diag)
+      if (CS%id_vi_hifreq > 0) call post_data(CS%id_vi_hifreq, vi, CS%diag)
+      if (CS%id_str_d_hifreq > 0) call post_data(CS%id_str_d_hifreq, CS%str_d, CS%diag)
+      if (CS%id_str_t_hifreq > 0) call post_data(CS%id_str_t_hifreq, CS%str_t, CS%diag)
+      if (CS%id_str_s_hifreq > 0) call post_data(CS%id_str_s_hifreq, CS%str_s, CS%diag)
+      if (CS%id_sh_d_hifreq > 0) call post_data(CS%id_sh_d_hifreq, sh_Dd, CS%diag)
+      if (CS%id_sh_t_hifreq > 0) call post_data(CS%id_sh_t_hifreq, sh_Dt, CS%diag)
+      if (CS%id_sh_s_hifreq > 0) call post_data(CS%id_sh_s_hifreq, sh_Ds, CS%diag)
       if (CS%id_sigi_hifreq>0) then
         call find_sigI(mice, ci_proj, CS%str_d, diag_val, G, US, CS)
-        call post_SIS_data(CS%id_sigi_hifreq, diag_val, CS%diag)
+        call post_data(CS%id_sigi_hifreq, diag_val, CS%diag)
       endif
       if (CS%id_sigii_hifreq>0) then
         call find_sigII(mice, ci_proj, CS%str_t, CS%str_s, diag_val, G, US, CS)
-        call post_SIS_data(CS%id_sigii_hifreq, diag_val, CS%diag)
+        call post_data(CS%id_sigii_hifreq, diag_val, CS%diag)
       endif
-      if (CS%id_ci_hifreq>0) call post_SIS_data(CS%id_ci_hifreq, ci_proj, CS%diag)
+      if (CS%id_ci_hifreq>0) call post_data(CS%id_ci_hifreq, ci_proj, CS%diag)
       if (CS%id_stren_hifreq>0) then
         do j=jsc,jec ; do i=isc,iec
           diag_val(i,j) = pres_mice(i,j)*mice(i,j)
         enddo ; enddo
-        call post_SIS_data(CS%id_stren_hifreq, diag_val, CS%diag)
+        call post_data(CS%id_stren_hifreq, diag_val, CS%diag)
       endif
     endif
 
