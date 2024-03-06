@@ -2173,11 +2173,6 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 ! Out: pass to SIS2: ui, vi
 ! Out: pass to bt_step: fxoc, fyoc
 
-
-
-
-
-
   if (apply_OBCs) then
     ! Correct the accelerations at OBC velocity points, but only in the
     ! symmetric-memory computational domain, not in the wide halo regions.

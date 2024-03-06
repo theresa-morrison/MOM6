@@ -23,6 +23,8 @@ use MOM_unit_scaling,  only : unit_scale_type
 use MOM_variables,     only : surface, thermo_var_ptrs
 use MOM_verticalGrid,  only : verticalGrid_type
 
+use MOM_SIS_C_dyn_CS_type, only : SIS_C_dyn_CS
+
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -66,13 +68,33 @@ end interface find_ustar
 
 !> The control structure with the state that is used and updated in the EVP loop
 type, public :: SIS_C_EVP_state
+  type(SIS_C_dyn_CS), pointer     :: SIS_C_dyn_CSp => NULL()
   real ::  dt_slow 
   real, allocatable, dimension(:,:) :: ci  !< Sea ice concentration [nondim]
   real, allocatable, dimension(:,:) :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
   real, allocatable, dimension(:,:) :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
   real, allocatable, dimension(:,:) :: mice  !< Mass per unit ocean area of sea ice [R Z ~> kg m-2]
-  real, allocatable, dimension(:,:) :: fxat  !< Zonal air stress on ice [R Z L T-2 ~> Pa]
-  real, allocatable, dimension(:,:) :: fyat  !< Meridional air stress on ice [R Z L T-2 ~> Pa]
+  
+  real, allocatable, dimension(:,:) :: Cor_u
+  real, allocatable, dimension(:,:) :: Cor_v
+  
+  real, allocatable, dimension(:,:) :: &  
+    fxat  !< Zonal air stress on ice [R Z L T-2 ~> Pa]
+    fxoc  !<
+    fxlf  !<
+    fxic  !<
+    fxic_d
+    fxic_t
+    fxic_s
+  
+  real, allocatable, dimension(:,:) :: &  
+    fyat  !< Meridional air stress on ice [R Z L T-2 ~> Pa]
+    fyoc  !<
+    fylf  !<
+    fyic  !<
+    fyic_d
+    fyic_t
+    fyic_s
 
   real, allocatable, dimension(:,:) :: &
     pres_mice, & ! The ice internal pressure per unit column mass [L2 T-2 ~> N m kg-1].
