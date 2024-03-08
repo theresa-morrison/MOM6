@@ -533,8 +533,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     if (OS%icebergs_alter_ocean) &
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
                           OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
-    if (OS%embedbed_seaice) &
-      call convert_IOB_to_EVPT(Ice_ocean_boundary,OS%
+    !if (OS%embedded_seaice) &
+    !  call convert_IOB_to_EVPT(Ice_ocean_boundary, OS%MOM_CSp%dyn_split_RK2_CSp%barotropic_CSp)
   endif
 
   if (do_thermo) then

@@ -39,6 +39,10 @@ use MOM_unit_scaling,     only : unit_scale_type
 use MOM_variables,        only : surface
 use user_revise_forcing,  only : user_alter_forcing, user_revise_forcing_init
 use user_revise_forcing,  only : user_revise_forcing_CS
+
+use MOM_barotropic,       only : Barotropic_CS
+use MOM_SIS_dyn_evp,      only : SIS_C_EVP_state
+
 use iso_fortran_env, only : int64
 
 implicit none ; private
@@ -208,6 +212,7 @@ type, public :: ice_ocean_boundary_type
                                       !! This flag may be set by the flux-exchange code, based on what
                                       !! the sea-ice model is providing.  Otherwise, the value from
                                       !! the surface_forcing_CS is used.
+  type(SIS_C_EVP_state), pointer :: EVPT => NULL() !! the info for the sea-ice
 end type ice_ocean_boundary_type
 
 integer :: id_clock_forcing !< A CPU time clock
@@ -1835,6 +1840,18 @@ subroutine check_mask_val_consistency(val, mask, i, j, varname, G)
     call MOM_error(WARNING, error_message)
   endif
 
-end subroutine
+end subroutine check_mask_val_consistency
+
+
+!subroutine convert_IOB_to_EVPT(IOB, BT_CS)
+!  type(ice_ocean_boundary_type), &
+!                   target, intent(in)    :: IOB  !< An ice-ocean boundary type with fluxes to drive
+!                                                 !! the ocean in a coupled model
+!  type(barotropic_CS), &
+!                   target, intent(inout)    :: BT_CS  !< 
+!
+!  BT_CS%EVPT = IOB%EVPT
+!
+!end subroutine convert_IOB_to_EVPT
 
 end module MOM_surface_forcing_gfdl

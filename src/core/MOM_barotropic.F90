@@ -104,7 +104,7 @@ type, private :: BT_OBC_type
 end type BT_OBC_type
 
 !> The barotropic stepping control structure
-type, public :: barotropic_CS ; private
+type, public :: barotropic_CS ;  ! private
   real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_,NKMEM_) :: frhatu
           !< The fraction of the total column thickness interpolated to u grid points in each layer [nondim].
   real ALLOCABLE_, dimension(NIMEM_,NJMEMB_PTR_,NKMEM_) :: frhatv
@@ -552,6 +552,9 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   ! averaged between the beginning and end of the time step,
                   ! relative to eta_PF, with SAL effects included [H ~> m or kg m-2].
 
+  real, dimension(SZIB_(G),SZJ_( G)) :: fxoc  !< Zonal ice stress on ocean [R Z L T-2 ~> Pa]
+  real, dimension(SZI_( G),SZJB_(G)) :: fyoc  !< Meridional ice stress on ocean [R Z L T-2 ~> Pa]
+  
   ! These are always allocated with symmetric memory and wide halos.
   real :: q(SZIBW_(CS),SZJBW_(CS)) ! A pseudo potential vorticity [T-1 H-1 ~> s-1 m-1 or m2 s-1 kg-1]
   real, dimension(SZIBW_(CS),SZJW_(CS)) :: &
