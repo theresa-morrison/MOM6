@@ -682,18 +682,19 @@ subroutine horiz_interp_and_extrap_tracer_fms_id(field, Time, G, tr_z, mask_z, &
   real :: pole      ! The sum of tracer values at the pole [a]
   real :: max_depth ! The maximum depth of the ocean [Z ~> m]
   real :: npole     ! The number of points contributing to the pole value [nondim]
-  real :: missing_val_in ! The missing value in the input field [a]
+  real, save :: missing_val_in ! The missing value in the input field [a]
   real :: roundoff  ! The magnitude of roundoff, usually ~2e-16 [nondim]
   logical :: add_np
   type(horiz_interp_type) :: Interp
-  type(axis_info), dimension(4) :: axes_data
+  type(axis_info), save, dimension(4) :: axes_data
   integer :: is, ie, js, je     ! compute domain indices
   integer :: isg, ieg, jsg, jeg ! global extent
   integer :: isd, ied, jsd, jed ! data domain indices
   integer :: id_clock_read
-  integer, dimension(4) :: fld_sz
+  integer, save, dimension(4) :: fld_sz
   logical :: debug=.false.
   logical :: is_ongrid
+  logical, save :: first_time = .true.
   integer :: ans_date           ! The vintage of the expressions and order of arithmetic to use
   real :: I_scale               ! The inverse of the scale factor for diagnostic output [a A-1 ~> 1]
   real :: dtr_iter_stop         ! The tolerance for changes in tracer concentrations between smoothing
@@ -735,7 +736,10 @@ subroutine horiz_interp_and_extrap_tracer_fms_id(field, Time, G, tr_z, mask_z, &
 
   call cpu_clock_begin(id_clock_read)
 
-  call get_external_field_info(field, size=fld_sz, axes=axes_data, missing=missing_val_in)
+  if (first_time) then
+    call get_external_field_info(field, size=fld_sz, axes=axes_data, missing=missing_val_in)
+    first_time = .false.
+  endif !first_time
   missing_value = scale*missing_val_in
 
   verbosity = MOM_get_verbosity()
