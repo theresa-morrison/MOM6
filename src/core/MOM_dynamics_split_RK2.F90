@@ -1421,7 +1421,7 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
                  "what is already being done with the primary state variables.  "//&
                  "The default should be changed to true.", default=.false., do_not_log=.true.)
   call get_param(param_file, mdl, "USE_OBC_U_INST_BUG", CS%use_obc_uinst_bug, &
-                 "If true, use a bug in the update of the radiation open boundary conditions"//&
+                 "If true, use a bug in the update of the radiation open boundary conditions "//&
                  "that uses the instantaneous velocity rather than the time-averaged velocity.",&
                   default=.true.)
   if (CS%remap_aux .and. .not.CS%store_CAu) call MOM_error(FATAL, &
