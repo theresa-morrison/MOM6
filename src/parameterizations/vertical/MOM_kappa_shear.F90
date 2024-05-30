@@ -801,10 +801,11 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   do K=nzc,2,-1
     dist_from_bot = dist_from_bot + dz_lay(k)
     h_from_bot = h_from_bot + hlay(k)
-    !I_L2_bdry(K) = ((dist_from_top(K) + dist_from_bot) * (h_from_top(K) + h_from_bot)) / &
-    !               ((dist_from_top(K) * dist_from_bot) * (h_from_top(K) * h_from_bot))
-    I_L2_bdry(K) = I_lz_rescale_sqr*((dist_from_top(K) + dist_from_bot) * (h_from_top(K) + h_from_bot)) / &
+    ! Find the inverse of the squared distances from the boundaries,
+    I_L2_bdry(K) = ((dist_from_top(K) + dist_from_bot) * (h_from_top(K) + h_from_bot)) / &
                    ((dist_from_top(K) * dist_from_bot) * (h_from_top(K) * h_from_bot))
+    ! reduce the distance by a factor of "lz_rescale" 
+    I_L2_bdry(K) = I_lz_rescale_sqr*I_L2_bdry(K) 
   enddo
 
   !   Determine the velocities and thicknesses after eliminating massless
