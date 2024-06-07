@@ -6,15 +6,7 @@ module generic_tracer
 
   use g_tracer_utils, only : g_tracer_type, g_diag_type
 
-<<<<<<< HEAD
-<<<<<<< HEAD
   use MOM_EOS,           only: EOS_type
-=======
-  use MOM_variables, only : thermo_var_ptrs
->>>>>>> 574766eb4 ( Bringing config_src updates from esmg (#2))
-=======
-  use MOM_EOS,           only: EOS_type
->>>>>>> 416e53b2d (Simplify changes to the generic tracer interface for cobalt-p4 (#3))
 
   implicit none ; private
 
