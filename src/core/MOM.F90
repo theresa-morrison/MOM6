@@ -453,6 +453,9 @@ type, public :: MOM_control_struct ; private
   type(stochastic_CS), pointer :: stoch_CS => NULL() !< a pointer to the stochastics control structure
   type(MOM_restart_CS), pointer :: restart_CS => NULL()
     !< Pointer to MOM's restart control structure
+  logical :: do_save_mom_restart = .true. !< If false, do not save a restart file at the end of the run.
+                                          !! Users should not set this flag to false unless they are not
+                                          !! planning to continue the simulation.
 end type MOM_control_struct
 
 public initialize_MOM, finish_MOM_initialization, MOM_end
@@ -2804,6 +2807,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   call restart_init(param_file, CS%restart_CS)
   restart_CSp => CS%restart_CS
 
+  call get_param(param_file, "MOM", "SAVE_MOM_RESTART", CS%do_save_mom_restart, &
+                 "If false, do not save a restart file at the end of the run. "// &
+                 "Users should not set this flag to false unless they are not "// &
+                 "planning to continue the simulation.", default=.true.)
+
   call set_restart_fields(GV, US, param_file, CS, restart_CSp)
   if (CS%split .and. CS%use_alt_split) then
     call register_restarts_dyn_split_RK2b(HI, GV, US, param_file, &
@@ -4152,11 +4160,13 @@ subroutine save_MOM_restart(CS, directory, time, G, time_stamped, filename, &
   logical, optional, intent(in) :: write_IC
     !< If present and true, initial conditions are being written
 
-  call save_restart(directory, time, G, CS%restart_CS, &
-      time_stamped=time_stamped, filename=filename, GV=GV, &
-      num_rest_files=num_rest_files, write_IC=write_IC)
+  if (CS%do_save_mom_restart) then
+    call save_restart(directory, time, G, CS%restart_CS, &
+        time_stamped=time_stamped, filename=filename, GV=GV, &
+        num_rest_files=num_rest_files, write_IC=write_IC)
 
-  if (CS%use_particles) call particles_save_restart(CS%particles, CS%h, directory, time, time_stamped)
+    if (CS%use_particles) call particles_save_restart(CS%particles, CS%h, directory, time, time_stamped)
+  endif
 end subroutine save_MOM_restart
 
 
