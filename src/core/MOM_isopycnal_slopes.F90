@@ -70,7 +70,10 @@ subroutine calc_isoneutral_slopes(G, GV, US, h, e, tv, dt_kappa_smooth, use_stan
                   ! in massless layers filled vertically by diffusion.
   real, dimension(SZI_(G), SZJ_(G),SZK_(GV)+1) :: &
     pres          ! The pressure at an interface [R L2 T-2 ~> Pa].
-  real, dimension(SZI_(G)) :: scrap ! An array to pass to calculate_density_second_derivs() that will be ingored.
+  real, dimension(SZI_(G)) :: scrap ! An array to pass to calculate_density_second_derivs() that is
+                  ! set there but will be ignored, it is used simultaneously with four different
+                  ! inconsistent units of [R S-1 C-1 ~> kg m-3 degC-1 ppt-1], [R S-2 ~> kg m-3 ppt-2],
+                  ! [T2 S-1 L-2 ~> kg m-3 ppt-1 Pa-1] and [T2 C-1 L-2 ~> kg m-3 degC-1 Pa-1].
   real, dimension(SZIB_(G)) :: &
     drho_dT_u, &  ! The derivative of density with temperature at u points [R C-1 ~> kg m-3 degC-1].
     drho_dS_u     ! The derivative of density with salinity at u points [R S-1 ~> kg m-3 ppt-1].
@@ -353,8 +356,9 @@ subroutine calc_isoneutral_slopes(G, GV, US, h, e, tv, dt_kappa_smooth, use_stan
           slope = 0.0
         endif
       else ! With .not.use_EOS, the layers are constant density.
-        slope = (e(i,j,K)-e(i+1,j,K)) * G%IdxCu(I,j)
+        slope = (e(i+1,j,K)-e(i,j,K)) * G%IdxCu(I,j)
       endif
+
       if (local_open_u_BC) then
         l_seg = OBC%segnum_u(I,j)
         if (l_seg /= OBC_NONE) then
@@ -369,7 +373,7 @@ subroutine calc_isoneutral_slopes(G, GV, US, h, e, tv, dt_kappa_smooth, use_stan
 !           endif
           endif
         endif
-        slope = slope * max(g%mask2dT(i,j),g%mask2dT(i+1,j))
+        slope = slope * max(G%mask2dT(i,j), G%mask2dT(i+1,j))
       endif
       slope_x(I,j,K) = slope
       if (present(dzSxN)) &
@@ -501,11 +505,10 @@ subroutine calc_isoneutral_slopes(G, GV, US, h, e, tv, dt_kappa_smooth, use_stan
         else ! Just in case mag_grad2 = 0 ever.
           slope = 0.0
         endif
-
-
       else ! With .not.use_EOS, the layers are constant density.
-        slope = (e(i,j,K)-e(i,j+1,K)) * G%IdyCv(i,J)
+        slope = (e(i,j+1,K)-e(i,j,K)) * G%IdyCv(i,J)
       endif
+
       if (local_open_v_BC) then
         l_seg = OBC%segnum_v(i,J)
         if (l_seg /= OBC_NONE) then
@@ -520,7 +523,7 @@ subroutine calc_isoneutral_slopes(G, GV, US, h, e, tv, dt_kappa_smooth, use_stan
 !           endif
           endif
         endif
-        slope = slope * max(g%mask2dT(i,j),g%mask2dT(i,j+1))
+        slope = slope * max(G%mask2dT(i,j), G%mask2dT(i,j+1))
       endif
       slope_y(i,J,K) = slope
       if (present(dzSyN)) &
