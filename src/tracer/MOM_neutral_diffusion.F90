@@ -20,6 +20,7 @@ use MOM_remapping,             only : extract_member_remapping_CS, build_reconst
 use MOM_remapping,             only : average_value_ppoly, remappingSchemesDoc, remappingDefaultScheme
 use MOM_tracer_registry,       only : tracer_registry_type, tracer_type
 use MOM_unit_scaling,          only : unit_scale_type
+use MOM_variables,             only : vertvisc_type
 use MOM_verticalGrid,          only : verticalGrid_type
 use polynomial_functions,      only : evaluation_polynomial, first_derivative_polynomial
 use PPM_functions,             only : PPM_reconstruction, PPM_boundary_extrapolation
@@ -119,6 +120,10 @@ type, public :: neutral_diffusion_CS ; private
                                    !! for remapping.  Values below 20190101 recover the remapping
                                    !! answers from 2018, while higher values use more robust
                                    !! forms of the same remapping expressions.
+  integer :: ndiff_answer_date     !< The vintage of the order of arithmetic to use for the neutral
+                                   !! diffusion.  Values of 20240330 or below recover the answers
+                                   !! from the original form of this code, while higher values use
+                                   !! mathematically equivalent expressions that recover rotational symmetry.
   type(KPP_CS),           pointer :: KPP_CSp => NULL()          !< KPP control structure needed to get BLD
   type(energetic_PBL_CS), pointer :: energetic_PBL_CSp => NULL()!< ePBL control structure needed to get MLD
 end type neutral_diffusion_CS
@@ -138,7 +143,7 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
   type(diag_ctrl), target,    intent(inout) :: diag       !< Diagnostics control structure
   type(param_file_type),      intent(in)    :: param_file !< Parameter file structure
   type(EOS_type),  target,    intent(in)    :: EOS        !< Equation of state
-  type(diabatic_CS),          pointer       :: diabatic_CSp!< KPP control structure needed to get BLD
+  type(diabatic_CS),          pointer       :: diabatic_CSp!< diabatic control structure needed to get BLD
   type(neutral_diffusion_CS), pointer       :: CS         !< Neutral diffusion control structure
 
   ! Local variables
@@ -200,6 +205,16 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
                  "transports that were unmasked, as used prior to Jan 2018. This is not "//&
                  "recommended.", default=.false.)
 
+  call get_param(param_file, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
+                 "This sets the default value for the various _ANSWER_DATE parameters.", &
+                 default=99991231)
+  call get_param(param_file, mdl, "NDIFF_ANSWER_DATE", CS%ndiff_answer_date, &
+                 "The vintage of the order of arithmetic to use for the neutral diffusion.  "//&
+                 "Values of 20240330 or below recover the answers from the original form of the "//&
+                 "neutral diffusion code, while higher values use mathematically equivalent "//&
+                 "expressions that recover rotational symmetry.", &
+                 default=20240101) !### Change this default later to default_answer_date.
+
   ! Initialize and configure remapping
   if ( .not.CS%continuous_reconstruction ) then
     call get_param(param_file, mdl, "NDIFF_BOUNDARY_EXTRAP", boundary_extrap, &
@@ -211,9 +226,6 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
                    "for vertical remapping for all variables. "//&
                    "It can be one of the following schemes: "//&
                    trim(remappingSchemesDoc), default=remappingDefaultScheme)
-    call get_param(param_file, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
-                 "This sets the default value for the various _ANSWER_DATE parameters.", &
-                 default=99991231)
     call get_param(param_file, mdl, "REMAPPING_ANSWER_DATE", CS%remap_answer_date, &
                  "The vintage of the expressions and order of arithmetic to use for remapping.  "//&
                  "Values below 20190101 result in the use of older, less accurate expressions "//&
@@ -322,13 +334,15 @@ end function neutral_diffusion_init
 
 !> Calculate remapping factors for u/v columns used to map adjoining columns to
 !! a shared coordinate space.
-subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, CS, p_surf)
+subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
   type(ocean_grid_type),                     intent(in) :: G   !< Ocean grid structure
   type(verticalGrid_type),                   intent(in) :: GV  !< ocean vertical grid structure
   type(unit_scale_type),                     intent(in) :: US  !< A dimensional unit scaling type
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in) :: h   !< Layer thickness [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in) :: T   !< Potential temperature [C ~> degC]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in) :: S   !< Salinity [S ~> ppt]
+  type(vertvisc_type),                       intent(in) :: visc !< Structure with vertical viscosities,
+                                                               !! boundary layer properties and related fields
   type(neutral_diffusion_CS),                pointer    :: CS  !< Neutral diffusion control structure
   real, dimension(SZI_(G),SZJ_(G)), optional, intent(in) :: p_surf !< Surface pressure to include in pressures used
                                                               !! for equation of state calculations [R L2 T-2 ~> Pa]
@@ -358,10 +372,13 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, CS, p_surf)
 
   ! Check if hbl needs to be extracted
   if (CS%interior_only) then
-    if (ASSOCIATED(CS%KPP_CSp)) call KPP_get_BLD(CS%KPP_CSp, CS%hbl, G, US, m_to_BLD_units=GV%m_to_H)
-    if (ASSOCIATED(CS%energetic_PBL_CSp)) call energetic_PBL_get_MLD(CS%energetic_PBL_CSp, CS%hbl, G, US, &
-                                                                     m_to_MLD_units=GV%m_to_H)
-    call pass_var(CS%hbl,G%Domain)
+    if (associated(visc%h_ML)) then
+      CS%hbl(:,:) = visc%h_ML(:,:)
+    else
+      call MOM_error(FATAL, "hor_bnd_diffusion requires that visc%h_ML is associated.")
+    endif
+    call pass_var(CS%hbl, G%Domain, halo=1)
+
     ! get k-indices and zeta
     do j=G%jsc-1, G%jec+1 ; do i=G%isc-1,G%iec+1
       if (G%mask2dT(i,j) > 0.0) then
@@ -623,6 +640,18 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
   real, dimension(SZK_(GV))                    :: dTracer     ! Change in tracer concentration due to neutral diffusion
                                                               ! [H L2 conc ~> m3 conc or kg conc].  For temperature
                                                               ! these units are [C H L2 ~> degC m3 or degC kg].
+  real, dimension(SZK_(GV))                    :: dTracer_N   ! Change in tracer concentration due to neutral diffusion
+                                                              ! into a cell via its logically northern face, in
+                                                              ! [H L2 conc ~> m3 conc or kg conc].
+  real, dimension(SZK_(GV))                    :: dTracer_S   ! Change in tracer concentration due to neutral diffusion
+                                                              ! into a cell via its logically southern face, in
+                                                              ! [H L2 conc ~> m3 conc or kg conc].
+  real, dimension(SZK_(GV))                    :: dTracer_E   ! Change in tracer concentration due to neutral diffusion
+                                                              ! into a cell via its logically eastern face, in
+                                                              ! [H L2 conc ~> m3 conc or kg conc].
+  real, dimension(SZK_(GV))                    :: dTracer_W   ! Change in tracer concentration due to neutral diffusion
+                                                              ! into a cell via its logically western face, in
+                                                              ! [H L2 conc ~> m3 conc or kg conc].
   real :: normalize  ! normalization used for averaging Coef_x and Coef_y to t-points [nondim].
 
   type(tracer_type), pointer                   :: Tracer => NULL() ! Pointer to the current tracer
@@ -800,21 +829,39 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
       endif
     endif
 
-    ! Update the tracer concentration from divergence of neutral diffusive flux components
+    ! Update the tracer concentration from divergence of neutral diffusive flux components, noting
+    ! that uFlx and vFlx use an unexpected sign convention.
     if (CS%KhTh_use_ebt_struct) then
       do j = G%jsc,G%jec ; do i = G%isc,G%iec
         if (G%mask2dT(i,j)>0.) then
-          dTracer(:) = 0.
-          do ks = 1,CS%nsurf-1
-            k = CS%uKoL(I,j,ks)
-            dTracer(k) = dTracer(k)   + uFlx(I,j,ks)
-            k = CS%uKoR(I-1,j,ks)
-            dTracer(k) =   dTracer(k) - uFlx(I-1,j,ks)
-            k = CS%vKoL(i,J,ks)
-            dTracer(k) = dTracer(k)   + vFlx(i,J,ks)
-            k = CS%vKoR(i,J-1,ks)
-            dTracer(k) =   dTracer(k) - vFlx(i,J-1,ks)
-          enddo
+          if (CS%ndiff_answer_date <= 20240330) then
+            dTracer(:) = 0.
+            do ks = 1,CS%nsurf-1
+              k = CS%uKoL(I,j,ks)
+              dTracer(k) = dTracer(k) + uFlx(I,j,ks)
+              k = CS%uKoR(I-1,j,ks)
+              dTracer(k) = dTracer(k) - uFlx(I-1,j,ks)
+              k = CS%vKoL(i,J,ks)
+              dTracer(k) = dTracer(k) + vFlx(i,J,ks)
+              k = CS%vKoR(i,J-1,ks)
+              dTracer(k) = dTracer(k) - vFlx(i,J-1,ks)
+            enddo
+          else  ! This form recovers rotational symmetry.
+            dTracer_N(:) = 0.0 ; dTracer_S(:) = 0.0 ; dTracer_E(:) = 0.0 ; dTracer_W(:) = 0.0
+            do ks = 1,CS%nsurf-1
+              k = CS%uKoL(I,j,ks)
+              dTracer_E(k) = dTracer_E(k) + uFlx(I,j,ks)
+              k = CS%uKoR(I-1,j,ks)
+              dTracer_W(k) = dTracer_W(k) - uFlx(I-1,j,ks)
+              k = CS%vKoL(i,J,ks)
+              dTracer_N(k) = dTracer_N(k) + vFlx(i,J,ks)
+              k = CS%vKoR(i,J-1,ks)
+              dTracer_S(k) = dTracer_S(k) - vFlx(i,J-1,ks)
+            enddo
+            do k = 1, GV%ke
+              dTracer(k) = (dTracer_N(k) + dTracer_S(k)) + (dTracer_E(k) + dTracer_W(k))
+            enddo
+          endif
           do k = 1, GV%ke
             tracer%t(i,j,k) = tracer%t(i,j,k) + dTracer(k) * &
                             ( G%IareaT(i,j) / ( h(i,j,k) + GV%H_subroundoff ) )
@@ -832,17 +879,34 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
     else
       do j = G%jsc,G%jec ; do i = G%isc,G%iec
         if (G%mask2dT(i,j)>0.) then
-          dTracer(:) = 0.
-          do ks = 1,CS%nsurf-1
-            k = CS%uKoL(I,j,ks)
-            dTracer(k) = dTracer(k) + Coef_x(I,j,1)   * uFlx(I,j,ks)
-            k = CS%uKoR(I-1,j,ks)
-            dTracer(k) = dTracer(k) - Coef_x(I-1,j,1) * uFlx(I-1,j,ks)
-            k = CS%vKoL(i,J,ks)
-            dTracer(k) = dTracer(k) + Coef_y(i,J,1)   * vFlx(i,J,ks)
-            k = CS%vKoR(i,J-1,ks)
-            dTracer(k) = dTracer(k) - Coef_y(i,J-1,1) * vFlx(i,J-1,ks)
-          enddo
+          if (CS%ndiff_answer_date <= 20240330) then
+            dTracer(:) = 0.
+            do ks = 1,CS%nsurf-1
+              k = CS%uKoL(I,j,ks)
+              dTracer(k) = dTracer(k) + Coef_x(I,j,1)   * uFlx(I,j,ks)
+              k = CS%uKoR(I-1,j,ks)
+              dTracer(k) = dTracer(k) - Coef_x(I-1,j,1) * uFlx(I-1,j,ks)
+              k = CS%vKoL(i,J,ks)
+              dTracer(k) = dTracer(k) + Coef_y(i,J,1)   * vFlx(i,J,ks)
+              k = CS%vKoR(i,J-1,ks)
+              dTracer(k) = dTracer(k) - Coef_y(i,J-1,1) * vFlx(i,J-1,ks)
+            enddo
+          else  ! This form recovers rotational symmetry.
+            dTracer_N(:) = 0.0 ; dTracer_S(:) = 0.0 ; dTracer_E(:) = 0.0 ; dTracer_W(:) = 0.0
+            do ks = 1,CS%nsurf-1
+              k = CS%uKoL(I,j,ks)
+              dTracer_E(k) = dTracer_E(k) + Coef_x(I,j,1)   * uFlx(I,j,ks)
+              k = CS%uKoR(I-1,j,ks)
+              dTracer_W(k) = dTracer_W(k) - Coef_x(I-1,j,1) * uFlx(I-1,j,ks)
+              k = CS%vKoL(i,J,ks)
+              dTracer_N(k) = dTracer_N(k) + Coef_y(i,J,1)   * vFlx(i,J,ks)
+              k = CS%vKoR(i,J-1,ks)
+              dTracer_S(k) = dTracer_S(k) - Coef_y(i,J-1,1) * vFlx(i,J-1,ks)
+            enddo
+            do k = 1, GV%ke
+              dTracer(k) = (dTracer_N(k) + dTracer_S(k)) + (dTracer_E(k) + dTracer_W(k))
+            enddo
+          endif
           do k = 1, GV%ke
             tracer%t(i,j,k) = tracer%t(i,j,k) + dTracer(k) * &
                             ( G%IareaT(i,j) / ( h(i,j,k) + GV%H_subroundoff ) )
@@ -965,7 +1029,8 @@ subroutine compute_tapering_coeffs(ne, bld_l, bld_r, coeff_l, coeff_r, h_l, h_r)
   real, dimension(ne),   intent(inout) :: coeff_r  !< Tapering coefficient, right column           [nondim]
 
   ! Local variables
-  real :: min_bld, max_bld                       ! Min/Max boundary layer depth in two adjacent columns
+  real :: min_bld         ! Minimum of the boundary layer depth in two adjacent columns [H ~> m or kg m-2]
+  real :: max_bld         ! Maximum of the boundary layer depth in two adjacent columns [H ~> m or kg m-2]
   integer :: dummy1                              ! dummy integer
   real    :: dummy2                              ! dummy real [nondim]
   integer :: k_min_l, k_min_r, k_max_l, k_max_r  ! Min/max vertical indices in two adjacent columns
