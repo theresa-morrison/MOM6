@@ -26,13 +26,14 @@ type, public :: ice_shelf_state
     area_shelf_h => NULL(), &  !< The area per cell covered by the ice shelf [L2 ~> m2].
     h_shelf => NULL(), &       !< the thickness of the shelf [Z ~> m], redundant with mass but may
                                !! make the code more readable
+    dhdt_shelf => NULL(), &       !< the change in thickness of the shelf over time [Z T-1 ~> m s-1]
     hmask => NULL(),&          !< Mask used to indicate ice-covered or partiall-covered cells
                                !! 1: fully covered, solve for velocity here (for now all
                                !!   ice-covered cells are treated the same, this may change)
                                !! 2: partially covered, do not solve for velocity
                                !! 0: no ice in cell.
-                               !! 3: bdry condition on thickness set - not in computational domain
-                               !! -2 : default (out of computational boundary, and) not = 3
+                               !! 3: bdry condition on thickness set
+                               !! -2 : default (out of computational boundary)
                                !! NOTE: hmask will change over time and NEEDS TO BE MAINTAINED
                                !!   otherwise the wrong nodes will be included in velocity calcs.
 
@@ -45,9 +46,13 @@ type, public :: ice_shelf_state
     tflux_shelf => NULL(), &   !< The downward diffusive heat flux in the ice
                                !! shelf at the ice-ocean interface [Q R Z T-1 ~> W m-2].
 
-    tfreeze => NULL()          !< The freezing point potential temperature
+    tfreeze => NULL(), &       !< The freezing point potential temperature
                                !! at the ice-ocean interface [C ~> degC].
 
+    !only active when calve_ice_shelf_bergs=true:
+    calving => NULL(), &       !< The mass flux per unit area of the ice shelf to convert to
+                               !! bergs [R Z T-1 ~> kg m-2 s-1].
+    calving_hflx => NULL()     !< Calving heat flux [Q R Z T-1 ~> W m-2].
 end type ice_shelf_state
 
 contains
@@ -70,6 +75,7 @@ subroutine ice_shelf_state_init(ISS, G)
   allocate(ISS%mass_shelf(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%area_shelf_h(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%h_shelf(isd:ied,jsd:jed), source=0.0 )
+  allocate(ISS%dhdt_shelf(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%hmask(isd:ied,jsd:jed), source=-2.0 )
 
   allocate(ISS%tflux_ocn(isd:ied,jsd:jed), source=0.0 )
@@ -78,6 +84,8 @@ subroutine ice_shelf_state_init(ISS, G)
   allocate(ISS%tflux_shelf(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%tfreeze(isd:ied,jsd:jed), source=0.0 )
 
+  allocate(ISS%calving(isd:ied,jsd:jed), source=0.0 )
+  allocate(ISS%calving_hflx(isd:ied,jsd:jed), source=0.0 )
 end subroutine ice_shelf_state_init
 
 
@@ -87,10 +95,12 @@ subroutine ice_shelf_state_end(ISS)
 
   if (.not.associated(ISS)) return
 
-  deallocate(ISS%mass_shelf, ISS%area_shelf_h, ISS%h_shelf, ISS%hmask)
+  deallocate(ISS%mass_shelf, ISS%area_shelf_h, ISS%h_shelf, ISS%dhdt_shelf, ISS%hmask)
 
   deallocate(ISS%tflux_ocn, ISS%water_flux, ISS%salt_flux, ISS%tflux_shelf)
   deallocate(ISS%tfreeze)
+
+  deallocate(ISS%calving, ISS%calving_hflx)
 
   deallocate(ISS)
 

@@ -26,7 +26,7 @@ public register_tidal_bay_OBC
 !> Control structure for tidal bay open boundaries.
 type, public :: tidal_bay_OBC_CS ; private
   real :: tide_flow = 3.0e6  !< Maximum tidal flux with the tidal bay configuration [L2 Z T-1 ~> m3 s-1]
-  real :: tide_period        !< The period associated with the tidal bay configuration [T ~> s-1]
+  real :: tide_period        !< The period associated with the tidal bay configuration [T ~> s]
   real :: tide_ssh_amp       !< The magnitude of the sea surface height anomalies at the inflow
                              !! with the tidal bay configuration [Z ~> m]
 end type tidal_bay_OBC_CS
@@ -74,7 +74,7 @@ subroutine tidal_bay_set_OBC_data(OBC, CS, G, GV, US, h, Time)
 
   ! The following variables are used to set up the transport in the tidal_bay example.
   real :: time_sec    ! Elapsed model time [T ~> s]
-  real :: cff_eta     ! The total column thickness anomalies associated with the inflow [H ~> m or kg m-2]
+  real :: cff_eta     ! The sea surface height anomalies associated with the inflow [Z ~> m]
   real :: my_flux     ! The vlume flux through the face [L2 Z T-1 ~> m3 s-1]
   real :: total_area  ! The total face area of the OBCs [L Z ~> m2]
   real :: PI          ! The ratio of the circumference of a circle to its diameter [nondim]
@@ -97,7 +97,7 @@ subroutine tidal_bay_set_OBC_data(OBC, CS, G, GV, US, h, Time)
   flux_scale = GV%H_to_m*US%L_to_m
 
   time_sec = US%s_to_T*time_type_to_real(Time)
-  cff_eta = CS%tide_ssh_amp*GV%Z_to_H * sin(2.0*PI*time_sec / CS%tide_period)
+  cff_eta = CS%tide_ssh_amp * sin(2.0*PI*time_sec / CS%tide_period)
   my_area = 0.0
   my_flux = 0.0
   segment => OBC%segment(1)
@@ -110,7 +110,7 @@ subroutine tidal_bay_set_OBC_data(OBC, CS, G, GV, US, h, Time)
       enddo
     endif
   enddo ; enddo
-  total_area = reproducing_sum(my_area)
+  total_area = US%m_to_Z*US%m_to_L * reproducing_sum(my_area)
   my_flux = - CS%tide_flow * SIN(2.0*PI*time_sec / CS%tide_period)
 
   do n = 1, OBC%number_of_segments
@@ -118,8 +118,8 @@ subroutine tidal_bay_set_OBC_data(OBC, CS, G, GV, US, h, Time)
 
     if (.not. segment%on_pe) cycle
 
-    segment%normal_vel_bt(:,:) = my_flux / (US%m_to_Z*US%m_to_L*total_area)
-    segment%eta(:,:) = cff_eta
+    segment%normal_vel_bt(:,:) = my_flux / total_area
+    segment%SSH(:,:) = cff_eta
 
   enddo ! end segment loop
 

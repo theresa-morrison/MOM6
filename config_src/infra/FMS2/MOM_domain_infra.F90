@@ -16,14 +16,15 @@ use mpp_domains_mod, only : mpp_start_update_domains, mpp_complete_update_domain
 use mpp_domains_mod, only : mpp_create_group_update, mpp_do_group_update
 use mpp_domains_mod, only : mpp_reset_group_update_field, mpp_group_update_initialized
 use mpp_domains_mod, only : mpp_start_group_update, mpp_complete_group_update
-use mpp_domains_mod, only : mpp_compute_block_extent
+use mpp_domains_mod, only : mpp_compute_block_extent, mpp_compute_extent
 use mpp_domains_mod, only : mpp_broadcast_domain, mpp_redistribute, mpp_global_field
 use mpp_domains_mod, only : AGRID, BGRID_NE, CGRID_NE, SCALAR_PAIR, BITWISE_EXACT_SUM
-use mpp_domains_mod, only : CYCLIC_GLOBAL_DOMAIN, FOLD_NORTH_EDGE
+use mpp_domains_mod, only : CYCLIC_GLOBAL_DOMAIN
+use mpp_domains_mod, only : FOLD_NORTH_EDGE, FOLD_SOUTH_EDGE, FOLD_EAST_EDGE, FOLD_WEST_EDGE
 use mpp_domains_mod, only : To_East => WUPDATE, To_West => EUPDATE, Omit_Corners => EDGEUPDATE
 use mpp_domains_mod, only : To_North => SUPDATE, To_South => NUPDATE
 use mpp_domains_mod, only : CENTER, CORNER, NORTH_FACE => NORTH, EAST_FACE => EAST
-use fms_io_mod,      only : file_exist, parse_mask_table
+use fms_io_utils_mod, only : file_exists, parse_mask_table
 use fms_affinity_mod, only : fms_affinity_init, fms_affinity_set, fms_affinity_get
 
 ! This subroutine is not in MOM6/src but may be required by legacy drivers
@@ -38,7 +39,7 @@ implicit none ; private
 public :: domain2D, domain1D, group_pass_type
 ! These interfaces are actually implemented or have explicit interfaces in this file.
 public :: create_MOM_domain, clone_MOM_domain, get_domain_components, get_domain_extent
-public :: deallocate_MOM_domain, get_global_shape, compute_block_extent
+public :: deallocate_MOM_domain, get_global_shape, compute_block_extent, compute_extent
 public :: pass_var, pass_vector, fill_symmetric_edges, rescale_comp_data
 public :: pass_var_start, pass_var_complete, pass_vector_start, pass_vector_complete
 public :: create_group_pass, do_group_pass, start_group_pass, complete_group_pass
@@ -49,6 +50,7 @@ public :: MOM_thread_affinity_set, set_MOM_thread_affinity
 public :: To_East, To_West, To_North, To_South, To_All, Omit_Corners
 public :: AGRID, BGRID_NE, CGRID_NE, SCALAR_PAIR
 public :: CORNER, CENTER, NORTH_FACE, EAST_FACE
+public :: set_domain, nullify_domain
 ! These are no longer used by MOM6 because the reproducing sum works so well, but they are
 ! still referenced by some of the non-GFDL couplers.
 ! public :: global_field_sum, BITWISE_EXACT_SUM
@@ -1390,7 +1392,7 @@ subroutine create_MOM_domain(MOM_dom, n_global, n_halo, reentrant, tripolar_N, l
   endif
 
   if (present(mask_table)) then
-    mask_table_exists = file_exist(mask_table)
+    mask_table_exists = file_exists(mask_table)
     if (mask_table_exists) then
       allocate(MOM_dom%maskmap(layout(1), layout(2)))
       call parse_mask_table(mask_table, MOM_dom%maskmap, MOM_dom%name)
@@ -1491,7 +1493,7 @@ end subroutine get_domain_components_d2D
 !> clone_MD_to_MD copies one MOM_domain_type into another, while allowing
 !! some properties of the new type to differ from the original one.
 subroutine clone_MD_to_MD(MD_in, MOM_dom, min_halo, halo_size, symmetric, domain_name, &
-                          turns, refine, extra_halo)
+                          turns, refine, extra_halo, io_layout)
   type(MOM_domain_type), target, intent(in) :: MD_in  !< An existing MOM_domain
   type(MOM_domain_type), pointer :: MOM_dom
                                   !< A pointer to a MOM_domain that will be
@@ -1514,6 +1516,9 @@ subroutine clone_MD_to_MD(MD_in, MOM_dom, min_halo, halo_size, symmetric, domain
   integer, optional, intent(in) :: refine  !< A factor by which to enhance the grid resolution.
   integer, optional, intent(in) :: extra_halo !< An extra number of points in the halos
                                   !! compared with MD_in
+  integer, optional, intent(in) :: io_layout(2)
+    !< A user-defined IO layout to replace the domain's IO layout
+
 
   integer :: global_indices(4)
   logical :: mask_table_exists
@@ -1523,9 +1528,16 @@ subroutine clone_MD_to_MD(MD_in, MOM_dom, min_halo, halo_size, symmetric, domain
                                              ! The sum of exni must equal MOM_dom%niglobal.
   integer :: qturns ! The number of quarter turns, restricted to the range of 0 to 3.
   integer :: i, j, nl1, nl2
+  integer :: io_layout_in(2)
 
   qturns = 0
   if (present(turns)) qturns = modulo(turns, 4)
+
+  if (present(io_layout)) then
+    io_layout_in(:) = io_layout(:)
+  else
+    io_layout_in(:) = MD_in%io_layout(:)
+  endif
 
   if (.not.associated(MOM_dom)) then
     allocate(MOM_dom)
@@ -1544,19 +1556,40 @@ subroutine clone_MD_to_MD(MD_in, MOM_dom, min_halo, halo_size, symmetric, domain
     call get_layout_extents(MD_in, exnj, exni)
 
     MOM_dom%X_FLAGS = MD_in%Y_FLAGS ; MOM_dom%Y_FLAGS = MD_in%X_FLAGS
+    ! Correct the position of a tripolar grid, assuming that flags are not additive.
+    if (modulo(qturns, 4) == 1) then
+      if (MD_in%Y_FLAGS == FOLD_NORTH_EDGE) MOM_dom%X_FLAGS = FOLD_EAST_EDGE
+      if (MD_in%Y_FLAGS == FOLD_SOUTH_EDGE) MOM_dom%X_FLAGS = FOLD_WEST_EDGE
+      if (MD_in%X_FLAGS == FOLD_EAST_EDGE) MOM_dom%Y_FLAGS = FOLD_SOUTH_EDGE
+      if (MD_in%X_FLAGS == FOLD_WEST_EDGE) MOM_dom%Y_FLAGS = FOLD_NORTH_EDGE
+    elseif (modulo(qturns, 4) == 3) then
+      if (MD_in%Y_FLAGS == FOLD_NORTH_EDGE) MOM_dom%X_FLAGS = FOLD_WEST_EDGE
+      if (MD_in%Y_FLAGS == FOLD_SOUTH_EDGE) MOM_dom%X_FLAGS = FOLD_EAST_EDGE
+      if (MD_in%X_FLAGS == FOLD_EAST_EDGE) MOM_dom%Y_FLAGS = FOLD_NORTH_EDGE
+      if (MD_in%X_FLAGS == FOLD_WEST_EDGE) MOM_dom%Y_FLAGS = FOLD_SOUTH_EDGE
+    endif
+
     MOM_dom%layout(:) = MD_in%layout(2:1:-1)
-    MOM_dom%io_layout(:) = MD_in%io_layout(2:1:-1)
+    MOM_dom%io_layout(:) = io_layout_in(2:1:-1)
   else
     MOM_dom%niglobal = MD_in%niglobal ; MOM_dom%njglobal = MD_in%njglobal
     MOM_dom%nihalo = MD_in%nihalo ; MOM_dom%njhalo = MD_in%njhalo
     call get_layout_extents(MD_in, exni, exnj)
 
     MOM_dom%X_FLAGS = MD_in%X_FLAGS ; MOM_dom%Y_FLAGS = MD_in%Y_FLAGS
+    ! Correct the position of a tripolar grid, assuming that flags are not additive.
+    if (modulo(qturns, 4) == 2) then
+      if (MD_in%Y_FLAGS == FOLD_NORTH_EDGE) MOM_dom%Y_FLAGS = FOLD_SOUTH_EDGE
+      if (MD_in%Y_FLAGS == FOLD_SOUTH_EDGE) MOM_dom%Y_FLAGS = FOLD_NORTH_EDGE
+      if (MD_in%X_FLAGS == FOLD_EAST_EDGE) MOM_dom%X_FLAGS = FOLD_WEST_EDGE
+      if (MD_in%X_FLAGS == FOLD_WEST_EDGE) MOM_dom%X_FLAGS = FOLD_EAST_EDGE
+    endif
+
     MOM_dom%layout(:) = MD_in%layout(:)
-    MOM_dom%io_layout(:) = MD_in%io_layout(:)
+    MOM_dom%io_layout(:) = io_layout_in(:)
   endif
 
-  ! Ensure that the points per processor are the same on the source and densitation grids.
+  ! Ensure that the points per processor are the same on the source and destination grids.
   select case (qturns)
     case (1) ; call invert(exni)
     case (2) ; call invert(exni) ; call invert(exnj)
@@ -1925,7 +1958,7 @@ subroutine get_global_shape(domain, niglobal, njglobal)
   njglobal = domain%njglobal
 end subroutine get_global_shape
 
-!> Get the array ranges in one dimension for the divisions of a global index space
+!> Get the array ranges in one dimension for the divisions of a global index space (alternative to compute_extent)
 subroutine compute_block_extent(isg, ieg, ndivs, ibegin, iend)
   integer,               intent(in)  :: isg    !< The starting index of the global index space
   integer,               intent(in)  :: ieg    !< The ending index of the global index space
@@ -1935,6 +1968,17 @@ subroutine compute_block_extent(isg, ieg, ndivs, ibegin, iend)
 
   call mpp_compute_block_extent(isg, ieg, ndivs, ibegin, iend)
 end subroutine compute_block_extent
+
+!> Get the array ranges in one dimension for the divisions of a global index space
+subroutine compute_extent(isg, ieg, ndivs, ibegin, iend)
+  integer,               intent(in)  :: isg    !< The starting index of the global index space
+  integer,               intent(in)  :: ieg    !< The ending index of the global index space
+  integer,               intent(in)  :: ndivs  !< The number of divisions
+  integer, dimension(:), intent(out) :: ibegin !< The starting index of each division
+  integer, dimension(:), intent(out) :: iend   !< The ending index of each division
+
+  call mpp_compute_extent(isg, ieg, ndivs, ibegin, iend)
+end subroutine compute_extent
 
 !> Broadcast a 2-d domain from the root PE to the other PEs
 subroutine broadcast_domain(domain)
@@ -1991,5 +2035,18 @@ subroutine get_layout_extents(Domain, extent_i, extent_j)
   allocate(extent_j(domain%layout(2))) ; extent_j(:) = 0
   call mpp_get_domain_extents(domain%mpp_domain, extent_i, extent_j)
 end subroutine get_layout_extents
+
+!> Set the associated domain for internal FMS I/O operations.
+subroutine set_domain(Domain)
+  type(MOM_domain_type), intent(in) :: Domain
+    !< MOM domain to be designated as the internal FMS I/O domain
+
+  ! FMS2 does not have domain-based internal FMS I/O operations, so this
+  ! function does nothing.
+end subroutine set_domain
+
+subroutine nullify_domain
+  ! No internal FMS I/O domain can be assigned, so this function does nothing.
+end subroutine nullify_domain
 
 end module MOM_domain_infra

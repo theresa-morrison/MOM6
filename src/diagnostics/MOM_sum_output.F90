@@ -8,13 +8,14 @@ use MOM_checksums,     only : is_NaN
 use MOM_coms,          only : sum_across_PEs, PE_here, root_PE, num_PEs, max_across_PEs, field_chksum
 use MOM_coms,          only : reproducing_sum, reproducing_sum_EFP, EFP_to_real, real_to_EFP
 use MOM_coms,          only : EFP_type, operator(+), operator(-), assignment(=), EFP_sum_across_PEs
-use MOM_error_handler, only : MOM_error, FATAL, WARNING, is_root_pe, MOM_mesg
+use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, is_root_pe
 use MOM_file_parser,   only : get_param, log_param, log_version, param_file_type
 use MOM_forcing_type,  only : forcing
 use MOM_grid,          only : ocean_grid_type
 use MOM_interface_heights, only : find_eta
-use MOM_io,            only : create_file, file_type, fieldtype, flush_file, reopen_file, close_file
-use MOM_io,            only : file_exists, slasher, vardesc, var_desc, write_field, MOM_write_field
+use MOM_io,            only : create_MOM_file, reopen_MOM_file
+use MOM_io,            only : MOM_infra_file, MOM_netcdf_file, MOM_field
+use MOM_io,            only : file_exists, slasher, vardesc, var_desc, MOM_write_field
 use MOM_io,            only : field_size, read_variable, read_attribute, open_ASCII_file, stdout
 use MOM_io,            only : axis_info, set_axis_info, delete_axis_info, get_filename_appendix
 use MOM_io,            only : attribute_info, set_attribute_info, delete_attribute_info
@@ -125,9 +126,9 @@ type, public :: sum_output_CS ; private
                                 !! to stdout when the energy files are written.
   integer :: previous_calls = 0 !< The number of times write_energy has been called.
   integer :: prev_n = 0         !< The value of n from the last call.
-  type(file_type) :: fileenergy_nc !< The file handle for the netCDF version of the energy file.
+  type(MOM_netcdf_file) :: fileenergy_nc !< The file handle for the netCDF version of the energy file.
   integer :: fileenergy_ascii   !< The unit number of the ascii version of the energy file.
-  type(fieldtype), dimension(NUM_FIELDS+MAX_FIELDS_) :: &
+  type(MOM_field), dimension(NUM_FIELDS+MAX_FIELDS_) :: &
              fields             !< fieldtype variables for the output fields.
   character(len=200) :: energyfile  !< The name of the energy file with path.
 end type sum_output_CS
@@ -198,7 +199,8 @@ subroutine MOM_sum_output_init(G, GV, US, param_file, directory, ntrnc, &
                  "The maximum velocity allowed before the velocity "//&
                  "components are truncated.", units="m s-1", default=3.0e8, scale=US%m_s_to_L_T)
     CS%max_Energy = 10.0 * maxvel**2
-    call log_param(param_file, mdl, "MAX_ENERGY as used", US%L_T_to_m_s**2*CS%max_Energy, units="m2 s-2")
+    call log_param(param_file, mdl, "MAX_ENERGY as used", CS%max_Energy, &
+                   units="m2 s-2", unscale=US%L_T_to_m_s**2)
   endif
 
   call get_param(param_file, mdl, "ENERGYFILE", energyfile, &
@@ -508,24 +510,18 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
     do k=1,nz ; vol_lay(k) = (US%m_to_L**2*GV%H_to_Z/GV%H_to_kg_m2)*mass_lay(k) ; enddo
   else
     tmp1(:,:,:) = 0.0
-    if (CS%do_APE_calc) then
-      do k=1,nz ; do j=js,je ; do i=is,ie
-        tmp1(i,j,k) = HL2_to_kg * h(i,j,k) * areaTm(i,j)
-      enddo ; enddo ; enddo
-      mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, sums=mass_lay, EFP_sum=mass_EFP)
+    do k=1,nz ; do j=js,je ; do i=is,ie
+      tmp1(i,j,k) = HL2_to_kg * h(i,j,k) * areaTm(i,j)
+    enddo ; enddo ; enddo
+    mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, sums=mass_lay, EFP_sum=mass_EFP)
 
+    if (CS%do_APE_calc) then
       call find_eta(h, tv, G, GV, US, eta, dZref=G%Z_ref)
       do k=1,nz ; do j=js,je ; do i=is,ie
         tmp1(i,j,k) = US%Z_to_m*US%L_to_m**2*(eta(i,j,K)-eta(i,j,K+1)) * areaTm(i,j)
       enddo ; enddo ; enddo
       vol_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, sums=vol_lay)
       do k=1,nz ; vol_lay(k) = US%m_to_Z*US%m_to_L**2 * vol_lay(k) ; enddo
-    else
-      do k=1,nz ; do j=js,je ; do i=is,ie
-        tmp1(i,j,k) = HL2_to_kg * h(i,j,k) * areaTm(i,j)
-      enddo ; enddo ; enddo
-      mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, sums=mass_lay, EFP_sum=mass_EFP)
-      do k=1,nz ; vol_lay(k) = US%m_to_Z*US%m_to_L**2*US%kg_m3_to_R * (mass_lay(k) / GV%Rho0) ; enddo
     endif
   endif ! Boussinesq
 
@@ -599,17 +595,15 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
           endif
         endif
       endif
-    endif
 
-    energypath_nc = trim(CS%energyfile) // ".nc"
-    if (day > CS%Start_time) then
-      call reopen_file(CS%fileenergy_nc, trim(energypath_nc), vars, &
-                       num_nc_fields, CS%fields, SINGLE_FILE, CS%timeunit, &
-                       G=G, GV=GV)
-    else
-      call create_file(CS%fileenergy_nc, trim(energypath_nc), vars, &
-                       num_nc_fields, CS%fields, SINGLE_FILE, CS%timeunit, &
-                       G=G, GV=GV)
+      energypath_nc = trim(CS%energyfile) // ".nc"
+      if (day > CS%Start_time) then
+        call reopen_MOM_file(CS%fileenergy_nc, trim(energypath_nc), vars, &
+            num_nc_fields, CS%fields, SINGLE_FILE, CS%timeunit, G=G, GV=GV)
+      else
+        call create_MOM_file(CS%fileenergy_nc, trim(energypath_nc), vars, &
+            num_nc_fields, CS%fields, SINGLE_FILE, CS%timeunit, G=G, GV=GV)
+      endif
     endif
   endif
 
@@ -643,7 +637,7 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
     if (GV%Boussinesq) then
       do j=js,je ; do i=is,ie
         hbelow = 0.0
-        do k=nz,1,-1
+        do K=nz,1,-1
           hbelow = hbelow + h(i,j,k) * GV%H_to_Z
           hint = Z_0APE(K) + (hbelow - (G%bathyT(i,j) + G%Z_ref))
           hbot = Z_0APE(K) - (G%bathyT(i,j) + G%Z_ref)
@@ -652,14 +646,28 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
                   (hint * hint - hbot * hbot)
         enddo
       enddo ; enddo
-    else
+    elseif (GV%semi_Boussinesq) then
       do j=js,je ; do i=is,ie
-        do k=nz,1,-1
+        do K=nz,1,-1
           hint = Z_0APE(K) + eta(i,j,K)  ! eta and H_0 have opposite signs.
           hbot = max(Z_0APE(K) - (G%bathyT(i,j) + G%Z_ref), 0.0)
           PE_pt(i,j,K) = (0.5 * PE_scale_factor * areaTm(i,j) * (GV%Rho0*GV%g_prime(K))) * &
-                  (hint * hint - hbot * hbot)
+                         (hint * hint - hbot * hbot)
         enddo
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        do K=nz,2,-1
+          hint = Z_0APE(K) + eta(i,j,K)  ! eta and H_0 have opposite signs.
+          hbot = max(Z_0APE(K) - (G%bathyT(i,j) + G%Z_ref), 0.0)
+          PE_pt(i,j,K) = (0.25 * PE_scale_factor * areaTm(i,j) * &
+                          ((GV%Rlay(k)+GV%Rlay(k-1))*GV%g_prime(K))) * &
+                         (hint * hint - hbot * hbot)
+        enddo
+        hint = Z_0APE(1) + eta(i,j,1)  ! eta and H_0 have opposite signs.
+        hbot = max(Z_0APE(1) - (G%bathyT(i,j) + G%Z_ref), 0.0)
+        PE_pt(i,j,1) = (0.5 * PE_scale_factor * areaTm(i,j) * (GV%Rlay(1)*GV%g_prime(1))) * &
+                       (hint * hint - hbot * hbot)
       enddo ; enddo
     endif
 
@@ -795,7 +803,7 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
     date_str = trim(mesg_intro)//trim(day_str)
   endif
 
-  if (is_root_pe()) then
+  if (is_root_pe()) then  ! Only the root PE actually writes anything.
     if (CS%use_temperature) then
         write(stdout,'(A," ",A,": En ",ES12.6, ", MaxCFL ", F8.5, ", Mass ", &
                 & ES18.12, ", Salt ", F15.11,", Temp ", F15.11)') &
@@ -861,37 +869,37 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
 
       enddo
     endif
-  endif
 
-  call write_field(CS%fileenergy_nc, CS%fields(1), real(CS%ntrunc), reday)
-  call write_field(CS%fileenergy_nc, CS%fields(2), toten, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(3), PE, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(4), KE, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(5), H_0APE, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(6), mass_lay, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(1), real(CS%ntrunc), reday)
+    call CS%fileenergy_nc%write_field(CS%fields(2), toten, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(3), PE, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(4), KE, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(5), H_0APE, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(6), mass_lay, reday)
 
-  call write_field(CS%fileenergy_nc, CS%fields(7), mass_tot, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(8), mass_chg, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(9), mass_anom, reday)
-  call write_field(CS%fileenergy_nc, CS%fields(10), max_CFL(1), reday)
-  call write_field(CS%fileenergy_nc, CS%fields(11), max_CFL(2), reday)
-  if (CS%use_temperature) then
-    call write_field(CS%fileenergy_nc, CS%fields(12), 0.001*Salt, reday)
-    call write_field(CS%fileenergy_nc, CS%fields(13), 0.001*salt_chg, reday)
-    call write_field(CS%fileenergy_nc, CS%fields(14), 0.001*salt_anom, reday)
-    call write_field(CS%fileenergy_nc, CS%fields(15), Heat, reday)
-    call write_field(CS%fileenergy_nc, CS%fields(16), heat_chg, reday)
-    call write_field(CS%fileenergy_nc, CS%fields(17), heat_anom, reday)
-    do m=1,nTr_stocks
-      call write_field(CS%fileenergy_nc, CS%fields(17+m), Tr_stocks(m), reday)
-    enddo
-  else
-    do m=1,nTr_stocks
-      call write_field(CS%fileenergy_nc, CS%fields(11+m), Tr_stocks(m), reday)
-    enddo
-  endif
+    call CS%fileenergy_nc%write_field(CS%fields(7), mass_tot, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(8), mass_chg, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(9), mass_anom, reday)
+    call CS%fileenergy_nc%write_field(CS%fields(10), max_CFL(1), reday)
+    call CS%fileenergy_nc%write_field(CS%fields(11), max_CFL(2), reday)
+    if (CS%use_temperature) then
+      call CS%fileenergy_nc%write_field(CS%fields(12), 0.001*Salt, reday)
+      call CS%fileenergy_nc%write_field(CS%fields(13), 0.001*salt_chg, reday)
+      call CS%fileenergy_nc%write_field(CS%fields(14), 0.001*salt_anom, reday)
+      call CS%fileenergy_nc%write_field(CS%fields(15), Heat, reday)
+      call CS%fileenergy_nc%write_field(CS%fields(16), heat_chg, reday)
+      call CS%fileenergy_nc%write_field(CS%fields(17), heat_anom, reday)
+      do m=1,nTr_stocks
+        call CS%fileenergy_nc%write_field(CS%fields(17+m), Tr_stocks(m), reday)
+      enddo
+    else
+      do m=1,nTr_stocks
+        call CS%fileenergy_nc%write_field(CS%fields(11+m), Tr_stocks(m), reday)
+      enddo
+    endif
 
-  call flush_file(CS%fileenergy_nc)
+    call CS%fileenergy_nc%flush()
+  endif  ! Only the root PE actually writes anything.
 
   if (is_NaN(En_mass)) then
     call MOM_error(FATAL, "write_energy : NaNs in total model energy forced model termination.")
@@ -1077,7 +1085,7 @@ subroutine depth_list_setup(G, GV, US, DL, CS)
         valid_DL_read = .true. ! Otherwise there would have been a fatal error.
       endif
     else
-      if (is_root_pe()) call MOM_error(WARNING, "depth_list_setup: "// &
+      if (is_root_pe()) call MOM_error(NOTE, "depth_list_setup: "// &
         trim(CS%depth_list_file)//" does not exist.  Creating a new file.")
       valid_DL_read = .false.
     endif
@@ -1233,13 +1241,13 @@ subroutine write_depth_list(G, US, DL, filename)
   ! Local variables
   type(vardesc), dimension(:), allocatable :: &
     vars          ! Types that described the staggering and metadata for the fields
-  type(fieldtype), dimension(:), allocatable :: &
+  type(MOM_field), dimension(:), allocatable :: &
     fields        ! Types with metadata about the variables that will be written
   type(axis_info), dimension(:), allocatable :: &
     extra_axes    ! Descriptors for extra axes that might be used
   type(attribute_info), dimension(:), allocatable :: &
     global_atts   ! Global attributes and their values
-  type(file_type)   :: IO_handle     ! The I/O handle of the fileset
+  type(MOM_netcdf_file) :: IO_handle   ! The I/O handle of the fileset
   character(len=16) :: depth_chksum, area_chksum
 
   ! All ranks are required to compute the global checksum
@@ -1259,8 +1267,8 @@ subroutine write_depth_list(G, US, DL, filename)
   call set_attribute_info(global_atts(1), depth_chksum_attr, depth_chksum)
   call set_attribute_info(global_atts(2), area_chksum_attr, area_chksum)
 
-  call create_file(IO_handle, filename, vars, 3, fields, SINGLE_FILE, extra_axes=extra_axes, &
-                   global_atts=global_atts)
+  call create_MOM_file(IO_handle, filename, vars, 3, fields, SINGLE_FILE, &
+      extra_axes=extra_axes, global_atts=global_atts)
   call MOM_write_field(IO_handle, fields(1), DL%depth, scale=US%Z_to_m)
   call MOM_write_field(IO_handle, fields(2), DL%area, scale=US%L_to_m**2)
   call MOM_write_field(IO_handle, fields(3), DL%vol_below, scale=US%Z_to_m*US%L_to_m**2)
@@ -1268,8 +1276,7 @@ subroutine write_depth_list(G, US, DL, filename)
   call delete_axis_info(extra_axes)
   call delete_attribute_info(global_atts)
   deallocate(vars, extra_axes, fields, global_atts)
-  call close_file(IO_handle)
-
+  call IO_handle%close()
 end subroutine write_depth_list
 
 !> This subroutine reads in the depth list from the specified file

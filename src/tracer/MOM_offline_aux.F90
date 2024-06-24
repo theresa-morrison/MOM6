@@ -642,7 +642,8 @@ subroutine update_offline_from_files(G, GV, US, nk_input, mean_file, sum_file, s
   real, dimension(SZI_(G),SZJ_(G)),          &
                            intent(inout) :: mld       !< Averaged mixed layer depth [Z ~> m]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1), &
-                           intent(inout) :: Kd        !< Diapycnal diffusivities at interfaces [Z2 T-1 ~> m2 s-1]
+                           intent(inout) :: Kd        !< Diapycnal diffusivities at interfaces
+                                                      !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   type(forcing),           intent(inout) :: fluxes    !< Fields with surface fluxes
   integer,                 intent(in   ) :: ridx_sum  !< Read index for sum, mean, and surf files
   integer,                 intent(in   ) :: ridx_snap !< Read index for snapshot file
@@ -696,7 +697,7 @@ subroutine update_offline_from_files(G, GV, US, nk_input, mean_file, sum_file, s
 
   ! Check if reading vertical diffusivities or entrainment fluxes
   call MOM_read_data( mean_file, 'Kd_interface', Kd(:,:,1:nk_input+1), G%Domain, &
-                  timelevel=ridx_sum, position=CENTER, scale=US%m2_s_to_Z2_T)
+                  timelevel=ridx_sum, position=CENTER, scale=GV%m2_s_to_HZ_T)
 
   ! This block makes sure that the fluxes control structure, which may not be used in the solo_driver,
   ! contains netMassIn and netMassOut which is necessary for the applyTracerBoundaryFluxesInOut routine
@@ -777,12 +778,12 @@ subroutine update_offline_from_arrays(G, GV, nk_input, ridx_sum, mean_file, sum_
   real, dimension(:,:,:,:), allocatable,     intent(inout) :: hend_all  !< End of timestep layer thickness
                                                                         !! [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: temp      !< Temperature array [C ~> degC]
-  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: salt      !< Salinity array [ppt ~> S]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: salt      !< Salinity array [S ~> ppt]
   real, dimension(:,:,:,:), allocatable,     intent(inout) :: temp_all  !< Temperature array [C ~> degC]
-  real, dimension(:,:,:,:), allocatable,     intent(inout) :: salt_all  !< Salinity array [ppt ~> S]
+  real, dimension(:,:,:,:), allocatable,     intent(inout) :: salt_all  !< Salinity array [S ~> ppt]
 
   integer :: i, j, k, is, ie, js, je, nz
-  real, parameter :: fill_value = 0.
+  real, parameter :: fill_value = 0. ! The fill value for input arrays [various]
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
   ! Check that all fields are allocated (this is a redundant check)

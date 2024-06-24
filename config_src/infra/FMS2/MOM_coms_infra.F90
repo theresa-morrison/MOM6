@@ -25,7 +25,7 @@ public :: field_chksum, MOM_infra_init, MOM_infra_end
 !> Communicate an array, string or scalar from one PE to others
 interface broadcast
   module procedure broadcast_char, broadcast_int32_0D, broadcast_int64_0D, broadcast_int1D
-  module procedure broadcast_real0D, broadcast_real1D, broadcast_real2D
+  module procedure broadcast_real0D, broadcast_real1D, broadcast_real2D, broadcast_real3D
 end interface broadcast
 
 !> Compute a checksum for a field distributed over a PE list.  If no PE list is
@@ -42,6 +42,7 @@ end interface field_chksum
 interface sum_across_PEs
   module procedure sum_across_PEs_int4_0d
   module procedure sum_across_PEs_int4_1d
+  module procedure sum_across_PEs_int4_2d
   module procedure sum_across_PEs_int8_0d
   module procedure sum_across_PEs_int8_1d
   module procedure sum_across_PEs_int8_2d
@@ -260,6 +261,27 @@ subroutine broadcast_real2D(dat, length, from_PE, PElist, blocking)
 
 end subroutine broadcast_real2D
 
+!> Communicate a 3-D array of reals from one PE to others
+subroutine broadcast_real3D(dat, length, from_PE, PElist, blocking)
+  real, dimension(:,:,:), intent(inout) :: dat       !< The data to communicate and destination
+  integer,              intent(in)    :: length    !< The total number of data elements
+  integer,    optional, intent(in)    :: from_PE   !< The source PE, by default the root PE
+  integer,    optional, intent(in)    :: PElist(:) !< The list of participating PEs, by default the
+                                                   !! active PE set as previously set via Set_PElist.
+  logical,    optional, intent(in)    :: blocking  !< If true, barriers are added around the call
+
+  integer :: src_PE   ! The processor that is sending the data
+  logical :: do_block ! If true add synchronizing barriers
+
+  do_block = .false. ; if (present(blocking)) do_block = blocking
+  if (present(from_PE)) then ; src_PE = from_PE ; else ; src_PE = root_PE() ; endif
+
+  if (do_block) call mpp_sync(PElist)
+  call mpp_broadcast(dat, length, src_PE, PElist)
+  if (do_block) call mpp_sync_self(PElist)
+
+end subroutine broadcast_real3D
+
 ! field_chksum wrappers
 
 !> Compute a checksum for a field distributed over a PE list.  If no PE list is
@@ -335,6 +357,15 @@ subroutine sum_across_PEs_int4_1d(field, length, pelist)
 
   call mpp_sum(field, length, pelist)
 end subroutine sum_across_PEs_int4_1d
+
+!> Find the sum of the values in corresponding positions of field across PEs, and return these sums in field.
+subroutine sum_across_PEs_int4_2d(field, length, pelist)
+  integer(kind=int32), dimension(:,:), intent(inout) :: field     !< The values to add, the sums upon return
+  integer,                             intent(in)    :: length    !< Number of elements in field to add
+  integer,                 optional,   intent(in)    :: pelist(:) !< List of PEs to work with
+
+  call mpp_sum(field, length, pelist)
+end subroutine sum_across_PEs_int4_2d
 
 !> Find the sum of field across PEs, and return this sum in field.
 subroutine sum_across_PEs_int8_0d(field, pelist)

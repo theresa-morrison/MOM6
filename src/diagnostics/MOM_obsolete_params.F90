@@ -56,6 +56,7 @@ subroutine find_obsolete_params(param_file)
          hint="Instead use OBC_SEGMENT_xxx_VELOCITY_NUDGING_TIMESCALES.")
   enddo
 
+  call obsolete_logical(param_file, "CONVERT_THICKNESS_UNITS", .true.)
   call obsolete_logical(param_file, "MASK_MASSLESS_TRACERS", .false.)
 
   call obsolete_logical(param_file, "SALT_REJECT_BELOW_ML", .false.)
@@ -73,6 +74,14 @@ subroutine find_obsolete_params(param_file)
   call obsolete_real(param_file, "ZSTAR_RIGID_SURFACE_THRESHOLD")
   call obsolete_logical(param_file, "HENYEY_IGW_BACKGROUND_NEW")
 
+  call obsolete_real(param_file, "SLIGHT_DZ_SURFACE")
+  call obsolete_int(param_file, "SLIGHT_NZ_SURFACE_FIXED")
+  call obsolete_real(param_file, "SLIGHT_SURFACE_AVG_DEPTH")
+  call obsolete_real(param_file, "SLIGHT_NLAY_TO_INTERIOR")
+  call obsolete_logical(param_file, "SLIGHT_FIX_HALOCLINES")
+  call obsolete_real(param_file, "HALOCLINE_FILTER_LENGTH")
+  call obsolete_real(param_file, "HALOCLINE_STRAT_TOL")
+
   ! Test for inconsistent parameter settings.
   split = .true. ; test_logic = .false.
   call read_param(param_file,"SPLIT",split)
@@ -80,15 +89,19 @@ subroutine find_obsolete_params(param_file)
   if (test_logic .and. .not.split) call MOM_ERROR(FATAL, &
     "find_obsolete_params: #define DYNAMIC_SURFACE_PRESSURE is not yet "//&
     "implemented without #define SPLIT.")
-
+  call obsolete_char(param_file, "CONTINUITY_SCHEME", warning_val="PPM", &
+                     hint="Only one continuity scheme is available so this need not be specified.")
   call obsolete_real(param_file, "ETA_TOLERANCE_AUX", only_warn=.true.)
   call obsolete_real(param_file, "BT_MASS_SOURCE_LIMIT", 0.0)
   call obsolete_real(param_file, "FIRST_GUESS_SURFACE_LAYER_DEPTH")
   call obsolete_logical(param_file, "CORRECT_SURFACE_LAYER_AVERAGE")
   call obsolete_int(param_file, "SEAMOUNT_LENGTH_SCALE", hint="Use SEAMOUNT_X_LENGTH_SCALE instead.")
+  call obsolete_int(param_file, "USE_LATERAL_BOUNDARY_DIFFUSION", &
+                    hint="Use USE_HORIZONTAL_BOUNDARY_DIFFUSION instead.")
 
   call obsolete_logical(param_file, "MSTAR_FIXED", hint="Instead use MSTAR_MODE.")
   call obsolete_logical(param_file, "USE_VISBECK_SLOPE_BUG", .false.)
+  call obsolete_logical(param_file, "Use_PP81", hint="get_param is case sensitive so use USE_PP81.")
 
   call obsolete_logical(param_file, "ALLOW_CLOCKS_IN_OMP_LOOPS", .true.)
   call obsolete_logical(param_file, "LARGE_FILE_SUPPORT", .true.)
@@ -98,6 +111,49 @@ subroutine find_obsolete_params(param_file)
   call read_param(param_file, "INTERPOLATE_SPONGE_TIME_SPACE", test_logic)
   call obsolete_logical(param_file, "NEW_SPONGES", warning_val=test_logic, &
                         hint="Use INTERPOLATE_SPONGE_TIME_SPACE instead.")
+
+  call obsolete_logical(param_file, "SMOOTH_RI", hint="Instead use N_SMOOTH_RI.")
+
+  call obsolete_logical(param_file, "TIDE_USE_SAL_SCALAR", hint="Use SAL_SCALAR_APPROX instead.")
+  call obsolete_logical(param_file, "TIDAL_SAL_SHT", hint="Use SAL_HARMONICS instead.")
+  call obsolete_int(param_file, "TIDAL_SAL_SHT_DEGREE", hint="Use SAL_HARMONICS_DEGREE instead.")
+  call obsolete_real(param_file, "RHO_E", hint="Use RHO_SOLID_EARTH instead.")
+  call obsolete_logical(param_file, "DEFAULT_2018_ANSWERS", hint="Instead use DEFAULT_ANSWER_DATE.")
+
+  call obsolete_logical(param_file, "SURFACE_FORCING_2018_ANSWERS", &
+                        hint="Instead use SURFACE_FORCING_ANSWER_DATE.")
+  call obsolete_logical(param_file, "WIND_GYRES_2018_ANSWERS", &
+                        hint="Instead use WIND_GYRES_ANSWER_DATE.")
+
+  call obsolete_logical(param_file, "BAROTROPIC_2018_ANSWERS", &
+                        hint="Instead use BAROTROPIC_ANSWER_DATE.")
+  call obsolete_logical(param_file, "EPBL_2018_ANSWERS", hint="Instead use EPBL_ANSWER_DATE.")
+  call obsolete_logical(param_file, "HOR_REGRID_2018_ANSWERS", &
+                        hint="Instead use HOR_REGRID_ANSWER_DATE.")
+  call obsolete_logical(param_file, "HOR_VISC_2018_ANSWERS", &
+                        hint="Instead use HOR_VISC_ANSWER_DATE.")
+  call obsolete_logical(param_file, "IDL_HURR_2018_ANSWERS", &
+                        hint="Instead use IDL_HURR_ANSWER_DATE.")
+  call obsolete_logical(param_file, "MEKE_GEOMETRIC_2018_ANSWERS", &
+                        hint="Instead use MEKE_GEOMETRIC_ANSWER_DATE.")
+  call obsolete_logical(param_file, "ODA_2018_ANSWERS", hint="Instead use ODA_ANSWER_DATE.")
+  call obsolete_logical(param_file, "OPTICS_2018_ANSWERS", hint="Instead use OPTICS_ANSWER_DATE.")
+  call obsolete_logical(param_file, "REGULARIZE_LAYERS_2018_ANSWERS", &
+                        hint="Instead use REGULARIZE_LAYERS_ANSWER_DATE.")
+  call obsolete_logical(param_file, "REMAPPING_2018_ANSWERS", &
+                        hint="Instead use REMAPPING_ANSWER_DATE.")
+  call obsolete_logical(param_file, "SET_DIFF_2018_ANSWERS", &
+                        hint="Instead use SET_DIFF_ANSWER_DATE.")
+  call obsolete_logical(param_file, "SET_VISC_2018_ANSWERS", &
+                        hint="Instead use SET_VISC_ANSWER_DATE.")
+  call obsolete_logical(param_file, "SURFACE_2018_ANSWERS", hint="Instead use SURFACE_ANSWER_DATE.")
+  call obsolete_logical(param_file, "TIDAL_MIXING_2018_ANSWERS", &
+                        hint="Instead use TIDAL_MIXING_ANSWER_DATE.")
+  call obsolete_logical(param_file, "VERT_FRICTION_2018_ANSWERS", &
+                        hint="Instead use VERT_FRICTION_ANSWER_DATE.")
+
+  call obsolete_logical(param_file, "USE_GRID_SPACE_DIAGNOSTIC_AXES", &
+                        hint="Instead use USE_INDEX_DIAGNOSTIC_AXIS.")
 
   ! Write the file version number to the model log.
   call log_version(param_file, mdl, version)
@@ -114,7 +170,7 @@ subroutine obsolete_logical(param_file, varname, warning_val, hint)
   logical :: test_logic, fatal_err
   character(len=128) :: hint_msg
 
-  test_logic = .false. ; call read_param(param_file, varname,test_logic)
+  test_logic = .false. ; call read_param(param_file, varname, test_logic)
   fatal_err = .true.
   if (present(warning_val)) fatal_err = (warning_val .neqv. .true.)
   hint_msg = " " ; if (present(hint)) hint_msg = hint

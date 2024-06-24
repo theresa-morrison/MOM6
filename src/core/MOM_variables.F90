@@ -6,6 +6,7 @@ module MOM_variables
 use MOM_array_transform, only : rotate_array, rotate_vector
 use MOM_coupler_types, only : coupler_1d_bc_type, coupler_2d_bc_type
 use MOM_coupler_types, only : coupler_type_spawn, coupler_type_destructor, coupler_type_initialized
+use MOM_coupler_types, only : coupler_type_copy_data
 use MOM_debugging,     only : hchksum
 use MOM_domains,       only : MOM_domain_type, get_domain_extent, group_pass_type
 use MOM_EOS,           only : EOS_type
@@ -30,11 +31,11 @@ public rotate_surface_state
 
 !> A structure for creating arrays of pointers to 3D arrays
 type, public :: p3d
-  real, dimension(:,:,:), pointer :: p => NULL() !< A pointer to a 3D array
+  real, dimension(:,:,:), pointer :: p => NULL() !< A pointer to a 3D array [various]
 end type p3d
 !> A structure for creating arrays of pointers to 2D arrays
 type, public :: p2d
-  real, dimension(:,:), pointer :: p => NULL() !< A pointer to a 2D array
+  real, dimension(:,:), pointer :: p => NULL() !< A pointer to a 2D array [various]
 end type p2d
 
 !> Pointers to various fields which may be used describe the surface state of MOM, and which
@@ -44,8 +45,6 @@ type, public :: surface
     SST, &         !< The sea surface temperature [C ~> degC].
     SSS, &         !< The sea surface salinity [S ~> psu or gSalt/kg].
     sfc_density, & !< The mixed layer density [R ~> kg m-3].
-    sfc_cfc11,   & !< Sea surface concentration of CFC11 [mol kg-1].
-    sfc_cfc12,   & !< Sea surface concentration of CFC12 [mol kg-1].
     Hml, &         !< The mixed layer depth [Z ~> m].
     u, &           !< The mixed layer zonal velocity [L T-1 ~> m s-1].
     v, &           !< The mixed layer meridional velocity [L T-1 ~> m s-1].
@@ -93,6 +92,11 @@ type, public :: thermo_var_ptrs
   logical :: S_is_absS = .false. !< If true, the salinity variable tv%S is
                          !! actually the absolute salinity in units of [gSalt kg-1].
   real :: min_salinity   !< The minimum value of salinity when BOUND_SALINITY=True [S ~> ppt].
+  real, allocatable, dimension(:,:,:) :: SpV_avg
+                         !< The layer averaged in situ specific volume [R-1 ~> m3 kg-1].
+  integer :: valid_SpV_halo = -1 !< If positive, the valid halo size for SpV_avg, or if negative
+                         !! SpV_avg is not currently set.
+
   ! These arrays are accumulated fluxes for communication with other components.
   real, dimension(:,:), pointer :: frazil => NULL()
                          !< The energy needed to heat the ocean column to the
@@ -101,7 +105,7 @@ type, public :: thermo_var_ptrs
   real, dimension(:,:), pointer :: salt_deficit => NULL()
                          !<   The salt needed to maintain the ocean column
                          !! at a minimum salinity of MIN_SALINITY since the last time
-                         !! that calculate_surface_state was called, [ppt R Z ~> gSalt m-2].
+                         !! that calculate_surface_state was called, [S R Z ~> gSalt m-2].
   real, dimension(:,:), pointer :: TempxPmE => NULL()
                          !<   The net inflow of water into the ocean times the
                          !! temperature at which this inflow occurs since the
@@ -229,12 +233,12 @@ type, public :: vertvisc_type
   real, allocatable, dimension(:,:) :: &
     bbl_thick_u, & !< The bottom boundary layer thickness at the u-points [Z ~> m].
     bbl_thick_v, & !< The bottom boundary layer thickness at the v-points [Z ~> m].
-    kv_bbl_u, &    !< The bottom boundary layer viscosity at the u-points [Z2 T-1 ~> m2 s-1].
-    kv_bbl_v, &    !< The bottom boundary layer viscosity at the v-points [Z2 T-1 ~> m2 s-1].
-    ustar_BBL, &   !< The turbulence velocity in the bottom boundary layer at h points [Z T-1 ~> m s-1].
+    kv_bbl_u, &    !< The bottom boundary layer viscosity at the u-points [H Z T-1 ~> m2 s-1 or Pa s]
+    kv_bbl_v, &    !< The bottom boundary layer viscosity at the v-points [H Z T-1 ~> m2 s-1 or Pa s]
+    ustar_BBL, &   !< The turbulence velocity in the bottom boundary layer at
+                   !! h points [H T-1 ~> m s-1 or kg m-2 s-1].
     TKE_BBL, &     !< A term related to the bottom boundary layer source of turbulent kinetic
-                   !! energy, currently in [Z3 T-3 ~> m3 s-3], but may at some time be changed
-                   !! to [R Z3 T-3 ~> W m-2].
+                   !! energy, currently in [H Z2 T-3 ~> m3 s-3 or W m-2].
     taux_shelf, &  !< The zonal stresses on the ocean under shelves [R Z L T-2 ~> Pa].
     tauy_shelf     !< The meridional stresses on the ocean under shelves [R Z L T-2 ~> Pa].
   real, allocatable, dimension(:,:) :: tbl_thick_shelf_u
@@ -242,9 +246,11 @@ type, public :: vertvisc_type
   real, allocatable, dimension(:,:) :: tbl_thick_shelf_v
                 !< Thickness of the viscous top boundary layer under ice shelves at v-points [Z ~> m].
   real, allocatable, dimension(:,:) :: kv_tbl_shelf_u
-                !< Viscosity in the viscous top boundary layer under ice shelves at u-points [Z2 T-1 ~> m2 s-1].
+                !< Viscosity in the viscous top boundary layer under ice shelves at
+                !! u-points [H Z T-1 ~> m2 s-1 or Pa s]
   real, allocatable, dimension(:,:) :: kv_tbl_shelf_v
-                !< Viscosity in the viscous top boundary layer under ice shelves at v-points [Z2 T-1 ~> m2 s-1].
+                !< Viscosity in the viscous top boundary layer under ice shelves at
+                !! v-points [H Z T-1 ~> m2 s-1 or Pa s]
   real, allocatable, dimension(:,:) :: nkml_visc_u
                 !< The number of layers in the viscous surface mixed layer at u-points [nondim].
                 !! This is not an integer because there may be fractional layers, and it is stored in
@@ -253,24 +259,25 @@ type, public :: vertvisc_type
   real, allocatable, dimension(:,:) :: nkml_visc_v
                 !< The number of layers in the viscous surface mixed layer at v-points [nondim].
   real, allocatable, dimension(:,:,:) :: &
-    Ray_u, &    !< The Rayleigh drag velocity to be applied to each layer at u-points [Z T-1 ~> m s-1].
-    Ray_v       !< The Rayleigh drag velocity to be applied to each layer at v-points [Z T-1 ~> m s-1].
+    Ray_u, &    !< The Rayleigh drag velocity to be applied to each layer at u-points [H T-1 ~> m s-1 or Pa s m-1].
+    Ray_v       !< The Rayleigh drag velocity to be applied to each layer at v-points [H T-1 ~> m s-1 or Pa s m-1].
 
   ! The following elements are pointers so they can be used as targets for pointers in the restart registry.
-  real, pointer, dimension(:,:) :: &
-    MLD => NULL()  !< Instantaneous active mixing layer depth [Z ~> m].
+  real, pointer, dimension(:,:) :: MLD => NULL()  !< Instantaneous active mixing layer depth [Z ~> m].
+  real, pointer, dimension(:,:) :: h_ML => NULL() !< Instantaneous active mixing layer thickness [H ~> m or kg m-2].
+  real, pointer, dimension(:,:) :: sfc_buoy_flx => NULL() !< Surface buoyancy flux (derived) [Z2 T-3 ~> m2 s-3].
   real, pointer, dimension(:,:,:) :: Kd_shear => NULL()
                 !< The shear-driven turbulent diapycnal diffusivity at the interfaces between layers
-                !! in tracer columns [Z2 T-1 ~> m2 s-1].
+                !! in tracer columns [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, pointer, dimension(:,:,:) :: Kv_shear => NULL()
                 !< The shear-driven turbulent vertical viscosity at the interfaces between layers
-                !! in tracer columns [Z2 T-1 ~> m2 s-1].
+                !! in tracer columns [H Z T-1 ~> m2 s-1 or Pa s]
   real, pointer, dimension(:,:,:) :: Kv_shear_Bu => NULL()
                 !< The shear-driven turbulent vertical viscosity at the interfaces between layers in
-                !! corner columns [Z2 T-1 ~> m2 s-1].
+                !! corner columns [H Z T-1 ~> m2 s-1 or Pa s]
   real, pointer, dimension(:,:,:) :: Kv_slow  => NULL()
                 !< The turbulent vertical viscosity component due to "slow" processes (e.g., tidal,
-                !! background, convection etc) [Z2 T-1 ~> m2 s-1].
+                !! background, convection etc) [H Z T-1 ~> m2 s-1 or Pa s]
   real, pointer, dimension(:,:,:) :: TKE_turb => NULL()
                 !< The turbulent kinetic energy per unit mass at the interfaces [Z2 T-2 ~> m2 s-2].
                 !! This may be at the tracer or corner points
@@ -332,27 +339,37 @@ contains
 !! the ocean model. Unused fields are unallocated.
 subroutine allocate_surface_state(sfc_state, G, use_temperature, do_integrals, &
                                   gas_fields_ocn, use_meltpot, use_iceshelves, &
-                                  omit_frazil, use_cfcs)
+                                  omit_frazil, sfc_state_in, turns)
   type(ocean_grid_type), intent(in)    :: G                !< ocean grid structure
   type(surface),         intent(inout) :: sfc_state        !< ocean surface state type to be allocated.
   logical,     optional, intent(in)    :: use_temperature  !< If true, allocate the space for thermodynamic variables.
   logical,     optional, intent(in)    :: do_integrals     !< If true, allocate the space for vertically
                                                            !! integrated fields.
   type(coupler_1d_bc_type), &
-               optional, intent(in)    :: gas_fields_ocn  !< If present, this type describes the ocean
+               optional, intent(in)    :: gas_fields_ocn   !< If present, this type describes the
                                               !! ocean and surface-ice fields that will participate
                                               !! in the calculation of additional gas or other
                                               !! tracer fluxes, and can be used to spawn related
                                               !! internal variables in the ice model.
   logical,     optional, intent(in)    :: use_meltpot      !< If true, allocate the space for melt potential
-  logical,     optional, intent(in)    :: use_cfcs         !< If true, allocate the space for cfcs
   logical,     optional, intent(in)    :: use_iceshelves   !< If true, allocate the space for the stresses
                                                            !! under ice shelves.
   logical,     optional, intent(in)    :: omit_frazil      !< If present and false, do not allocate the space to
                                                            !! pass frazil fluxes to the coupler
+  type(surface), &
+               optional, intent(in)    :: sfc_state_in     !< If present and its tr_fields are initialized,
+                                              !! this type describes the ocean and surface-ice fields that
+                                              !! will participate in the calculation of additional gas or
+                                              !! other tracer fluxes, and can be used to spawn related
+                                              !! internal variables in the ice model.  If gas_fields_ocn
+                                              !! is present, it is used and tr_fields_in is ignored.
+  integer,     optional, intent(in)    :: turns  !< If present, the number of counterclockwise quarter
+                                                 !! turns to use on the new grid.
 
   ! local variables
-  logical :: use_temp, alloc_integ, use_melt_potential, alloc_iceshelves, alloc_frazil, alloc_cfcs
+  logical :: use_temp, alloc_integ, use_melt_potential, alloc_iceshelves, alloc_frazil
+  logical :: even_turns  ! True if turns is absent or even
+  integer :: tr_field_i_mem(4), tr_field_j_mem(4)
   integer :: is, ie, js, je, isd, ied, jsd, jed
   integer :: isdB, iedB, jsdB, jedB
 
@@ -363,7 +380,6 @@ subroutine allocate_surface_state(sfc_state, G, use_temperature, do_integrals, &
   use_temp = .true. ; if (present(use_temperature)) use_temp = use_temperature
   alloc_integ = .true. ; if (present(do_integrals)) alloc_integ = do_integrals
   use_melt_potential = .false. ; if (present(use_meltpot)) use_melt_potential = use_meltpot
-  alloc_cfcs = .false. ; if (present(use_cfcs)) alloc_cfcs = use_cfcs
   alloc_iceshelves = .false. ; if (present(use_iceshelves)) alloc_iceshelves = use_iceshelves
   alloc_frazil = .true. ; if (present(omit_frazil)) alloc_frazil = .not.omit_frazil
 
@@ -387,11 +403,6 @@ subroutine allocate_surface_state(sfc_state, G, use_temperature, do_integrals, &
     allocate(sfc_state%melt_potential(isd:ied,jsd:jed), source=0.0)
   endif
 
-  if (alloc_cfcs) then
-    allocate(sfc_state%sfc_cfc11(isd:ied,jsd:jed), source=0.0)
-    allocate(sfc_state%sfc_cfc12(isd:ied,jsd:jed), source=0.0)
-  endif
-
   if (alloc_integ) then
     ! Allocate structures for the vertically integrated ocean_mass, ocean_heat, and ocean_salt.
     allocate(sfc_state%ocean_mass(isd:ied,jsd:jed), source=0.0)
@@ -406,9 +417,22 @@ subroutine allocate_surface_state(sfc_state, G, use_temperature, do_integrals, &
     allocate(sfc_state%tauy_shelf(isd:ied,JsdB:JedB), source=0.0)
   endif
 
-  if (present(gas_fields_ocn)) &
+  ! The data fields in the coupler_2d_bc_type are never rotated.
+  even_turns = .true. ; if (present(turns)) even_turns = (modulo(turns, 2) == 0)
+  if (even_turns) then
+    tr_field_i_mem(1:4) = (/is,is,ie,ie/) ; tr_field_j_mem(1:4) = (/js,js,je,je/)
+  else
+    tr_field_i_mem(1:4) = (/js,js,je,je/) ; tr_field_j_mem(1:4) = (/is,is,ie,ie/)
+  endif
+  if (present(gas_fields_ocn)) then
     call coupler_type_spawn(gas_fields_ocn, sfc_state%tr_fields, &
-                            (/is,is,ie,ie/), (/js,js,je,je/), as_needed=.true.)
+                            tr_field_i_mem, tr_field_j_mem, as_needed=.true.)
+  elseif (present(sfc_state_in)) then
+    if (coupler_type_initialized(sfc_state_in%tr_fields)) then
+      call coupler_type_spawn(sfc_state_in%tr_fields, sfc_state%tr_fields, &
+                              tr_field_i_mem, tr_field_j_mem, as_needed=.true.)
+    endif
+  endif
 
   sfc_state%arrays_allocated = .true.
 
@@ -431,8 +455,6 @@ subroutine deallocate_surface_state(sfc_state)
   if (allocated(sfc_state%ocean_mass)) deallocate(sfc_state%ocean_mass)
   if (allocated(sfc_state%ocean_heat)) deallocate(sfc_state%ocean_heat)
   if (allocated(sfc_state%ocean_salt)) deallocate(sfc_state%ocean_salt)
-  if (allocated(sfc_state%sfc_cfc11)) deallocate(sfc_state%sfc_cfc11)
-  if (allocated(sfc_state%sfc_cfc12)) deallocate(sfc_state%sfc_cfc12)
   call coupler_type_destructor(sfc_state%tr_fields)
 
   sfc_state%arrays_allocated = .false.
@@ -441,10 +463,10 @@ end subroutine deallocate_surface_state
 
 !> Rotate the surface state fields from the input to the model indices.
 subroutine rotate_surface_state(sfc_state_in, sfc_state, G, turns)
-  type(surface), intent(in) :: sfc_state_in
-  type(surface), intent(inout) :: sfc_state
-  type(ocean_grid_type), intent(in) :: G
-  integer, intent(in) :: turns
+  type(surface), intent(in) :: sfc_state_in  !< The input unrotated surface state type that is the data source.
+  type(surface), intent(inout) :: sfc_state  !< The rotated surface state type whose arrays will be filled in
+  type(ocean_grid_type), intent(in) :: G     !< The ocean grid structure
+  integer, intent(in) :: turns   !< The number of counterclockwise quarter turns to use on the rotated grid.
 
   logical :: use_temperature, do_integrals, use_melt_potential, use_iceshelves
 
@@ -457,13 +479,9 @@ subroutine rotate_surface_state(sfc_state_in, sfc_state, G, turns)
       .and. allocated(sfc_state_in%tauy_shelf)
 
   if (.not. sfc_state%arrays_allocated) then
-    call allocate_surface_state(sfc_state, G, &
-        use_temperature=use_temperature, &
-        do_integrals=do_integrals, &
-        use_meltpot=use_melt_potential, &
-        use_iceshelves=use_iceshelves &
-    )
-    sfc_state%arrays_allocated = .true.
+    call allocate_surface_state(sfc_state, G, use_temperature=use_temperature, &
+            do_integrals=do_integrals, use_meltpot=use_melt_potential, &
+            use_iceshelves=use_iceshelves, sfc_state_in=sfc_state_in, turns=turns)
   endif
 
   if (use_temperature) then
@@ -503,9 +521,11 @@ subroutine rotate_surface_state(sfc_state_in, sfc_state, G, turns)
   sfc_state%T_is_conT = sfc_state_in%T_is_conT
   sfc_state%S_is_absS = sfc_state_in%S_is_absS
 
-  ! TODO: tracer field rotation
-  if (coupler_type_initialized(sfc_state_in%tr_fields)) &
-    call MOM_error(FATAL, "Rotation of surface state tracers is not yet implemented.")
+  ! NOTE: Tracer fields are handled by FMS, so are left unrotated.  Any
+  ! reads/writes to tr_fields must be appropriately rotated.
+  if (coupler_type_initialized(sfc_state_in%tr_fields)) then
+    call coupler_type_copy_data(sfc_state_in%tr_fields, sfc_state%tr_fields)
+  endif
 end subroutine rotate_surface_state
 
 !> Allocates the arrays contained within a BT_cont_type and initializes them to 0.

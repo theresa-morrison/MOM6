@@ -11,7 +11,7 @@ jobs:
         working-directory: .testing
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
       with:
         submodules: recursive
 
@@ -28,7 +28,3 @@ jobs:
     - name: Compile MOM6 for the NUOPC driver
       shell: bash
       run: make check_mom6_api_nuopc -j
-
-    - name: Compile MOM6 for the MCT driver
-      shell: bash
-      run: make check_mom6_api_mct -j

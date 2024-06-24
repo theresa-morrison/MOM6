@@ -2,31 +2,21 @@
 
 module MOM_cap_mod
 
-use constants_mod,            only: constants_init
-use diag_manager_mod,         only: diag_manager_init, diag_manager_end
-use field_manager_mod,        only: field_manager_init, field_manager_end
-use fms_mod,                  only: fms_init, fms_end, open_namelist_file, check_nml_error
-use fms_mod,                  only: close_file, file_exist, uppercase
-use fms_io_mod,               only: fms_io_exit
-use mpp_domains_mod,          only: domain2d, mpp_get_compute_domain, mpp_get_compute_domains
+use MOM_domains,              only: get_domain_extent
+use MOM_io,                   only: stdout, io_infra_end
+use mpp_domains_mod,          only: mpp_get_compute_domains
 use mpp_domains_mod,          only: mpp_get_ntile_count, mpp_get_pelist, mpp_get_global_domain
 use mpp_domains_mod,          only: mpp_get_domain_npes
-use mpp_io_mod,               only: mpp_open, MPP_RDONLY, MPP_ASCII, MPP_OVERWR, MPP_APPEND, mpp_close, MPP_SINGLE
-use mpp_mod,                  only: stdlog, stdout, mpp_root_pe, mpp_clock_id
-use mpp_mod,                  only: mpp_clock_begin, mpp_clock_end, MPP_CLOCK_SYNC
-use mpp_mod,                  only: MPP_CLOCK_DETAILED, CLOCK_COMPONENT, MAXPES
-use time_manager_mod,         only: set_calendar_type, time_type, increment_date
-use time_manager_mod,         only: set_time, set_date, get_time, get_date, month_name
-use time_manager_mod,         only: GREGORIAN, JULIAN, NOLEAP, THIRTY_DAY_MONTHS, NO_CALENDAR
-use time_manager_mod,         only: operator( <= ), operator( < ), operator( >= )
-use time_manager_mod,         only: operator( + ),  operator( - ), operator( / )
-use time_manager_mod,         only: operator( * ), operator( /= ), operator( > )
-use time_manager_mod,         only: date_to_string
-use time_manager_mod,         only: fms_get_calendar_type => get_calendar_type
-use MOM_domains,              only: MOM_infra_init, num_pes, root_pe, pe_here
+
+use MOM_time_manager,         only: set_calendar_type, time_type, set_time, set_date
+use MOM_time_manager,         only: GREGORIAN, JULIAN, NOLEAP
+use MOM_time_manager,         only: operator( <= ), operator( < ), operator( >= )
+use MOM_time_manager,         only: operator( + ),  operator( - ), operator( / )
+use MOM_time_manager,         only: operator( * ), operator( /= ), operator( > )
+use MOM_domains,              only: MOM_infra_init, MOM_infra_end
 use MOM_file_parser,          only: get_param, log_version, param_file_type, close_param_file
 use MOM_get_input,            only: get_MOM_input, directories
-use MOM_domains,              only: pass_var
+use MOM_domains,              only: pass_var, pe_here
 use MOM_error_handler,        only: MOM_error, FATAL, is_root_pe
 use MOM_grid,                 only: ocean_grid_type, get_global_grid_size
 use MOM_ocean_model_nuopc,    only: ice_ocean_boundary_type
@@ -38,10 +28,12 @@ use MOM_cap_time,             only: AlarmInit
 use MOM_cap_methods,          only: mom_import, mom_export, mom_set_geomtype, mod2med_areacor
 use MOM_cap_methods,          only: med2mod_areacor, state_diagnose
 use MOM_cap_methods,          only: ChkErr
+use MOM_ensemble_manager,     only: ensemble_manager_init
+use MOM_coms,                 only: sum_across_PEs
 
 #ifdef CESMCOUPLED
-use shr_file_mod,             only: shr_file_setLogUnit, shr_file_getLogUnit
-use shr_mpi_mod,              only : shr_mpi_min, shr_mpi_max
+use shr_log_mod,             only: shr_log_setLogUnit
+use nuopc_shr_methods,       only: get_component_instance
 #endif
 use time_utils_mod,           only: esmf2fms_time
 
@@ -80,6 +72,7 @@ use ESMF,  only: ESMF_AlarmCreate, ESMF_ClockGetAlarmList, ESMF_AlarmList_Flag
 use ESMF,  only: ESMF_AlarmGet, ESMF_AlarmIsCreated, ESMF_ALARMLIST_ALL, ESMF_AlarmIsEnabled
 use ESMF,  only: ESMF_STATEITEM_NOTFOUND, ESMF_FieldWrite
 use ESMF,  only: ESMF_END_ABORT, ESMF_Finalize
+use ESMF,  only: ESMF_REDUCE_MAX, ESMF_REDUCE_MIN, ESMF_VMAllReduce
 use ESMF,  only: operator(==), operator(/=), operator(+), operator(-)
 
 ! TODO ESMF_GridCompGetInternalState does not have an explicit Fortran interface.
@@ -137,12 +130,13 @@ integer              :: export_slice = 1
 character(len=256)   :: tmpstr
 logical              :: write_diagnostics = .false.
 logical              :: overwrite_timeslice = .false.
+logical              :: write_runtimelog = .false.
 character(len=32)    :: runtype  !< run type
-integer              :: logunit  !< stdout logging unit number
 logical              :: profile_memory = .true.
 logical              :: grid_attach_area = .false.
 logical              :: use_coldstart = .true.
 logical              :: use_mommesh = .true.
+logical              :: restart_eor = .false.
 character(len=128)   :: scalar_field_name = ''
 integer              :: scalar_field_count = 0
 integer              :: scalar_field_idx_grid_nx = 0
@@ -157,7 +151,11 @@ type(ESMF_GeomType_Flag) :: geomtype = ESMF_GEOMTYPE_MESH
 logical :: cesm_coupled = .false.
 type(ESMF_GeomType_Flag) :: geomtype
 #endif
-character(len=8) :: restart_mode = 'alarms'
+character(len=8)  :: restart_mode = 'alarms'
+character(len=16) :: inst_suffix = ''
+real(8) :: timere
+
+type(ESMF_Time), allocatable :: restartFhTimes(:)
 
 contains
 
@@ -241,6 +239,8 @@ subroutine InitializeP0(gcomp, importState, exportState, clock, rc)
   integer                     :: iostat
   character(len=64)           :: value, logmsg
   character(len=*),parameter  :: subname='(MOM_cap:InitializeP0)'
+  type(ESMF_VM)               :: vm
+  integer                     :: mype
 
   rc = ESMF_SUCCESS
 
@@ -257,6 +257,14 @@ subroutine InitializeP0(gcomp, importState, exportState, clock, rc)
 
   write(logmsg,*) write_diagnostics
   call ESMF_LogWrite('MOM_cap:DumpFields = '//trim(logmsg), ESMF_LOGMSG_INFO)
+
+  write_runtimelog = .false.
+  call NUOPC_CompAttributeGet(gcomp, name="RunTimeLog", value=value, &
+       isPresent=isPresent, isSet=isSet, rc=rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  if (isPresent .and. isSet) write_runtimelog=(trim(value)=="true")
+  write(logmsg,*) write_runtimelog
+  call ESMF_LogWrite('MOM_cap:RunTimeLog = '//trim(logmsg), ESMF_LOGMSG_INFO)
 
   overwrite_timeslice = .false.
   call NUOPC_CompAttributeGet(gcomp, name="OverwriteSlice", value=value, &
@@ -374,6 +382,14 @@ subroutine InitializeP0(gcomp, importState, exportState, clock, rc)
     geomtype = ESMF_GEOMTYPE_GRID
   endif
 
+  ! Read end of run restart config option
+  call NUOPC_CompAttributeGet(gcomp, name="write_restart_at_endofrun", value=value, &
+                              isPresent=isPresent, isSet=isSet, rc=rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  if (isPresent .and. isSet) then
+     if (trim(value) .eq. '.true.') restart_eor = .true.
+  end if
+
 end subroutine
 
 !> Called by NUOPC to advertise import and export fields.  "Advertise"
@@ -433,9 +449,13 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
                                                                  ! (same as restartfile if single restart file)
   character(len=*), parameter            :: subname='(MOM_cap:InitializeAdvertise)'
   character(len=32)                      :: calendar
+  character(len=:), allocatable          :: rpointer_filename
+  integer                                :: inst_index
+  real(8)                                :: MPI_Wtime, timeiads
 !--------------------------------
 
   rc = ESMF_SUCCESS
+  if(write_runtimelog) timeiads = MPI_Wtime()
 
   call ESMF_LogWrite(subname//' enter', ESMF_LOGMSG_INFO)
 
@@ -462,9 +482,48 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
   CALL ESMF_TimeIntervalGet(TINT, S=DT_OCEAN, RC=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-  call fms_init(mpi_comm_mom)
-  call constants_init
-  call field_manager_init
+#ifdef CESMCOUPLED
+  call get_component_instance(gcomp, inst_suffix, inst_index, rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  call ensemble_manager_init(inst_suffix)
+  rpointer_filename = 'rpointer.ocn'//trim(inst_suffix)
+#endif
+
+  ! reset shr logging to my log file
+  if (localPet==0) then
+    call NUOPC_CompAttributeGet(gcomp, name="diro", &
+         isPresent=isPresentDiro, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    call NUOPC_CompAttributeGet(gcomp, name="logfile", &
+         isPresent=isPresentLogfile, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (isPresentDiro .and. isPresentLogfile) then
+      call NUOPC_CompAttributeGet(gcomp, name="diro", value=diro, rc=rc)
+      if (ChkErr(rc,__LINE__,u_FILE_u)) return
+      call NUOPC_CompAttributeGet(gcomp, name="logfile", value=logfile, rc=rc)
+      if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+      if (cesm_coupled) then
+        ! Multiinstance logfile name needs a correction
+        if(len_trim(inst_suffix) > 0) then
+          n = index(logfile, '.')
+          logfile = logfile(1:n-1)//trim(inst_suffix)//logfile(n:)
+        endif
+      endif
+
+      open(newunit=stdout,file=trim(diro)//"/"//trim(logfile))
+    else
+      stdout = output_unit
+    endif
+  else
+    stdout = output_unit
+  endif
+  call shr_log_setLogUnit(stdout)
+  call NUOPC_CompAttributeAdd(gcomp, (/"logunit"/), rc=rc)
+  if (chkerr(rc,__LINE__,u_FILE_u)) return
+  call NUOPC_CompAttributeSet(gcomp, "logunit", stdout, rc=rc)
+  if (chkerr(rc,__LINE__,u_FILE_u)) return
+  call MOM_infra_init(mpi_comm_mom)
 
   ! determine the calendar
   if (cesm_coupled) then
@@ -491,15 +550,13 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
     call set_calendar_type (JULIAN)
   endif
 
-  call diag_manager_init
-
   ! this ocean connector will be driven at set interval
   DT = set_time (DT_OCEAN, 0)
   ! get current time
   time_start = set_date (YEAR,MONTH,DAY,HOUR,MINUTE,SECOND)
 
   if (is_root_pe()) then
-    write(logunit,*) subname//'current time: y,m,d-',year,month,day,'h,m,s=',hour,minute,second
+    write(stdout,*) subname//'current time: y,m,d-',year,month,day,'h,m,s=',hour,minute,second
   endif
 
   ! get start/reference time
@@ -512,32 +569,7 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
   time0 = set_date (YEAR,MONTH,DAY,HOUR,MINUTE,SECOND)
 
   if (is_root_pe()) then
-    write(logunit,*) subname//'start time: y,m,d-',year,month,day,'h,m,s=',hour,minute,second
-  endif
-
-  ! rsd need to figure out how to get this without share code
-  !call shr_nuopc_get_component_instance(gcomp, inst_suffix, inst_index)
-  !inst_name = "OCN"//trim(inst_suffix)
-
-  ! reset shr logging to my log file
-  if (is_root_pe()) then
-    call NUOPC_CompAttributeGet(gcomp, name="diro", &
-         isPresent=isPresentDiro, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    call NUOPC_CompAttributeGet(gcomp, name="logfile", &
-         isPresent=isPresentLogfile, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (isPresentDiro .and. isPresentLogfile) then
-         call NUOPC_CompAttributeGet(gcomp, name="diro", value=diro, rc=rc)
-         if (ChkErr(rc,__LINE__,u_FILE_u)) return
-         call NUOPC_CompAttributeGet(gcomp, name="logfile", value=logfile, rc=rc)
-         if (ChkErr(rc,__LINE__,u_FILE_u)) return
-         open(newunit=logunit,file=trim(diro)//"/"//trim(logfile))
-    else
-      logunit = output_unit
-    endif
-  else
-    logunit = output_unit
+    write(stdout,*) subname//'start time: y,m,d-',year,month,day,'h,m,s=',hour,minute,second
   endif
 
   starttype = ""
@@ -590,10 +622,10 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
 
       if (localPet == 0) then
         ! this hard coded for rpointer.ocn right now
-        open(newunit=readunit, file='rpointer.ocn', form='formatted', status='old', iostat=iostat)
+        open(newunit=readunit, file=rpointer_filename, form='formatted', status='old', iostat=iostat)
         if (iostat /= 0) then
-          call ESMF_LogSetError(ESMF_RC_FILE_OPEN, msg=subname//' ERROR opening rpointer.ocn', &
-                 line=__LINE__, file=u_FILE_u, rcToReturn=rc)
+          call ESMF_LogSetError(ESMF_RC_FILE_OPEN, msg=subname//' ERROR opening '//rpointer_filename, &
+               line=__LINE__, file=u_FILE_u, rcToReturn=rc)
           return
         endif
         do
@@ -602,7 +634,7 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
             if (len(trim(restartfiles))>1 .and. iostat<0) then
               exit ! done reading restart files list.
             else
-              call ESMF_LogSetError(ESMF_RC_FILE_READ, msg=subname//' ERROR reading rpointer.ocn', &
+              call ESMF_LogSetError(ESMF_RC_FILE_READ, msg=subname//' ERROR reading '//rpointer_filename, &
                  line=__LINE__, file=u_FILE_u, rcToReturn=rc)
               return
             endif
@@ -625,14 +657,19 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
   endif
 
   ocean_public%is_ocean_pe = .true.
-  call ocean_model_init(ocean_public, ocean_state, time0, time_start, input_restart_file=trim(restartfiles))
+  if (cesm_coupled .and. len_trim(inst_suffix)>0) then
+    call ocean_model_init(ocean_public, ocean_state, time0, time_start, &
+      input_restart_file=trim(adjustl(restartfiles)), inst_index=inst_index)
+  else
+    call ocean_model_init(ocean_public, ocean_state, time0, time_start, input_restart_file=trim(adjustl(restartfiles)))
+  endif
 
   ! GMM, this call is not needed in CESM. Check with EMC if it can be deleted.
   call ocean_model_flux_init(ocean_state)
 
   call ocean_model_init_sfc(ocean_state, ocean_public)
 
-  call mpp_get_compute_domain(ocean_public%domain, isc, iec, jsc, jec)
+  call get_domain_extent(ocean_public%domain, isc, iec, jsc, jec)
 
   allocate ( Ice_ocean_boundary% u_flux (isc:iec,jsc:jec),          &
              Ice_ocean_boundary% v_flux (isc:iec,jsc:jec),          &
@@ -719,73 +756,57 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
     call fld_list_add(fldsFrOcn_num, fldsFrOcn, trim(scalar_field_name), "will_provide")
   endif
 
-
   !--------- import fields -------------
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_salt_rate"             , "will provide") ! from ice
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_zonal_moment_flx"      , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_merid_moment_flx"      , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_sensi_heat_flx"        , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_evap_rate"             , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_net_lw_flx"            , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_net_sw_vis_dir_flx"    , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_net_sw_vis_dif_flx"    , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_net_sw_ir_dir_flx"     , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_net_sw_ir_dif_flx"     , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_prec_rate"             , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_fprec_rate"            , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "inst_pres_height_surface"   , "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofl"                  , "will provide") !-> liquid runoff
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofi"                  , "will provide") !-> ice runoff
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "Si_ifrac"                   , "will provide") !-> ice fraction
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "So_duu10n"                  , "will provide") !-> wind^2 at 10m
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "mean_fresh_water_to_ocean_rate", "will provide")
-  call fld_list_add(fldsToOcn_num, fldsToOcn, "net_heat_flx_to_ocn"        , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Fioi_salt"      , "will provide") ! from ice
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_taux"      , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_tauy"      , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_sen"       , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_evap"      , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_lwnet"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_swnet_vdr" , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_swnet_vdf" , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_swnet_idr" , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_swnet_idf" , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Faxa_rain"      , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Faxa_snow"      , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Sa_pslv"        , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofl"      , "will provide") !-> liquid runoff
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofi"      , "will provide") !-> ice runoff
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Si_ifrac"       , "will provide") !-> ice fraction
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "So_duu10n"      , "will provide") !-> wind^2 at 10m
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Fioi_meltw"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Fioi_melth"     , "will provide")
 
-  if (cesm_coupled) then
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_lprec", "will provide")
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_fprec", "will provide")
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_evap" , "will provide")
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_cond" , "will provide")
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_rofl" , "will provide")
-    call fld_list_add(fldsToOcn_num, fldsToOcn, "heat_content_rofi" , "will provide")
-  endif
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrain"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hsnow"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hevap"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hcond"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofl"     , "will provide")
+  call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofi"     , "will provide")
 
   if (use_waves) then
     if (wave_method == "EFACTOR") then
-      call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_lamult"                 , "will provide")
+      call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_lamult"   , "will provide")
     else if (wave_method == "SURFACE_BANDS") then
-      if (cesm_coupled) then
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_pstokes_x", "will provide", &
-          ungridded_lbound=1, ungridded_ubound=Ice_ocean_boundary%num_stk_bands)
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_pstokes_y", "will provide", &
-          ungridded_lbound=1, ungridded_ubound=Ice_ocean_boundary%num_stk_bands)
-      else ! below is the old approach of importing partitioned stokes drift components. after the planned ww3 nuopc
-           ! cap unification, this else block should be removed in favor of the more flexible import approach above.
-        if (Ice_ocean_boundary%num_stk_bands > 3) then
-          call MOM_error(FATAL, "Number of Stokes Bands > 3, NUOPC cap not set up for this")
-        endif
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "eastward_partitioned_stokes_drift_1" , "will provide")
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "northward_partitioned_stokes_drift_1", "will provide")
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "eastward_partitioned_stokes_drift_2" , "will provide")
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "northward_partitioned_stokes_drift_2", "will provide")
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "eastward_partitioned_stokes_drift_3" , "will provide")
-        call fld_list_add(fldsToOcn_num, fldsToOcn, "northward_partitioned_stokes_drift_3", "will provide")
-      endif
+      call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_pstokes_x", "will provide", &
+        ungridded_lbound=1, ungridded_ubound=Ice_ocean_boundary%num_stk_bands)
+      call fld_list_add(fldsToOcn_num, fldsToOcn, "Sw_pstokes_y", "will provide", &
+        ungridded_lbound=1, ungridded_ubound=Ice_ocean_boundary%num_stk_bands)
     else
       call MOM_error(FATAL, "Unsupported WAVE_METHOD encountered in NUOPC cap.")
     endif
   endif
 
   !--------- export fields -------------
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "ocean_mask"                 , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "sea_surface_temperature"    , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "s_surf"                     , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "ocn_current_zonal"          , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "ocn_current_merid"          , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "sea_surface_slope_zonal"    , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "sea_surface_slope_merid"    , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "freezing_melting_potential" , "will provide")
-  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_bldepth"                 , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_omask"   , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_t"       , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_s"       , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_u"       , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_v"       , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_dhdx"    , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_dhdy"    , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "Fioo_q"     , "will provide")
+  call fld_list_add(fldsFrOcn_num, fldsFrOcn, "So_bldepth" , "will provide")
 
   do n = 1,fldsToOcn_num
     call NUOPC_Advertise(importState, standardName=fldsToOcn(n)%stdname, name=fldsToOcn(n)%shortname, rc=rc)
@@ -796,6 +817,7 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
     call NUOPC_Advertise(exportState, standardName=fldsFrOcn(n)%stdname, name=fldsFrOcn(n)%shortname, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
   enddo
+  if(write_runtimelog .and. is_root_pe()) write(stdout,*) 'In ',trim(subname),' time ', MPI_Wtime()-timeiads
 
 end subroutine InitializeAdvertise
 
@@ -829,6 +851,7 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
   type(ocean_grid_type)        , pointer     :: ocean_grid
   type(ocean_internalstate_wrapper)          :: ocean_internalstate
   integer                                    :: npet, ntiles
+  integer                                    :: npes ! number of PEs (from FMS).
   integer                                    :: nxg, nyg, cnt
   integer                                    :: isc,iec,jsc,jec
   integer, allocatable                       :: xb(:),xe(:),yb(:),ye(:),pe(:)
@@ -855,6 +878,8 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
   integer                                    :: lsize
   integer                                    :: ig,jg, ni,nj,k
   integer, allocatable                       :: gindex(:) ! global index space
+  integer, allocatable                       :: gindex_ocn(:) ! global index space for ocean cells (excl. masked cells)
+  integer, allocatable                       :: gindex_elim(:) ! global index space for eliminated cells
   character(len=128)                         :: fldname
   character(len=256)                         :: cvalue
   character(len=256)                         :: frmt    ! format specifier for several error msgs
@@ -873,20 +898,23 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
   real(ESMF_KIND_R8), allocatable            :: mesh_areas(:)
   real(ESMF_KIND_R8), allocatable            :: model_areas(:)
   real(ESMF_KIND_R8), pointer                :: dataPtr_mesh_areas(:)
-  real(ESMF_KIND_R8)                         :: max_mod2med_areacor
-  real(ESMF_KIND_R8)                         :: max_med2mod_areacor
-  real(ESMF_KIND_R8)                         :: min_mod2med_areacor
-  real(ESMF_KIND_R8)                         :: min_med2mod_areacor
-  real(ESMF_KIND_R8)                         :: max_mod2med_areacor_glob
-  real(ESMF_KIND_R8)                         :: max_med2mod_areacor_glob
-  real(ESMF_KIND_R8)                         :: min_mod2med_areacor_glob
-  real(ESMF_KIND_R8)                         :: min_med2mod_areacor_glob
+  real(ESMF_KIND_R8)                         :: min_areacor(2)
+  real(ESMF_KIND_R8)                         :: max_areacor(2)
+  real(ESMF_KIND_R8)                         :: min_areacor_glob(2)
+  real(ESMF_KIND_R8)                         :: max_areacor_glob(2)
   character(len=*), parameter                :: subname='(MOM_cap:InitializeRealize)'
+  integer                                    :: niproc, njproc
+  integer                                    :: ip, jp, pe_ix
+  integer                                    :: num_elim_blocks ! number of blocks to be eliminated
+  integer                                    :: num_elim_cells_global, num_elim_cells_local, num_elim_cells_remaining
+  integer, allocatable                       :: cell_mask(:,:)
+  real(8)                                    :: MPI_Wtime, timeirls
   !--------------------------------
 
   rc = ESMF_SUCCESS
+  if(write_runtimelog) timeirls = MPI_Wtime()
 
-  call shr_file_setLogUnit (logunit)
+  call shr_log_setLogUnit (stdout)
 
   !----------------------------------------------------------------------------
   ! Get pointers to ocean internal state
@@ -926,19 +954,19 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     rc = ESMF_FAILURE
     call ESMF_LogWrite(subname//' ntiles must be 1', ESMF_LOGMSG_ERROR)
   endif
-  ntiles = mpp_get_domain_npes(ocean_public%domain)
-  write(tmpstr,'(a,1i6)') subname//' ntiles = ',ntiles
+  npes = mpp_get_domain_npes(ocean_public%domain)
+  write(tmpstr,'(a,1i6)') subname//' npes = ',npes
   call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
 
   !---------------------------------
   ! get start and end indices of each tile and their PET
   !---------------------------------
 
-  allocate(xb(ntiles),xe(ntiles),yb(ntiles),ye(ntiles),pe(ntiles))
+  allocate(xb(npes),xe(npes),yb(npes),ye(npes),pe(npes))
   call mpp_get_compute_domains(ocean_public%domain, xbegin=xb, xend=xe, ybegin=yb, yend=ye)
   call mpp_get_pelist(ocean_public%domain, pe)
   if (dbug > 1) then
-    do n = 1,ntiles
+    do n = 1,npes
       write(tmpstr,'(a,6i6)') subname//' tiles ',n,pe(n),xb(n),xe(n),yb(n),ye(n)
       call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
     enddo
@@ -960,17 +988,102 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     call get_global_grid_size(ocean_grid, ni, nj)
     lsize = ( ocean_grid%iec - ocean_grid%isc + 1 ) * ( ocean_grid%jec - ocean_grid%jsc + 1 )
 
-    ! Create the global index space for the computational domain
-    allocate(gindex(lsize))
-    k = 0
-    do j = ocean_grid%jsc, ocean_grid%jec
-      jg = j + ocean_grid%jdg_offset
-      do i = ocean_grid%isc, ocean_grid%iec
-        ig = i + ocean_grid%idg_offset
-        k = k + 1 ! Increment position within gindex
-        gindex(k) = ni * (jg - 1) + ig
+    num_elim_blocks = 0
+    num_elim_cells_global = 0
+    num_elim_cells_local = 0
+    num_elim_cells_remaining = 0
+
+    ! Compute the number of eliminated blocks (specified in MOM_mask_table)
+    if (associated(ocean_grid%Domain%maskmap)) then
+      njproc = size(ocean_grid%Domain%maskmap, 1)
+      niproc = size(ocean_grid%Domain%maskmap, 2)
+
+      do ip = 1, niproc
+        do jp = 1, njproc
+          if (.not. ocean_grid%Domain%maskmap(jp,ip)) then
+            num_elim_blocks = num_elim_blocks+1
+          endif
+        enddo
       enddo
-    enddo
+    endif
+
+    ! Apply land block elimination to ESMF gindex
+    ! (Here we assume that each processor gets assigned a single tile. If multi-tile implementation is to be added
+    ! in MOM6 NUOPC cap in the future, below code must be updated accordingly.)
+    if (num_elim_blocks>0) then
+
+      allocate(cell_mask(ni, nj), source=0)
+      allocate(gindex_ocn(lsize))
+      k = 0
+      do j = ocean_grid%jsc, ocean_grid%jec
+        jg = j + ocean_grid%jdg_offset
+        do i = ocean_grid%isc, ocean_grid%iec
+          ig = i + ocean_grid%idg_offset
+          k = k + 1 ! Increment position within gindex
+          gindex_ocn(k) = ni * (jg - 1) + ig
+          cell_mask(ig, jg) = 1
+        enddo
+      enddo
+      call sum_across_PEs(cell_mask, ni*nj)
+
+      if (maxval(cell_mask) /= 1 ) then
+        call MOM_error(FATAL, "Encountered cells shared by multiple PEs while attempting to determine masked cells.")
+      endif
+
+      num_elim_cells_global = ni * nj - sum(cell_mask)
+      num_elim_cells_local = num_elim_cells_global / npes
+
+      if (pe_here() == pe(npes)) then
+        ! assign all remaining cells to the last PE.
+        num_elim_cells_remaining = num_elim_cells_global - num_elim_cells_local * npes
+        allocate(gindex_elim(num_elim_cells_local+num_elim_cells_remaining))
+      else
+        allocate(gindex_elim(num_elim_cells_local))
+      endif
+
+      ! Zero-based PE index.
+      pe_ix = pe_here() - pe(1)
+
+      k = 0
+      do jg = 1, nj
+        do ig = 1, ni
+          if (cell_mask(ig, jg) == 0) then
+            k = k + 1
+            if (k > pe_ix * num_elim_cells_local .and.  &
+                    k <= ((pe_ix+1) * num_elim_cells_local + num_elim_cells_remaining)) then
+              gindex_elim(k - pe_ix * num_elim_cells_local) = ni * (jg -1) + ig
+            endif
+          endif
+        enddo
+      enddo
+
+      allocate(gindex(lsize + num_elim_cells_local + num_elim_cells_remaining))
+      do k = 1, lsize
+        gindex(k) = gindex_ocn(k)
+      enddo
+      do k = 1, num_elim_cells_local + num_elim_cells_remaining
+        gindex(k+lsize) = gindex_elim(k)
+      enddo
+
+      deallocate(cell_mask)
+      deallocate(gindex_ocn)
+      deallocate(gindex_elim)
+
+    else ! no eliminated land blocks
+
+      ! Create the global index space for the computational domain
+      allocate(gindex(lsize))
+      k = 0
+      do j = ocean_grid%jsc, ocean_grid%jec
+        jg = j + ocean_grid%jdg_offset
+        do i = ocean_grid%isc, ocean_grid%iec
+          ig = i + ocean_grid%idg_offset
+          k = k + 1 ! Increment position within gindex
+          gindex(k) = ni * (jg - 1) + ig
+        enddo
+      enddo
+
+    endif
 
     DistGrid = ESMF_DistGridCreate(arbSeqIndexList=gindex, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -983,7 +1096,7 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
     if (localPet == 0) then
-      write(logunit,*)'mesh file for mom6 domain is ',trim(cvalue)
+      write(stdout,*)'mesh file for mom6 domain is ',trim(cvalue)
     endif
 
     ! recreate the mesh using the above distGrid
@@ -993,6 +1106,10 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     ! Check for consistency of lat, lon and mask between mesh and mom6 grid
     call ESMF_MeshGet(Emesh, spatialDim=spatialDim, numOwnedElements=numOwnedElements, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    if (lsize /= numOwnedElements - num_elim_cells_local - num_elim_cells_remaining) then
+      call MOM_error(FATAL, "Discrepancy detected between ESMF mesh and internal MOM6 domain sizes. Check mask table.")
+    endif
 
     allocate(ownedElemCoords(spatialDim*numOwnedElements))
     allocate(lonMesh(numOwnedElements), lon(numOwnedElements))
@@ -1011,7 +1128,7 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     call ESMF_MeshGet(Emesh, elemMaskArray=elemMaskArray, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-    call mpp_get_compute_domain(ocean_public%domain, isc, iec, jsc, jec)
+    call get_domain_extent(ocean_public%domain, isc, iec, jsc, jec)
     n = 0
     do j = jsc, jec
       jg = j + ocean_grid%jsc - jsc
@@ -1025,7 +1142,7 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     end do
 
     eps_omesh = get_eps_omesh(ocean_state)
-    do n = 1,numOwnedElements
+    do n = 1,lsize
       diff_lon = abs(mod(lonMesh(n) - lon(n),360.0))
       if (diff_lon > eps_omesh) then
         frmt = "('ERROR: Difference between ESMF Mesh and MOM6 domain coords is "//&
@@ -1099,19 +1216,20 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     deallocate(model_areas)
 
     ! Write diagnostic output for correction factors
-    min_mod2med_areacor = minval(mod2med_areacor)
-    max_mod2med_areacor = maxval(mod2med_areacor)
-    min_med2mod_areacor = minval(med2mod_areacor)
-    max_med2mod_areacor = maxval(med2mod_areacor)
-    call shr_mpi_max(max_mod2med_areacor, max_mod2med_areacor_glob, mpicom)
-    call shr_mpi_min(min_mod2med_areacor, min_mod2med_areacor_glob, mpicom)
-    call shr_mpi_max(max_med2mod_areacor, max_med2mod_areacor_glob, mpicom)
-    call shr_mpi_min(min_med2mod_areacor, min_med2mod_areacor_glob, mpicom)
+    min_areacor(1) = minval(mod2med_areacor)
+    max_areacor(1) = maxval(mod2med_areacor)
+    min_areacor(2) = minval(med2mod_areacor)
+    max_areacor(2) = maxval(med2mod_areacor)
+    call ESMF_VMAllReduce(vm, min_areacor, min_areacor_glob, 2, ESMF_REDUCE_MIN, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    call ESMF_VMAllReduce(vm, max_areacor, max_areacor_glob, 2, ESMF_REDUCE_MAX, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
     if (localPet == 0) then
-      write(logunit,'(2A,2g23.15,A )') trim(subname),' :  min_mod2med_areacor, max_mod2med_areacor ',&
-            min_mod2med_areacor_glob, max_mod2med_areacor_glob, 'MOM6'
-      write(logunit,'(2A,2g23.15,A )') trim(subname),' :  min_med2mod_areacor, max_med2mod_areacor ',&
-            min_med2mod_areacor_glob, max_med2mod_areacor_glob, 'MOM6'
+      write(stdout,'(2A,2g23.15,A )') trim(subname),' :  min_mod2med_areacor, max_mod2med_areacor ',&
+            min_areacor_glob(1), max_areacor_glob(1), 'MOM6'
+      write(stdout,'(2A,2g23.15,A )') trim(subname),' :  min_med2mod_areacor, max_med2mod_areacor ',&
+            min_areacor_glob(2), max_areacor_glob(2), 'MOM6'
     end if
 #endif
 
@@ -1128,11 +1246,11 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
 
     ! generate delayout and dist_grid
 
-    allocate(deBlockList(2,2,ntiles))
-    allocate(petMap(ntiles))
-    allocate(deLabelList(ntiles))
+    allocate(deBlockList(2,2,npes))
+    allocate(petMap(npes))
+    allocate(deLabelList(npes))
 
-    do n = 1, ntiles
+    do n = 1, npes
       deLabelList(n) = n
       deBlockList(1,1,n) = xb(n)
       deBlockList(1,2,n) = xe(n)
@@ -1262,7 +1380,7 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
     ! values for j=0 and wrap-around in i. on tripole seam, decomposition
     ! domains are 1 larger in j; to load corner values need to loop one extra row
 
-    call mpp_get_compute_domain(ocean_public%domain, isc, iec, jsc, jec)
+    call get_domain_extent(ocean_public%domain, isc, iec, jsc, jec)
 
     lbnd1 = lbound(dataPtr_mask,1)
     ubnd1 = ubound(dataPtr_mask,1)
@@ -1375,6 +1493,9 @@ subroutine InitializeRealize(gcomp, importState, exportState, clock, rc)
   !     timeslice=1, relaxedFlag=.true., rc=rc)
   !if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
+  timere = 0.
+  if(write_runtimelog .and. is_root_pe()) write(stdout,*) 'In ',trim(subname),' time ', MPI_Wtime()-timeirls
+
 end subroutine InitializeRealize
 
 !> TODO
@@ -1403,7 +1524,10 @@ subroutine DataInitialize(gcomp, rc)
   type(ESMF_Field)                       :: field
   character(len=64),allocatable          :: fieldNameList(:)
   character(len=*),parameter  :: subname='(MOM_cap:DataInitialize)'
+  real(8)                                :: MPI_Wtime, timedis
   !--------------------------------
+
+  if(write_runtimelog) timedis = MPI_Wtime()
 
   ! query the Component for its clock, importState and exportState
   call ESMF_GridCompGet(gcomp, clock=clock, importState=importState, exportState=exportState, rc=rc)
@@ -1465,6 +1589,8 @@ subroutine DataInitialize(gcomp, rc)
     enddo
   endif
 
+  if(write_runtimelog .and. is_root_pe()) write(stdout,*) 'In ',trim(subname),' time ', MPI_Wtime()-timedis
+
 end subroutine DataInitialize
 
 !> Called by NUOPC to advance the model a single timestep.
@@ -1514,12 +1640,22 @@ subroutine ModelAdvance(gcomp, rc)
   character(len=128)                     :: fldname
   character(len=*),parameter             :: subname='(MOM_cap:ModelAdvance)'
   character(len=8)                       :: suffix
+  character(len=:), allocatable          :: rpointer_filename
   integer                                :: num_rest_files
+  real(8)                                :: MPI_Wtime, timers
+  logical                                :: write_restart
+  logical                                :: write_restartfh
+  logical                                :: write_restart_eor
+
 
   rc = ESMF_SUCCESS
   if(profile_memory) call ESMF_VMLogMemInfo("Entering MOM Model_ADVANCE: ")
+  if(write_runtimelog) then
+     timers = MPI_Wtime()
+     if(timere>0. .and. is_root_pe()) write(stdout,*) 'In ',trim(subname),' time since last time step ',timers-timere
+  endif
 
-  call shr_file_setLogUnit (logunit)
+  call shr_log_setLogUnit (stdout)
 
   ! query the Component for its clock, importState and exportState
   call ESMF_GridCompGet(gcomp, clock=clock, importState=importState, &
@@ -1622,7 +1758,7 @@ subroutine ModelAdvance(gcomp, rc)
     ! Import data
     !---------------
 
-    call mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary, cesm_coupled, rc=rc)
+    call mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
     !---------------
@@ -1650,7 +1786,6 @@ subroutine ModelAdvance(gcomp, rc)
   !---------------
   ! Get the stop alarm
   !---------------
-
   call ESMF_ClockGetAlarm(clock, alarmname='stop_alarm', alarm=stop_alarm, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -1662,13 +1797,37 @@ subroutine ModelAdvance(gcomp, rc)
     call ESMF_ClockGetAlarm(clock, alarmname='restart_alarm', alarm=restart_alarm, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
+    write_restartfh = .false.
+    ! check if next time is == to any restartfhtime
+    if (allocated(RestartFhTimes)) then
+      do n = 1,size(RestartFhTimes)
+        call ESMF_ClockGetNextTime(clock, MyTime, rc=rc)
+        if (ChkErr(rc,__LINE__,u_FILE_u)) return
+        if (MyTime == RestartFhTimes(n)) write_restartfh = .true.
+      end do
+    end if
+
+    write_restart = .false.
     if (ESMF_AlarmIsRinging(restart_alarm, rc=rc)) then
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
+      write_restart = .true.
       ! turn off the alarm
       call ESMF_AlarmRingerOff(restart_alarm, rc=rc )
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    end if
 
+    write_restart_eor = .false.
+    if (restart_eor) then
+      if (ESMF_AlarmIsRinging(stop_alarm, rc=rc)) then
+         if (ChkErr(rc,__LINE__,u_FILE_u)) return
+         write_restart_eor = .true.
+         ! turn off the alarm
+         call ESMF_AlarmRingerOff(stop_alarm, rc=rc )
+         if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       end if
+    end if
+
+    if (write_restart .or. write_restartfh .or. write_restart_eor) then
       ! determine restart filename
       call ESMF_ClockGetNextTime(clock, MyTime, rc=rc)
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -1683,20 +1842,26 @@ subroutine ModelAdvance(gcomp, rc)
         call ESMF_VMGet(vm, localPet=localPet, rc=rc)
         if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
+        rpointer_filename = 'rpointer.ocn'//trim(inst_suffix)
+
         write(restartname,'(A,".mom6.r.",I4.4,"-",I2.2,"-",I2.2,"-",I5.5)') &
-             trim(casename), year, month, day, seconds
+             trim(casename), year, month, day, hour * 3600 + minute * 60 + seconds
         call ESMF_LogWrite("MOM_cap: Writing restart :  "//trim(restartname), ESMF_LOGMSG_INFO)
         ! write restart file(s)
         call ocean_model_restart(ocean_state, restartname=restartname, num_rest_files=num_rest_files)
         if (localPet == 0) then
-           ! Write name of restart file in the rpointer file - this is currently hard-coded for the ocean
-          open(newunit=writeunit, file='rpointer.ocn', form='formatted', status='unknown', iostat=iostat)
+          ! Write name of restart file in the rpointer file - this is currently hard-coded for the ocean
+          open(newunit=writeunit, file=rpointer_filename, form='formatted', status='unknown', iostat=iostat)
           if (iostat /= 0) then
             call ESMF_LogSetError(ESMF_RC_FILE_OPEN, &
-                 msg=subname//' ERROR opening rpointer.ocn', line=__LINE__, file=u_FILE_u, rcToReturn=rc)
+                 msg=subname//' ERROR opening '//rpointer_filename, line=__LINE__, file=u_FILE_u, rcToReturn=rc)
             return
           endif
-          write(writeunit,'(a)') trim(restartname)//'.nc'
+          if (len_trim(inst_suffix) == 0) then
+            write(writeunit,'(a)') trim(restartname)//'.nc'
+          else
+            write(writeunit,'(a)') trim(restartname)//'.'//trim(inst_suffix)//'.nc'
+          endif
 
           if (num_rest_files > 1) then
             ! append i.th restart file name to rpointer
@@ -1712,16 +1877,10 @@ subroutine ModelAdvance(gcomp, rc)
           close(writeunit)
         endif
       else  ! not cesm_coupled
-        ! write the final restart without a timestamp
-        if (ESMF_AlarmIsRinging(stop_alarm, rc=rc)) then
-          write(restartname,'(A)')"MOM.res"
-          write(stoch_restartname,'(A)')"ocn_stoch.res.nc"
-        else
-          write(restartname,'(A,I4.4,"-",I2.2,"-",I2.2,"-",I2.2,"-",I2.2,"-",I2.2)') &
-                "MOM.res.", year, month, day, hour, minute, seconds
-          write(stoch_restartname,'(A,I4.4,"-",I2.2,"-",I2.2,"-",I2.2,"-",I2.2,"-",I2.2,A)') &
-                "ocn_stoch.res.", year, month, day, hour, minute, seconds,".nc"
-        endif
+        write(restartname,'(i4.4,2(i2.2),A,3(i2.2),A)') year, month, day,".", hour, minute, seconds, &
+             ".MOM.res"
+        write(stoch_restartname,'(i4.4,2(i2.2),A,3(i2.2),A)') year, month, day,".", hour, minute, seconds, &
+             ".ocn_stoch.res.nc"
         call ESMF_LogWrite("MOM_cap: Writing restart :  "//trim(restartname), ESMF_LOGMSG_INFO)
 
         ! write restart file(s)
@@ -1731,7 +1890,7 @@ subroutine ModelAdvance(gcomp, rc)
       endif
 
       if (is_root_pe()) then
-        write(logunit,*) subname//' writing restart file ',trim(restartname)
+        write(stdout,*) subname//' writing restart file ',trim(restartname)
       endif
     endif
   endif ! restart_mode
@@ -1757,31 +1916,45 @@ subroutine ModelAdvance(gcomp, rc)
     enddo
   endif
 
+  if(write_runtimelog) then
+    timere = MPI_Wtime()
+    if(is_root_pe()) write(stdout,*) 'In ',trim(subname),' time ', timere-timers
+  endif
+
   if(profile_memory) call ESMF_VMLogMemInfo("Leaving MOM Model_ADVANCE: ")
 
 end subroutine ModelAdvance
 
 
 subroutine ModelSetRunClock(gcomp, rc)
+
+  use ESMF, only : ESMF_TimeIntervalSet
+
   type(ESMF_GridComp)  :: gcomp
   integer, intent(out) :: rc
 
   ! local variables
+  type(ESMF_VM)            :: vm
   type(ESMF_Clock)         :: mclock, dclock
   type(ESMF_Time)          :: mcurrtime, dcurrtime
   type(ESMF_Time)          :: mstoptime, dstoptime
   type(ESMF_TimeInterval)  :: mtimestep, dtimestep
+  type(ESMF_TimeInterval)  :: fhInterval
   character(len=128)       :: mtimestring, dtimestring
+  character(len=256)       :: timestr
   character(len=256)       :: cvalue
   character(len=256)       :: restart_option ! Restart option units
   integer                  :: restart_n      ! Number until restart interval
   integer                  :: restart_ymd    ! Restart date (YYYYMMDD)
+  integer                  :: dt_cpl         ! coupling timestep
   type(ESMF_Alarm)         :: restart_alarm
   type(ESMF_Alarm)         :: stop_alarm
   logical                  :: isPresent, isSet
   logical                  :: first_time = .true.
-  character(len=*),parameter :: subname='MOM_cap:(ModelSetRunClock) '
-  character(len=256)       :: timestr
+  integer                  :: localPet
+  integer                  :: n, nfh
+  integer, allocatable     :: restart_fh(:)
+  character(len=*),parameter :: subname='(MOM_cap:ModelSetRunClock) '
   !--------------------------------
 
   rc = ESMF_SUCCESS
@@ -1795,6 +1968,11 @@ subroutine ModelSetRunClock(gcomp, rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   call ESMF_ClockGet(mclock, currTime=mcurrtime, timeStep=mtimestep, rc=rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+  call ESMF_GridCompGet(gcomp, vm=vm, rc=rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  call ESMF_VMGet(vm, localPet=localPet, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !--------------------------------
@@ -1881,7 +2059,7 @@ subroutine ModelSetRunClock(gcomp, rc)
                  line=__LINE__, file=__FILE__, rcToReturn=rc)
             return
           endif
-          ! not used in nems
+          ! not used in ufs
           call NUOPC_CompAttributeGet(gcomp, name="restart_ymd", value=cvalue, &
                isPresent=isPresent, isSet=isSet, rc=rc)
           if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -1920,8 +2098,41 @@ subroutine ModelSetRunClock(gcomp, rc)
     call ESMF_TimeGet(dstoptime, timestring=timestr, rc=rc)
     call ESMF_LogWrite("Stop Alarm will ring at : "//trim(timestr), ESMF_LOGMSG_INFO)
 
-    first_time = .false.
+    ! set up Times to write non-interval restarts
+    call NUOPC_CompAttributeGet(gcomp, name='restart_fh', isPresent=isPresent, isSet=isSet, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (isPresent .and. isSet) then
 
+      call ESMF_TimeIntervalGet(dtimestep, s=dt_cpl, rc=rc)
+      if (ChkErr(rc,__LINE__,u_FILE_u)) return
+      call NUOPC_CompAttributeGet(gcomp, name='restart_fh', value=cvalue, rc=rc)
+      if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+      ! convert string to a list of integer restart_fh values
+      nfh = 1 + count(transfer(trim(cvalue), 'a', len(cvalue)) == ",")
+      allocate(restart_fh(1:nfh))
+      allocate(restartFhTimes(1:nfh))
+      read(cvalue,*)restart_fh(1:nfh)
+
+      ! create a list of times at each restart_fh
+      do n = 1,nfh
+        call ESMF_TimeIntervalSet(fhInterval, h=restart_fh(n), rc=rc)
+        if (ChkErr(rc,__LINE__,u_FILE_u)) return
+        restartFhTimes(n) = mcurrtime + fhInterval
+        call ESMF_TimePrint(restartFhTimes(n), options="string", preString="Restart_Fh at ", unit=timestr, rc=rc)
+        if (ChkErr(rc,__LINE__,u_FILE_u)) return
+        if (localPet == 0) then
+          if (mod(3600*restart_fh(n),dt_cpl) /= 0) then
+            write(stdout,'(A)')trim(subname)//trim(timestr)//' will not be written'
+          else
+            write(stdout,'(A)')trim(subname)//trim(timestr)//' will be written'
+          end if
+        end if
+      end do
+      deallocate(restart_fh)
+    end if
+
+    first_time = .false.
   endif
 
   !--------------------------------
@@ -1959,9 +2170,13 @@ subroutine ocean_model_finalize(gcomp, rc)
   character(len=64)                      :: timestamp
   logical                                :: write_restart
   character(len=*),parameter  :: subname='(MOM_cap:ocean_model_finalize)'
+  real(8)                                :: MPI_Wtime, timefs
 
-  write(*,*) 'MOM: --- finalize called ---'
+  if (is_root_pe()) then
+    write(stdout,*) 'MOM: --- finalize called ---'
+  endif
   rc = ESMF_SUCCESS
+  if(write_runtimelog) timefs = MPI_Wtime()
 
   call ESMF_GridCompGetInternalState(gcomp, ocean_internalstate, rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -1986,12 +2201,11 @@ subroutine ocean_model_finalize(gcomp, rc)
                          ESMF_LOGMSG_INFO)
 
   call ocean_model_end(ocean_public, ocean_State, Time, write_restart=write_restart)
-  call field_manager_end()
 
-  call fms_io_exit()
-  call fms_end()
+  call io_infra_end()
+  call MOM_infra_end()
 
-  write(*,*) 'MOM: --- completed ---'
+  if(write_runtimelog .and. is_root_pe()) write(stdout,*) 'In ',trim(subname),' time ', MPI_Wtime()-timefs
 
 end subroutine ocean_model_finalize
 
@@ -2202,17 +2416,11 @@ end subroutine fld_list_add
 
 
 #ifndef CESMCOUPLED
-subroutine shr_file_setLogUnit(nunit)
+subroutine shr_log_setLogUnit(nunit)
   integer, intent(in) :: nunit
   ! do nothing for this stub - its just here to replace
   ! having cppdefs in the main program
-end subroutine shr_file_setLogUnit
-
-subroutine shr_file_getLogUnit(nunit)
-  integer, intent(in) :: nunit
-  ! do nothing for this stub - its just here to replace
-  ! having cppdefs in the main program
-end subroutine shr_file_getLogUnit
+end subroutine shr_log_setLogUnit
 #endif
 
 !>
@@ -2342,8 +2550,7 @@ end subroutine shr_file_getLogUnit
 !! @subsection Initialization Initialization
 !!
 !! During the [InitializeAdvertise] (@ref MOM_cap_mod::initializeadvertise) phase, calls are
-!! made to MOM's native initialization subroutines, including `fms_init()`, `constants_init()`,
-!! `field_manager_init()`, `diag_manager_init()`, and `set_calendar_type()`.  The MPI communicator
+!! made to MOM's native initialization subroutines. The MPI communicator
 !! is pulled in through the ESMF VM object for the MOM component. The dt and start time are set
 !! from parameters from the incoming ESMF clock with calls to `set_time()` and `set_date().`
 !!
@@ -2418,10 +2625,6 @@ end subroutine shr_file_getLogUnit
 !! procedures:
 !!
 !!     call ocean_model_end (ocean_public, ocean_State, Time)
-!!     call diag_manager_end(Time )
-!!     call field_manager_end
-!!     call fms_io_exit
-!!     call fms_end
 !!
 !! @section ModelFields Model Fields
 !!
@@ -2437,7 +2640,7 @@ end subroutine shr_file_getLogUnit
 !!     <th>Description</td>
 !!     <th>Notes</td>
 !! <tr>
-!!     <td>inst_pres_height_surface</td>
+!!     <td>Sa_pslv</td>
 !!     <td>Pa</td>
 !!     <td>p</td>
 !!     <td>pressure of overlying sea ice and atmosphere</td>
@@ -2451,14 +2654,14 @@ end subroutine shr_file_getLogUnit
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>seaice_melt_heat</td>
+!!     <td>Fioi_melth</td>
 !!     <td>W m-2</td>
 !!     <td>seaice_melt_heat</td>
 !!     <td>sea ice and snow melt heat flux</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>seaice_melt</td>
+!!     <td>Fioi_meltw</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>seaice_melt</td>
 !!     <td>water flux due to sea ice and snow melting</td>
@@ -2472,136 +2675,143 @@ end subroutine shr_file_getLogUnit
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_evap_rate</td>
+!!     <td>Foxx_evap</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>q_flux</td>
 !!     <td>specific humidity flux</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_fprec_rate</td>
+!!     <td>Faxa_snow</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>fprec</td>
 !!     <td>mass flux of frozen precip</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_merid_moment_flx</td>
-!!     <td>Pa</td>
-!!     <td>v_flux</td>
-!!     <td>j-directed wind stress into ocean</td>
-!!     <td>[vector rotation] (@ref VectorRotations) applied - lat-lon to tripolar</td>
-!! </tr>
-!! <tr>
-!!     <td>mean_net_lw_flx</td>
+!!     <td>Foxx_lwnet</td>
 !!     <td>W m-2</td>
 !!     <td>lw_flux</td>
 !!     <td>long wave radiation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_net_sw_ir_dif_flx</td>
+!!     <td>Foxx_swnet_idf</td>
 !!     <td>W m-2</td>
 !!     <td>sw_flux_nir_dif</td>
 !!     <td>diffuse near IR shortwave radiation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_net_sw_ir_dir_flx</td>
+!!     <td>Foxx_swnet_idr</td>
 !!     <td>W m-2</td>
 !!     <td>sw_flux_nir_dir</td>
 !!     <td>direct near IR shortwave radiation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_net_sw_vis_dif_flx</td>
+!!     <td>Foxx_swnet_vdf</td>
 !!     <td>W m-2</td>
 !!     <td>sw_flux_vis_dif</td>
 !!     <td>diffuse visible shortware radiation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_net_sw_vis_dir_flx</td>
+!!     <td>Foxx_swnet_idr</td>
 !!     <td>W m-2</td>
 !!     <td>sw_flux_vis_dir</td>
 !!     <td>direct visible shortware radiation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_prec_rate</td>
+!!     <td>Faxa_rain</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>lprec</td>
 !!     <td>mass flux of liquid precip</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_lprec</td>
+!!     <td>Foxx_hrain</td>
 !!     <td>W m-2</td>
 !!     <td>hrain</td>
 !!     <td>heat content (enthalpy) of liquid water entering the ocean</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_fprec</td>
+!!     <td>Foxx_hsnow</td>
 !!     <td>W m-2</td>
 !!     <td>hsnow</td>
 !!     <td>heat content (enthalpy) of frozen water entering the ocean</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_evap</td>
+!!     <td>Foxx_hevap</td>
 !!     <td>W m-2</td>
 !!     <td>hevap</td>
 !!     <td>heat content (enthalpy) of water leaving the ocean</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_cond</td>
+!!     <td>Foxx_hcond</td>
 !!     <td>W m-2</td>
 !!     <td>hcond</td>
 !!     <td>heat content (enthalpy) of liquid water entering the ocean due to condensation</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_rofl</td>
+!!     <td>Foxx_hrofl</td>
 !!     <td>W m-2</td>
 !!     <td>hrofl</td>
 !!     <td>heat content (enthalpy) of liquid runoff</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>heat_content_rofi</td>
+!!     <td>Foxx_hrofi</td>
 !!     <td>W m-2</td>
 !!     <td>hrofi</td>
 !!     <td>heat content (enthalpy) of frozen runoff</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_runoff_rate</td>
+!!     <td>Foxx_rofl</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>runoff</td>
 !!     <td>mass flux of liquid runoff</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_salt_rate</td>
+!!     <td>Foxx_rofi</td>
+!!     <td>kg m-2 s-1</td>
+!!     <td>runoff</td>
+!!     <td>mass flux of frozen runoff</td>
+!!     <td></td>
+!! </tr>
+!! <tr>
+!!     <td>Fioi_salt</td>
 !!     <td>kg m-2 s-1</td>
 !!     <td>salt_flux</td>
 !!     <td>salt flux</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_sensi_heat_flx</td>
+!!     <td>Foxx_sen</td>
 !!     <td>W m-2</td>
 !!     <td>t_flux</td>
 !!     <td>sensible heat flux into ocean</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
-!!     <td>mean_zonal_moment_flx</td>
+!!     <td>Foxx_taux</td>
 !!     <td>Pa</td>
 !!     <td>u_flux</td>
 !!     <td>i-directed wind stress into ocean</td>
+!!     <td>[vector rotation] (@ref VectorRotations) applied - lat-lon to tripolar</td>
+!! </tr>
+!! <tr>
+!!     <td>Foxx_tauy</td>
+!!     <td>Pa</td>
+!!     <td>v_flux</td>
+!!     <td>j-directed wind stress into ocean</td>
 !!     <td>[vector rotation] (@ref VectorRotations) applied - lat-lon to tripolar</td>
 !! </tr>
 !! </table>
@@ -2620,63 +2830,63 @@ end subroutine shr_file_getLogUnit
 !!       <th>Notes</th>
 !!   </tr>
 !!   <tr>
-!!       <td>freezing_melting_potential</td>
+!!       <td>Fioo_q</td>
 !!       <td>W m-2</td>
 !!       <td>combination of frazil and melt_potential</td>
 !!       <td>cap converts model units (J m-2) to (W m-2) for export</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>ocean_mask</td>
+!!       <td>So_omask</td>
 !!       <td></td>
 !!       <td></td>
 !!       <td>ocean mask</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>ocn_current_merid</td>
+!!       <td>So_v</td>
 !!       <td>m s-1</td>
 !!       <td>v_surf</td>
 !!       <td>j-directed surface velocity on u-cell</td>
 !!       <td>[vector rotation] (@ref VectorRotations) applied - tripolar to lat-lon</td>
 !!   </tr>
 !!   <tr>
-!!       <td>ocn_current_zonal</td>
+!!       <td>So_u</td>
 !!       <td>m s-1</td>
 !!       <td>u_surf</td>
 !!       <td>i-directed surface velocity on u-cell</td>
 !!       <td>[vector rotation] (@ref VectorRotations) applied - tripolar to lat-lon</td>
 !!   </tr>
 !!   <tr>
-!!       <td>s_surf</td>
+!!       <td>So_s</td>
 !!       <td>psu</td>
 !!       <td>s_surf</td>
 !!       <td>sea surface salinity on t-cell</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>sea_surface_temperature</td>
+!!       <td>So_t</td>
 !!       <td>K</td>
 !!       <td>t_surf</td>
 !!       <td>sea surface temperature on t-cell</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>sea_surface_slope_zonal</td>
+!!       <td>So_dhdx</td>
 !!       <td>unitless</td>
 !!       <td>created from ssh</td>
 !!       <td>sea surface zonal slope</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>sea_surface_slope_merid</td>
+!!       <td>So_dhy</td>
 !!       <td>unitless</td>
 !!       <td>created from ssh</td>
 !!       <td>sea surface meridional slope</td>
 !!       <td></td>
 !!   </tr>
 !!   <tr>
-!!       <td>so_bldepth</td>
+!!       <td>So_bldepth</td>
 !!       <td>m</td>
 !!       <td>obld</td>
 !!       <td>ocean surface boundary layer depth</td>
@@ -2710,7 +2920,7 @@ end subroutine shr_file_getLogUnit
 !! with incoming coupling fields from other components. These three derived types are allocated during the
 !! [InitializeAdvertise] (@ref MOM_cap_mod::initializeadvertise) phase.  Also during that
 !! phase, the `ice_ocean_boundary` type members are all allocated using bounds retrieved
-!! from `mpp_get_compute_domain()`.
+!! from `get_domain_extent()`.
 !!
 !! During the [InitializeRealize] (@ref MOM_cap_mod::initializerealize) phase,
 !! `ESMF_Field`s are created for each of the coupling fields in the `ice_ocean_boundary`

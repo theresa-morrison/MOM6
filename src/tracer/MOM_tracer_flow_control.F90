@@ -11,6 +11,7 @@ use MOM_forcing_type,  only : forcing, optics_type
 use MOM_get_input,     only : Get_MOM_input
 use MOM_grid,          only : ocean_grid_type
 use MOM_hor_index,     only : hor_index_type
+use MOM_interface_heights, only : convert_MLD_to_ML_thickness
 use MOM_CVMix_KPP,     only : KPP_CS
 use MOM_open_boundary, only : ocean_OBC_type
 use MOM_restart,       only : MOM_restart_CS
@@ -45,7 +46,7 @@ use MOM_OCMIP2_CFC, only : register_OCMIP2_CFC, initialize_OCMIP2_CFC, flux_init
 use MOM_OCMIP2_CFC, only : OCMIP2_CFC_column_physics, OCMIP2_CFC_surface_state
 use MOM_OCMIP2_CFC, only : OCMIP2_CFC_stock, OCMIP2_CFC_end, OCMIP2_CFC_CS
 use MOM_CFC_cap, only : register_CFC_cap, initialize_CFC_cap
-use MOM_CFC_cap, only : CFC_cap_column_physics, CFC_cap_surface_state
+use MOM_CFC_cap, only : CFC_cap_column_physics, CFC_cap_set_forcing
 use MOM_CFC_cap, only : CFC_cap_stock, CFC_cap_end, CFC_cap_CS
 use oil_tracer, only : register_oil_tracer, initialize_oil_tracer
 use oil_tracer, only : oil_tracer_column_physics, oil_tracer_surface_state
@@ -317,34 +318,31 @@ subroutine tracer_flow_control_init(restart, day, G, GV, US, h, param_file, diag
                                 sponge_CSp)
   if (CS%use_DOME_tracer) &
     call initialize_DOME_tracer(restart, day, G, GV, US, h, diag, OBC, CS%DOME_tracer_CSp, &
-                                sponge_CSp, param_file)
+                                sponge_CSp, tv)
   if (CS%use_ISOMIP_tracer) &
     call initialize_ISOMIP_tracer(restart, day, G, GV, h, diag, OBC, CS%ISOMIP_tracer_CSp, &
                                 ALE_sponge_CSp)
   if (CS%use_RGC_tracer) &
-    call initialize_RGC_tracer(restart, day, G, GV, h, diag, OBC, &
-                  CS%RGC_tracer_CSp, sponge_CSp, ALE_sponge_CSp)
+    call initialize_RGC_tracer(restart, day, G, GV, h, diag, OBC, CS%RGC_tracer_CSp, &
+                                sponge_CSp, ALE_sponge_CSp)
   if (CS%use_ideal_age) &
     call initialize_ideal_age_tracer(restart, day, G, GV, US, h, diag, OBC, CS%ideal_age_tracer_CSp, &
-                                     sponge_CSp)
+                                sponge_CSp)
   if (CS%use_regional_dyes) &
-    call initialize_dye_tracer(restart, day, G, GV, h, diag, OBC, CS%dye_tracer_CSp, &
-                                     sponge_CSp)
+    call initialize_dye_tracer(restart, day, G, GV, h, diag, OBC, CS%dye_tracer_CSp, sponge_CSp, tv)
   if (CS%use_oil) &
-    call initialize_oil_tracer(restart, day, G, GV, US, h, diag, OBC, CS%oil_tracer_CSp, &
-                                     sponge_CSp)
+    call initialize_oil_tracer(restart, day, G, GV, US, h, diag, OBC, CS%oil_tracer_CSp, sponge_CSp)
   if (CS%use_advection_test_tracer) &
     call initialize_advection_test_tracer(restart, day, G, GV, h, diag, OBC, CS%advection_test_tracer_CSp, &
                                 sponge_CSp)
   if (CS%use_OCMIP2_CFC) &
-    call initialize_OCMIP2_CFC(restart, day, G, GV, US, h, diag, OBC, CS%OCMIP2_CFC_CSp, &
-                                sponge_CSp)
+    call initialize_OCMIP2_CFC(restart, day, G, GV, US, h, diag, OBC, CS%OCMIP2_CFC_CSp, sponge_CSp)
   if (CS%use_CFC_cap) &
     call initialize_CFC_cap(restart, day, G, GV, US, h, diag, OBC, CS%CFC_cap_CSp)
 
   if (CS%use_MOM_generic_tracer) &
-    call initialize_MOM_generic_tracer(restart, day, G, GV, US, h, param_file, diag, OBC, &
-        CS%MOM_generic_tracer_CSp, sponge_CSp, ALE_sponge_CSp)
+    call initialize_MOM_generic_tracer(restart, day, G, GV, US, h, tv, param_file, diag, OBC, &
+                                CS%MOM_generic_tracer_CSp, sponge_CSp, ALE_sponge_CSp)
   if (CS%use_pseudo_salt_tracer) &
     call initialize_pseudo_salt_tracer(restart, day, G, GV, US, h, diag, OBC, CS%pseudo_salt_tracer_CSp, &
                                 sponge_CSp, tv)
@@ -401,7 +399,7 @@ end subroutine get_chl_from_model
 
 !> This subroutine calls the individual tracer modules' subroutines to
 !! specify or read quantities related to their surface forcing.
-subroutine call_tracer_set_forcing(sfc_state, fluxes, day_start, day_interval, G, CS)
+subroutine call_tracer_set_forcing(sfc_state, fluxes, day_start, day_interval, G, US, Rho0, CS)
 
   type(surface),                intent(inout) :: sfc_state !< A structure containing fields that
                                                            !! describe the surface state of the
@@ -413,6 +411,8 @@ subroutine call_tracer_set_forcing(sfc_state, fluxes, day_start, day_interval, G
   type(time_type),              intent(in)    :: day_interval !< Length of time over which these
                                                            !! fluxes will be applied.
   type(ocean_grid_type),        intent(in)    :: G         !< The ocean's grid structure.
+  type(unit_scale_type),        intent(in)    :: US        !< A dimensional unit scaling type
+  real,                         intent(in)    :: Rho0      !< The mean ocean density [R ~> kg m-3]
   type(tracer_flow_control_CS), pointer       :: CS        !< The control structure returned by a
                                                            !! previous call to call_tracer_register.
 
@@ -421,12 +421,15 @@ subroutine call_tracer_set_forcing(sfc_state, fluxes, day_start, day_interval, G
 !  if (CS%use_ideal_age) &
 !    call ideal_age_tracer_set_forcing(sfc_state, fluxes, day_start, day_interval, &
 !                                      G, CS%ideal_age_tracer_CSp)
+  if (CS%use_CFC_cap) &
+    call CFC_cap_set_forcing(sfc_state, fluxes, day_start, day_interval, G, US, Rho0, &
+                             CS%CFC_cap_CSp)
 
 end subroutine call_tracer_set_forcing
 
 !> This subroutine calls all registered tracer column physics subroutines.
-subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, US, tv, optics, CS, &
-                                  debug, KPP_CSp, nonLocalTrans, evap_CFL_limit, minimum_forcing_depth)
+subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, mld, dt, G, GV, US, tv, optics, CS, &
+                                  debug, KPP_CSp, nonLocalTrans, evap_CFL_limit, minimum_forcing_depth, h_BL)
   type(ocean_grid_type),                 intent(in) :: G      !< The ocean's grid structure.
   type(verticalGrid_type),               intent(in) :: GV     !< The ocean's vertical grid structure.
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in) :: h_old !< Layer thickness before entrainment
@@ -442,7 +445,7 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
   type(forcing),                         intent(in) :: fluxes !< A structure containing pointers to
                                                               !! any possible forcing fields.
                                                               !! Unused fields have NULL ptrs.
-  real, dimension(SZI_(G),SZJ_(G)),      intent(in) :: Hml    !< Mixed layer depth [Z ~> m]
+  real, dimension(SZI_(G),SZJ_(G)),      intent(in) :: mld    !< Mixed layer depth [Z ~> m]
   real,                                  intent(in) :: dt     !< The amount of time covered by this
                                                               !! call [T ~> s]
   type(unit_scale_type),                 intent(in) :: US     !< A dimensional unit scaling type
@@ -461,6 +464,11 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
                                                               !! of the top layer in a timestep [nondim]
   real,                        optional, intent(in) :: minimum_forcing_depth !< The smallest depth over
                                                               !! which fluxes can be applied [H ~> m or kg m-2]
+  real, dimension(:,:),        optional, pointer    :: h_BL   !< Thickness of active mixing layer [H ~> m or kg m-2]
+
+  ! Local variables
+  real :: Hbl(SZI_(G),SZJ_(G))    !< Boundary layer thickness [H ~> m or kg m-2]
+  logical :: use_h_BL
 
   if (.not. associated(CS)) call MOM_error(FATAL, "call_tracer_column_fns: "// &
          "Module must be initialized via call_tracer_register before it is used.")
@@ -486,14 +494,21 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
                                         G, GV, US, CS%RGC_tracer_CSp, &
                                         evap_CFL_limit=evap_CFL_limit, &
                                         minimum_forcing_depth=minimum_forcing_depth)
-    if (CS%use_ideal_age) &
+    if (CS%use_ideal_age) then
+      use_h_BL = .false. ; if (present(h_BL)) use_h_BL = associated(h_BL)
+      if (present(h_BL)) then
+        Hbl(:,:) = h_BL(:,:)
+      else  ! This option is here mostly to support the offline tracers.
+        call convert_MLD_to_ML_thickness(mld, h_new, Hbl, tv, G, GV)
+      endif
       call ideal_age_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
                                            G, GV, US, CS%ideal_age_tracer_CSp, &
                                            evap_CFL_limit=evap_CFL_limit, &
-                                           minimum_forcing_depth=minimum_forcing_depth)
+                                           minimum_forcing_depth=minimum_forcing_depth, Hbl=Hbl)
+    endif
     if (CS%use_regional_dyes) &
       call dye_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
-                                     G, GV, US, CS%dye_tracer_CSp, &
+                                     G, GV, US, tv, CS%dye_tracer_CSp, &
                                      evap_CFL_limit=evap_CFL_limit, &
                                      minimum_forcing_depth=minimum_forcing_depth)
     if (CS%use_oil) &
@@ -523,7 +538,7 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
       if (US%QRZ_T_to_W_m2 /= 1.0) call MOM_error(FATAL, "MOM_generic_tracer_column_physics "//&
             "has not been written to permit dimensionsal rescaling.  Set all 4 of the "//&
             "[QRZT]_RESCALE_POWER parameters to 0.")
-      call MOM_generic_tracer_column_physics(h_old, h_new, ea, eb, fluxes, Hml, dt, &
+      call MOM_generic_tracer_column_physics(h_old, h_new, ea, eb, fluxes, mld, dt, &
                                              G, GV, US, CS%MOM_generic_tracer_CSp, tv, optics, &
                                              evap_CFL_limit=evap_CFL_limit, &
                                              minimum_forcing_depth=minimum_forcing_depth)
@@ -564,12 +579,19 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
     if (CS%use_RGC_tracer) &
       call RGC_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
                                       G, GV, US, CS%RGC_tracer_CSp)
-    if (CS%use_ideal_age) &
+    if (CS%use_ideal_age) then
+      use_h_BL = .false. ; if (present(h_BL)) use_h_BL = associated(h_BL)
+      if (present(h_BL)) then
+        Hbl(:,:) = h_BL(:,:)
+      else  ! This option is here mostly to support the offline tracers.
+        call convert_MLD_to_ML_thickness(mld, h_new, Hbl, tv, G, GV)
+      endif
       call ideal_age_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
-                                           G, GV, US, CS%ideal_age_tracer_CSp)
+                                           G, GV, US, CS%ideal_age_tracer_CSp, Hbl=Hbl)
+    endif
     if (CS%use_regional_dyes) &
       call dye_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
-                                           G, GV, US, CS%dye_tracer_CSp)
+                                           G, GV, US, tv, CS%dye_tracer_CSp)
     if (CS%use_oil) &
       call oil_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, &
                                      G, GV, US, CS%oil_tracer_CSp, tv)
@@ -588,7 +610,7 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, Hml, dt, G, GV, 
       if (US%QRZ_T_to_W_m2 /= 1.0) call MOM_error(FATAL, "MOM_generic_tracer_column_physics "//&
             "has not been written to permit dimensionsal rescaling.  Set all 4 of the "//&
             "[QRZT]_RESCALE_POWER parameters to 0.")
-      call MOM_generic_tracer_column_physics(h_old, h_new, ea, eb, fluxes, Hml, dt, &
+      call MOM_generic_tracer_column_physics(h_old, h_new, ea, eb, fluxes, mld, dt, &
                                      G, GV, US, CS%MOM_generic_tracer_CSp, tv, optics)
     endif
     if (CS%use_pseudo_salt_tracer) &
@@ -849,8 +871,6 @@ subroutine call_tracer_surface_state(sfc_state, h, G, GV, US, CS)
     call advection_test_tracer_surface_state(sfc_state, h, G, GV, CS%advection_test_tracer_CSp)
   if (CS%use_OCMIP2_CFC) &
     call OCMIP2_CFC_surface_state(sfc_state, h, G, GV, US, CS%OCMIP2_CFC_CSp)
-  if (CS%use_CFC_cap) &
-    call CFC_cap_surface_state(sfc_state, G, CS%CFC_cap_CSp)
   if (CS%use_MOM_generic_tracer) &
     call MOM_generic_tracer_surface_state(sfc_state, h, G, GV, CS%MOM_generic_tracer_CSp)
 

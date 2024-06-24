@@ -189,12 +189,12 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS, pbv, Wav
   real, dimension(SZIB_(G),SZJB_(G),SZK_(GV)) :: &
     PV, &       ! A diagnostic array of the potential vorticities [H-1 T-1 ~> m-1 s-1 or m2 kg-1 s-1].
     RV          ! A diagnostic array of the relative vorticities [T-1 ~> s-1].
-  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)) ::     CAuS !
-  real, dimension(SZI_(G),SZJB_(G),SZK_(G)) ::     CAvS !
-  real :: fv1, fv2, fv3, fv4   ! (f+rv)*v [L T-2 ~> m s-2].
-  real :: fu1, fu2, fu3, fu4   ! -(f+rv)*u [L T-2 ~> m s-2].
-  real :: max_fv, max_fu       ! The maximum or minimum of the neighboring Coriolis
-  real :: min_fv, min_fu       ! accelerations [L T-2 ~> m s-2], i.e. max(min)_fu(v)q.
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)) :: CAuS ! Stokes contribution to CAu [L T-2 ~> m s-2]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G)) :: CAvS ! Stokes contribution to CAv [L T-2 ~> m s-2]
+  real :: fv1, fv2, fv3, fv4   ! (f+rv)*v at the 4 points surrounding a u points[L T-2 ~> m s-2]
+  real :: fu1, fu2, fu3, fu4   ! -(f+rv)*u at the 4 points surrounding a v point [L T-2 ~> m s-2]
+  real :: max_fv, max_fu       ! The maximum of the neighboring Coriolis accelerations [L T-2 ~> m s-2]
+  real :: min_fv, min_fu       ! The minimum of the neighboring Coriolis accelerations [L T-2 ~> m s-2]
 
   real, parameter :: C1_12 = 1.0 / 12.0 ! C1_12 = 1/12 [nondim]
   real, parameter :: C1_24 = 1.0 / 24.0 ! C1_24 = 1/24 [nondim]
@@ -902,20 +902,20 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS, pbv, Wav
         if (associated(AD%rv_x_u)) then
           do J=Jsq,Jeq ; do i=is,ie
             AD%rv_x_u(i,J,k) = -G%IdyCv(i,J) * C1_12 * &
-              ((q2(I,J) + q2(I-1,J) + q2(I-1,J-1)) * uh(I-1,j,k) + &
-               (q2(I-1,J) + q2(I,J) + q2(I,J-1)) * uh(I,j,k) + &
-               (q2(I-1,J) + q2(I,J+1) + q2(I,J)) * uh(I,j+1,k) + &
-               (q2(I,J) + q2(I-1,J+1) + q2(I-1,J)) * uh(I-1,j+1,k))
+              (((((q2(I,J) + q2(I-1,J-1)) + q2(I-1,J)) * uh(I-1,j,k)) + &
+                (((q2(I-1,J) + q2(I,J+1)) + q2(I,J)) * uh(I,j+1,k))) + &
+               ((((q2(I-1,J) + q2(I,J-1)) + q2(I,J)) * uh(I,j,k))+ &
+                (((q2(I,J) + q2(I-1,J+1)) + q2(I-1,J)) * uh(I-1,j+1,k))))
           enddo ; enddo
         endif
 
         if (associated(AD%rv_x_v)) then
           do j=js,je ; do I=Isq,Ieq
             AD%rv_x_v(I,j,k) = G%IdxCu(I,j) * C1_12 * &
-              ((q2(I+1,J) + q2(I,J) + q2(I,J-1)) * vh(i+1,J,k) + &
-               (q2(I-1,J) + q2(I,J) + q2(I,J-1)) * vh(i,J,k) + &
-               (q2(I-1,J-1) + q2(I,J) + q2(I,J-1)) * vh(i,J-1,k) + &
-               (q2(I+1,J-1) + q2(I,J) + q2(I,J-1)) * vh(i+1,J-1,k))
+              (((((q2(I+1,J) + q2(I,J-1)) + q2(I,J)) * vh(i+1,J,k)) + &
+                (((q2(I-1,J-1) + q2(I,J)) + q2(I,J-1)) * vh(i,J-1,k))) + &
+               ((((q2(I-1,J) + q2(I,J-1)) + q2(I,J)) * vh(i,J,k)) + &
+                (((q2(I+1,J-1) + q2(I,J)) + q2(I,J-1)) * vh(i+1,J-1,k))))
           enddo ; enddo
         endif
       endif

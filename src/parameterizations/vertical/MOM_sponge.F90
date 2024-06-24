@@ -3,16 +3,17 @@ module MOM_sponge
 
 ! This file is part of MOM6. See LICENSE.md for the license.
 
-use MOM_coms, only : sum_across_PEs
+use MOM_coms,          only : sum_across_PEs
 use MOM_diag_mediator, only : post_data, query_averaging_enabled, register_diag_field
 use MOM_diag_mediator, only : diag_ctrl
 use MOM_error_handler, only : MOM_error, FATAL, NOTE, WARNING, is_root_pe
-use MOM_file_parser, only : get_param, log_param, log_version, param_file_type
-use MOM_grid, only : ocean_grid_type
+use MOM_file_parser,   only : get_param, log_param, log_version, param_file_type
+use MOM_grid,          only : ocean_grid_type
 use MOM_spatial_means, only : global_i_mean
-use MOM_time_manager, only : time_type
-use MOM_unit_scaling, only : unit_scale_type
-use MOM_verticalGrid, only : verticalGrid_type
+use MOM_time_manager,  only : time_type
+use MOM_unit_scaling,  only : unit_scale_type
+use MOM_variables,     only : thermo_var_ptrs
+use MOM_verticalGrid,  only : verticalGrid_type
 
 ! Planned extension:  Support for time varying sponge targets.
 
@@ -30,11 +31,11 @@ public initialize_sponge, apply_sponge, sponge_end, init_sponge_diags
 
 !> A structure for creating arrays of pointers to 3D arrays
 type, public :: p3d
-  real, dimension(:,:,:), pointer :: p => NULL() !< A pointer to a 3D array
+  real, dimension(:,:,:), pointer :: p => NULL() !< A pointer to a 3D array [various]
 end type p3d
 !> A structure for creating arrays of pointers to 2D arrays
 type, public :: p2d
-  real, dimension(:,:), pointer :: p => NULL() !< A pointer to a 2D array
+  real, dimension(:,:), pointer :: p => NULL() !< A pointer to a 2D array [various]
 end type p2d
 
 !> This control structure holds memory and parameters for the MOM_sponge module
@@ -203,15 +204,15 @@ subroutine set_up_sponge_field(sp_val, f_ptr, G, GV, nlay, CS, sp_val_i_mean)
   type(ocean_grid_type),   intent(in) :: G      !< The ocean's grid structure
   type(verticalGrid_type), intent(in) :: GV     !< The ocean's vertical grid structure
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
-                           intent(in) :: sp_val !< The reference profiles of the quantity being registered.
+                           intent(in) :: sp_val !< The reference profiles of the quantity being registered [various]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
-                   target, intent(in) :: f_ptr  !< a pointer to the field which will be damped
+                   target, intent(in) :: f_ptr  !< a pointer to the field which will be damped [various]
   integer,                 intent(in) :: nlay   !< the number of layers in this quantity
   type(sponge_CS),         pointer    :: CS     !< A pointer to the control structure for this module that
                                                 !! is set by a previous call to initialize_sponge.
   real, dimension(SZJ_(G),SZK_(GV)),&
                optional, intent(in) :: sp_val_i_mean !< The i-mean reference value for
-                                              !! this field with i-mean sponges.
+                                              !! this field with i-mean sponges [various]
 
   integer :: j, k, col
   character(len=256) :: mesg ! String for error messages
@@ -301,12 +302,14 @@ end subroutine set_up_sponge_ML_density
 
 !> This subroutine applies damping to the layers thicknesses, mixed layer buoyancy, and a variety of
 !! tracers for every column where there is damping.
-subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
+subroutine apply_sponge(h, tv, dt, G, GV, US, ea, eb, CS, Rcv_ml)
   type(ocean_grid_type),   intent(inout) :: G   !< The ocean's grid structure
   type(verticalGrid_type), intent(in)    :: GV  !< The ocean's vertical grid structure
   type(unit_scale_type),   intent(in)    :: US  !< A dimensional unit scaling type
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
                            intent(inout) :: h   !< Layer thicknesses [H ~> m or kg m-2]
+  type(thermo_var_ptrs),   intent(in)    :: tv  !< A structure pointing to various
+                                                !! thermodynamic variables
   real,                    intent(in)    :: dt  !< The amount of time covered by this call [T ~> s].
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
                            intent(inout) :: ea  !< An array to which the amount of fluid entrained
@@ -331,11 +334,11 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
     eta_anom, &    ! Anomalies in the interface height, relative to the i-mean
                    ! target value [Z ~> m].
     fld_anom       ! Anomalies in a tracer concentration, relative to the
-                   ! i-mean target value.
+                   ! i-mean target value [various]
   real, dimension(SZJ_(G), SZK_(GV)+1) :: &
     eta_mean_anom  ! The i-mean interface height anomalies [Z ~> m].
   real, allocatable, dimension(:,:,:) :: &
-    fld_mean_anom  ! THe i-mean tracer concentration anomalies.
+    fld_mean_anom  ! The i-mean tracer concentration anomalies [various]
   real, dimension(SZI_(G), SZK_(GV)+1) :: &
     h_above, &     ! The total thickness above an interface [H ~> m or kg m-2].
     h_below        ! The total thickness below an interface [H ~> m or kg m-2].
@@ -344,10 +347,14 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
                    ! give 0 at the surface [nondim].
 
   real :: e(SZK_(GV)+1)  ! The interface heights [Z ~> m], usually negative.
+  real :: dz_to_h(SZK_(GV)+1)  ! Factors used to convert interface height movement
+                   ! to thickness fluxes [H Z-1 ~> nondim or kg m-3]
   real :: e0       ! The height of the free surface [Z ~> m].
   real :: e_str    ! A nondimensional amount by which the reference
                    ! profile must be stretched for the free surfaces
                    ! heights in the two profiles to agree [nondim].
+  real :: w_mean   ! The vertical displacement of water moving upward through an
+                   ! interface within 1 timestep [Z ~> m].
   real :: w        ! The thickness of water moving upward through an
                    ! interface within 1 timestep [H ~> m or kg m-2].
   real :: wm       ! wm is w if w is negative and 0 otherwise [H ~> m or kg m-2].
@@ -381,9 +388,15 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
                   "work properly with i-mean sponges and a bulk mixed layer.")
 
     do j=js,je ; do i=is,ie ; e_D(i,j,nz+1) = -G%bathyT(i,j) ; enddo ; enddo
-    do k=nz,1,-1 ; do j=js,je ; do i=is,ie
-      e_D(i,j,K) = e_D(i,j,K+1) + h(i,j,k)*GV%H_to_Z
-    enddo ; enddo ; enddo
+    if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg)) then
+      do k=nz,1,-1 ; do j=js,je ; do i=is,ie
+        e_D(i,j,K) = e_D(i,j,K+1) + GV%H_to_RZ * h(i,j,k) * tv%SpV_avg(i,j,k)
+      enddo ; enddo ; enddo
+    else
+      do k=nz,1,-1 ; do j=js,je ; do i=is,ie
+        e_D(i,j,K) = e_D(i,j,K+1) + h(i,j,k)*GV%H_to_Z
+      enddo ; enddo ; enddo
+    endif
     do j=js,je
       do i=is,ie
         dilate(i) = (G%bathyT(i,j) + G%Z_ref) / (e_D(i,j,1) + G%bathyT(i,j))
@@ -421,20 +434,39 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
       do K=2,nz+1 ; do i=is,ie
         h_above(i,K) = h_above(i,K-1) + max(h(i,j,k-1)-GV%Angstrom_H, 0.0)
       enddo ; enddo
-      do K=2,nz
-        ! w is positive for an upward (lightward) flux of mass, resulting
-        ! in the downward movement of an interface.
-        w = damp_1pdamp * eta_mean_anom(j,K) * GV%Z_to_H
-        do i=is,ie
+
+      ! In both blocks below, w is positive for an upward (lightward) flux of mass,
+      ! resulting in the downward movement of an interface.
+      if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg)) then
+        do K=2,nz
+          w_mean = damp_1pdamp * eta_mean_anom(j,K)
+          do i=is,ie
+            w = w_mean * 2.0*GV%RZ_to_H / (tv%SpV_avg(i,j,k-1) + tv%SpV_avg(i,j,k))
+            if (w > 0.0) then
+              w_int(i,j,K) = min(w, h_below(i,K))
+              eb(i,j,k-1) = eb(i,j,k-1) + w_int(i,j,K)
+            else
+              w_int(i,j,K) = max(w, -h_above(i,K))
+              ea(i,j,k) = ea(i,j,k) - w_int(i,j,K)
+            endif
+          enddo
+        enddo
+      else
+        do K=2,nz
+          w = damp_1pdamp * eta_mean_anom(j,K) * GV%Z_to_H
           if (w > 0.0) then
-            w_int(i,j,K) = min(w, h_below(i,K))
-            eb(i,j,k-1) = eb(i,j,k-1) + w_int(i,j,K)
+            do i=is,ie
+              w_int(i,j,K) = min(w, h_below(i,K))
+              eb(i,j,k-1) = eb(i,j,k-1) + w_int(i,j,K)
+            enddo
           else
-            w_int(i,j,K) = max(w, -h_above(i,K))
-            ea(i,j,k) = ea(i,j,k) - w_int(i,j,K)
+            do i=is,ie
+              w_int(i,j,K) = max(w, -h_above(i,K))
+              ea(i,j,k) = ea(i,j,k) - w_int(i,j,K)
+            enddo
           endif
         enddo
-      enddo
+      endif
       do k=1,nz ; do i=is,ie
         ea_k = max(0.0, -w_int(i,j,K))
         eb_k = max(0.0, w_int(i,j,K+1))
@@ -459,9 +491,20 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
     damp = dt * CS%Iresttime_col(c)
 
     e(1) = 0.0 ; e0 = 0.0
-    do K=1,nz
-      e(K+1) = e(K) - h(i,j,k)*GV%H_to_Z
-    enddo
+    if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg)) then
+      do K=1,nz
+        e(K+1) = e(K) - GV%H_to_RZ * h(i,j,k) * tv%SpV_avg(i,j,k)
+      enddo
+      dz_to_h(1) = GV%RZ_to_H / tv%SpV_avg(i,j,1)
+      do K=2,nz
+        dz_to_h(K) = 2.0*GV%RZ_to_H / (tv%SpV_avg(i,j,k-1) + tv%SpV_avg(i,j,k))
+      enddo
+    else
+      do K=1,nz
+        e(K+1) = e(K) - h(i,j,k)*GV%H_to_Z
+        dz_to_h(K) = GV%Z_to_H
+      enddo
+    endif
     e_str = e(nz+1) / CS%Ref_eta(nz+1,c)
 
     if ( CS%bulkmixedlayer ) then
@@ -478,7 +521,7 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
       wpb = 0.0; wb = 0.0
       do k=nz,nkmb+1,-1
         if (GV%Rlay(k) > Rcv_ml(i,j)) then
-          w = MIN((((e(K)-e0) - e_str*CS%Ref_eta(K,c)) * damp)*GV%Z_to_H, &
+          w = MIN((((e(K)-e0) - e_str*CS%Ref_eta(K,c)) * damp)*dz_to_h(K), &
                     ((wb + h(i,j,k)) - GV%Angstrom_H))
           wm = 0.5*(w-ABS(w))
           do m=1,CS%fldno
@@ -534,7 +577,7 @@ subroutine apply_sponge(h, dt, G, GV, US, ea, eb, CS, Rcv_ml)
       wpb = 0.0
       wb = 0.0
       do k=nz,1,-1
-        w = MIN((((e(K)-e0) - e_str*CS%Ref_eta(K,c)) * damp)*GV%Z_to_H, &
+        w = MIN((((e(K)-e0) - e_str*CS%Ref_eta(K,c)) * damp)*dz_to_h(K), &
                   ((wb + h(i,j,k)) - GV%Angstrom_H))
         wm = 0.5*(w - ABS(w))
         do m=1,CS%fldno

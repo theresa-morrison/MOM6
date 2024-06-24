@@ -6,15 +6,17 @@ module MOM_forcing_type
 use MOM_array_transform, only : rotate_array, rotate_vector, rotate_array_pair
 use MOM_coupler_types, only : coupler_2d_bc_type, coupler_type_destructor
 use MOM_coupler_types, only : coupler_type_increment_data, coupler_type_initialized
+use MOM_coupler_types, only : coupler_type_copy_data, coupler_type_spawn
 use MOM_cpu_clock,     only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, CLOCK_ROUTINE
 use MOM_debugging,     only : hchksum, uvchksum
 use MOM_diag_mediator, only : post_data, register_diag_field, register_scalar_field
 use MOM_diag_mediator, only : time_type, diag_ctrl, safe_alloc_alloc, query_averaging_enabled
 use MOM_diag_mediator, only : enable_averages, disable_averaging
-use MOM_EOS,           only : calculate_density_derivs, EOS_domain
+use MOM_EOS,           only : calculate_density_derivs, calculate_specific_vol_derivs, EOS_domain
 use MOM_error_handler, only : MOM_error, FATAL, WARNING
 use MOM_file_parser,   only : get_param, log_param, log_version, param_file_type
 use MOM_grid,          only : ocean_grid_type
+use MOM_interface_heights, only : thickness_to_dz
 use MOM_opacity,       only : sumSWoverBands, optics_type, extract_optics_slice, optics_nbands
 use MOM_spatial_means, only : global_area_integral, global_area_mean
 use MOM_spatial_means, only : global_area_mean_u, global_area_mean_v
@@ -28,7 +30,7 @@ implicit none ; private
 
 public extractFluxes1d, extractFluxes2d, optics_type
 public MOM_forcing_chksum, MOM_mech_forcing_chksum
-public calculateBuoyancyFlux1d, calculateBuoyancyFlux2d
+public calculateBuoyancyFlux1d, calculateBuoyancyFlux2d, find_ustar
 public forcing_accumulate, fluxes_accumulate
 public forcing_SinglePointPrint, mech_forcing_diags, forcing_diagnostics
 public register_forcing_type_diags, allocate_forcing_type, deallocate_forcing_type
@@ -52,6 +54,12 @@ interface allocate_mech_forcing
   module procedure allocate_mech_forcing_from_ref
 end interface allocate_mech_forcing
 
+!> Determine the friction velocity from a forcing type or a mechanical forcing type.
+interface find_ustar
+  module procedure find_ustar_fluxes
+  module procedure find_ustar_mech_forcing
+end interface find_ustar
+
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
 ! their mks counterparts with notation like "a velocity [Z T-1 ~> m s-1]".  If the units
@@ -67,9 +75,16 @@ type, public :: forcing
 
   ! surface stress components and turbulent velocity scale
   real, pointer, dimension(:,:) :: &
+    !omega_w2x     => NULL(), & !< the counter-clockwise angle of the wind stress with respect
     ustar         => NULL(), & !< surface friction velocity scale [Z T-1 ~> m s-1].
-    ustar_gustless => NULL()   !< surface friction velocity scale without any
+    tau_mag       => NULL(), & !< Magnitude of the wind stress averaged over tracer cells,
+                               !! including any contributions from sub-gridscale variability
+                               !! or gustiness [R L Z T-2 ~> Pa]
+    ustar_gustless => NULL(), & !< surface friction velocity scale without any
                                !! any augmentation for gustiness [Z T-1 ~> m s-1].
+    tau_mag_gustless => NULL() !< Magnitude of the wind stress averaged over tracer cells,
+                               !! without any augmentation for sub-gridscale variability
+                               !! or gustiness [R L Z T-2 ~> Pa]
 
   ! surface buoyancy force, used when temperature is not a state variable
   real, pointer, dimension(:,:) :: &
@@ -111,9 +126,8 @@ type, public :: forcing
   real, pointer, dimension(:,:) :: &
     netMassIn     => NULL(), & !< Sum of water mass fluxes into the ocean integrated over a
                                !! forcing timestep [H ~> m or kg m-2]
-    netMassOut    => NULL(), & !< Net water mass flux out of the ocean integrated over a forcing timestep,
+    netMassOut    => NULL()    !< Net water mass flux out of the ocean integrated over a forcing timestep,
                                !! with negative values for water leaving the ocean [H ~> m or kg m-2]
-    KPP_salt_flux => NULL()    !< KPP effective salt flux [ppt m s-1]
 
   ! heat associated with water crossing ocean surface
   real, pointer, dimension(:,:) :: &
@@ -131,8 +145,10 @@ type, public :: forcing
   real, pointer, dimension(:,:) :: &
     salt_flux       => NULL(), & !< net salt flux into the ocean [R Z T-1 ~> kgSalt m-2 s-1]
     salt_flux_in    => NULL(), & !< salt flux provided to the ocean from coupler [R Z T-1 ~> kgSalt m-2 s-1]
-    salt_flux_added => NULL()    !< additional salt flux from restoring or flux adjustment before adjustment
+    salt_flux_added => NULL(), & !< additional salt flux from restoring or flux adjustment before adjustment
                                  !! to net zero [R Z T-1 ~> kgSalt m-2 s-1]
+    salt_left_behind => NULL()   !< salt left in ocean at the surface from brine rejection
+                                 !! [R Z T-1 ~> kgSalt m-2 s-1]
 
   ! applied surface pressure from other component models (e.g., atmos, sea ice, land ice)
   real, pointer, dimension(:,:) :: p_surf_full => NULL()
@@ -191,10 +207,8 @@ type, public :: forcing
   real :: C_p                   !< heat capacity of seawater [Q C-1 ~> J kg-1 degC-1].
                                 !! C_p is is the same value as in thermovar_ptrs_type.
 
-  ! CFC-related arrays needed in the MOM_CFC_cap module
+  ! arrays needed in the some tracer modules, e.g., MOM_CFC_cap
   real, pointer, dimension(:,:) :: &
-    cfc11_flux    => NULL(), &  !< flux of cfc_11 into the ocean [CU R Z T-1 ~> mol m-2 s-1]
-    cfc12_flux    => NULL(), &  !< flux of cfc_12 into the ocean [CU R Z T-1 ~> mol m-2 s-1]
     ice_fraction  => NULL(), &  !< fraction of sea ice coverage at h-cells, from 0 to 1 [nondim].
     u10_sqr       => NULL()     !< wind magnitude at 10 m squared [L2 T-2 ~> m2 s-2]
 
@@ -222,8 +236,12 @@ type, public :: mech_forcing
   real, pointer, dimension(:,:) :: &
     taux  => NULL(), & !< zonal wind stress [R L Z T-2 ~> Pa]
     tauy  => NULL(), & !< meridional wind stress [R L Z T-2 ~> Pa]
+    tau_mag => NULL(), & !< Magnitude of the wind stress averaged over tracer cells, including any
+                       !! contributions from sub-gridscale variability or gustiness [R L Z T-2 ~> Pa]
     ustar => NULL(), & !< surface friction velocity scale [Z T-1 ~> m s-1].
     net_mass_src => NULL() !< The net mass source to the ocean [R Z T-1 ~> kg m-2 s-1]
+    !omega_w2x    => NULL()    !< the counter-clockwise angle of the wind stress with respect
+                              !! to the horizontal abscissa (x-coordinate) at tracer points [rad].
 
   ! applied surface pressure from other component models (e.g., atmos, sea ice, land ice)
   real, pointer, dimension(:,:) :: p_surf_full => NULL()
@@ -343,6 +361,7 @@ type, public :: forcing_diags
   integer :: id_saltflux          = -1
   integer :: id_saltFluxIn        = -1
   integer :: id_saltFluxAdded     = -1
+  integer :: id_saltFluxBehind    = -1
 
   integer :: id_total_saltflux        = -1
   integer :: id_total_saltFluxIn      = -1
@@ -359,14 +378,13 @@ type, public :: forcing_diags
   integer :: id_taux  = -1
   integer :: id_tauy  = -1
   integer :: id_ustar = -1
-
+  !integer :: id_omega_w2x = -1
+  integer :: id_tau_mag = -1
   integer :: id_psurf     = -1
   integer :: id_TKE_tidal = -1
   integer :: id_buoy      = -1
 
-  ! cfc-related diagnostics handles
-  integer :: id_cfc11    = -1
-  integer :: id_cfc12    = -1
+  ! tracer surface flux related diagnostics handles
   integer :: id_ice_fraction = -1
   integer :: id_u10_sqr      = -1
 
@@ -739,15 +757,15 @@ subroutine extractFluxes1d(G, GV, US, fluxes, optics, nsw, j, dt, &
     endif
 
     ! Salt fluxes
-    Net_salt(i) = 0.0
-    if (do_NSR) Net_salt_rate(i) = 0.0
+    net_salt(i) = 0.0
+    if (do_NSR) net_salt_rate(i) = 0.0
     ! Convert salt_flux from kg (salt)/(m^2 * s) to
     ! Boussinesq: (ppt * m)
     ! non-Bouss:  (g/m^2)
     if (associated(fluxes%salt_flux)) then
-      Net_salt(i) = (scale * dt * (1000.0*US%ppt_to_S * fluxes%salt_flux(i,j))) * GV%RZ_to_H
+      net_salt(i) = (scale * dt * (1000.0*US%ppt_to_S * fluxes%salt_flux(i,j))) * GV%RZ_to_H
       !Repeat above code for 'rate' term
-      if (do_NSR) Net_salt_rate(i) = (scale * 1. * (1000.0*US%ppt_to_S * fluxes%salt_flux(i,j))) * GV%RZ_to_H
+      if (do_NSR) net_salt_rate(i) = (scale * 1. * (1000.0*US%ppt_to_S * fluxes%salt_flux(i,j))) * GV%RZ_to_H
     endif
 
     ! Diagnostics follow...
@@ -968,18 +986,25 @@ subroutine calculateBuoyancyFlux1d(G, GV, US, fluxes, optics, nsw, h, Temp, Salt
   real, dimension(SZI_(G))              :: netEvap    ! net FW flux leaving ocean via evaporation
                                                       ! [H T-1 ~> m s-1 or kg m-2 s-1]
   real, dimension(SZI_(G))              :: netHeat    ! net temp flux [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+  real, dimension(SZI_(G), SZK_(GV))    :: dz         ! Layer thicknesses in depth units [Z ~> m]
   real, dimension(max(nsw,1), SZI_(G))  :: penSWbnd   ! penetrating SW radiation by band
-                                                      ! [degC H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+                                                      ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
   real, dimension(SZI_(G))              :: pressure   ! pressure at the surface [R L2 T-2 ~> Pa]
   real, dimension(SZI_(G))              :: dRhodT     ! density partial derivative wrt temp [R C-1 ~> kg m-3 degC-1]
   real, dimension(SZI_(G))              :: dRhodS     ! density partial derivative wrt saln [R S-1 ~> kg m-3 ppt-1]
+  real, dimension(SZI_(G))              :: dSpV_dT    ! Partial derivative of specific volume with respect
+                                                      ! to temperature [R-1 C-1 ~> m3 kg-1 degC-1]
+  real, dimension(SZI_(G))              :: dSpV_dS    ! Partial derivative of specific volume with respect
+                                                      ! to salinity [R-1 S-1 ~> m3 kg-1 ppt-1]
   real, dimension(SZI_(G),SZK_(GV)+1)   :: netPen     ! The net penetrating shortwave radiation at each level
                                                       ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
 
   logical :: useRiverHeatContent
   logical :: useCalvingHeatContent
-  real    :: GoRho ! The gravitational acceleration divided by mean density times a
-                   ! unit conversion factor [L2 H-1 R-1 T-2 ~> m4 kg-1 s-2 or m7 kg-2 s-2]
+  real    :: GoRho  ! The gravitational acceleration divided by mean density times a
+                    ! unit conversion factor [L2 H-1 R-1 T-2 ~> m4 kg-1 s-2 or m7 kg-2 s-2]
+  real    :: g_conv ! The gravitational acceleration times the conversion factors from non-Boussinesq
+                    ! thickness units to mass per units area [R L2 H-1 T-2 ~> kg m-2 s-2 or m s-2]
   real    :: H_limit_fluxes ! A depth scale that specifies when the ocean is shallow that
                             ! it is necessary to eliminate fluxes [H ~> m or kg m-2]
   integer :: i, k
@@ -989,14 +1014,11 @@ subroutine calculateBuoyancyFlux1d(G, GV, US, fluxes, optics, nsw, h, Temp, Salt
   useCalvingHeatContent = .False.
 
   H_limit_fluxes = max( GV%Angstrom_H, 1.e-30*GV%m_to_H )
-  pressure(:) = 0.
-  if (associated(tv%p_surf)) then ; do i=G%isc,G%iec ; pressure(i) = tv%p_surf(i,j) ; enddo ; endif
-  GoRho       = (GV%g_Earth * GV%H_to_Z) / GV%Rho0
 
   ! The surface forcing is contained in the fluxes type.
   ! We aggregate the thermodynamic forcing for a time step into the following:
   ! netH       = water added/removed via surface fluxes [H T-1 ~> m s-1 or kg m-2 s-1]
-  ! netHeat    = heat via surface fluxes [degC H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+  ! netHeat    = heat via surface fluxes [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
   ! netSalt    = salt via surface fluxes [S H T-1 ~> ppt m s-1 or gSalt m-2 s-1]
   ! Note that unlike other calls to extractFLuxes1d() that return the time-integrated flux
   ! this call returns the rate because dt=1 (in arbitrary time units)
@@ -1007,30 +1029,55 @@ subroutine calculateBuoyancyFlux1d(G, GV, US, fluxes, optics, nsw, h, Temp, Salt
 
   ! Sum over bands and attenuate as a function of depth
   ! netPen is the netSW as a function of depth
-  call sumSWoverBands(G, GV, US, h(:,j,:), optics_nbands(optics), optics, j, 1.0, &
+  call thickness_to_dz(h, tv, dz, j, G, GV)
+  call sumSWoverBands(G, GV, US, h(:,j,:), dz, optics_nbands(optics), optics, j, 1.0, &
                       H_limit_fluxes, .true., penSWbnd, netPen)
 
-  ! Density derivatives
-  call calculate_density_derivs(Temp(:,j,1), Salt(:,j,1), pressure, dRhodT, dRhodS, &
-                                tv%eqn_of_state, EOS_domain(G%HI))
-
   ! Adjust netSalt to reflect dilution effect of FW flux
-  ! [ppt H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
+  ! [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
   netSalt(G%isc:G%iec) = netSalt(G%isc:G%iec) - Salt(G%isc:G%iec,j,1) * netH(G%isc:G%iec)
 
   ! Add in the SW heating for purposes of calculating the net
   ! surface buoyancy flux affecting the top layer.
-  ! [degC H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+  ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
   !netHeat(:) = netHeatMinusSW(:) + sum( penSWbnd, dim=1 )
   netHeat(G%isc:G%iec) = netHeatMinusSW(G%isc:G%iec) + netPen(G%isc:G%iec,1)
 
-  ! Convert to a buoyancy flux, excluding penetrating SW heating
-  buoyancyFlux(G%isc:G%iec,1) = - GoRho * ( dRhodS(G%isc:G%iec) * netSalt(G%isc:G%iec) + &
-                                             dRhodT(G%isc:G%iec) * netHeat(G%isc:G%iec) ) ! [L2 T-3 ~> m2 s-3]
-  ! We also have a penetrative buoyancy flux associated with penetrative SW
-  do k=2, GV%ke+1
-    buoyancyFlux(G%isc:G%iec,k) = - GoRho * ( dRhodT(G%isc:G%iec) * netPen(G%isc:G%iec,k) ) ! [L2 T-3 ~> m2 s-3]
-  enddo
+  ! Determine the buoyancy flux
+  pressure(:) = 0.
+  if (associated(tv%p_surf)) then ; do i=G%isc,G%iec ; pressure(i) = tv%p_surf(i,j) ; enddo ; endif
+
+  if ((.not.GV%Boussinesq) .and. (.not.GV%semi_Boussinesq)) then
+    g_conv = GV%g_Earth * GV%H_to_RZ
+
+    ! Specific volume derivatives
+    call calculate_specific_vol_derivs(Temp(:,j,1), Salt(:,j,1), pressure, dSpV_dT, dSpV_dS, &
+                                  tv%eqn_of_state, EOS_domain(G%HI))
+
+    ! Convert to a buoyancy flux [L2 T-3 ~> m2 s-3], first excluding penetrating SW heating
+    do i=G%isc,G%iec
+      buoyancyFlux(i,1) = g_conv * (dSpV_dS(i) * netSalt(i) + dSpV_dT(i) * netHeat(i))
+    enddo
+    ! We also have a penetrative buoyancy flux associated with penetrative SW
+    do k=2,GV%ke+1 ; do i=G%isc,G%iec
+      buoyancyFlux(i,k) = g_conv * ( dSpV_dT(i) * netPen(i,k) ) ! [L2 T-3 ~> m2 s-3]
+    enddo ; enddo
+  else
+    GoRho = (GV%g_Earth * GV%H_to_Z) / GV%Rho0
+
+    ! Density derivatives
+    call calculate_density_derivs(Temp(:,j,1), Salt(:,j,1), pressure, dRhodT, dRhodS, &
+                                  tv%eqn_of_state, EOS_domain(G%HI))
+
+    ! Convert to a buoyancy flux [L2 T-3 ~> m2 s-3], excluding penetrating SW heating
+    do i=G%isc,G%iec
+      buoyancyFlux(i,1) = - GoRho * ( dRhodS(i) * netSalt(i) + dRhodT(i) * netHeat(i) )
+    enddo
+    ! We also have a penetrative buoyancy flux associated with penetrative SW
+    do k=2,GV%ke+1 ; do i=G%isc,G%iec
+      buoyancyFlux(i,k) = - GoRho * ( dRhodT(i) * netPen(i,k) ) ! [L2 T-3 ~> m2 s-3]
+    enddo ; enddo
+  endif
 
 end subroutine calculateBuoyancyFlux1d
 
@@ -1066,6 +1113,139 @@ subroutine calculateBuoyancyFlux2d(G, GV, US, fluxes, optics, h, Temp, Salt, tv,
 end subroutine calculateBuoyancyFlux2d
 
 
+!> Determine the friction velocity from the contenxts of a forcing type, perhaps
+!! using the evolving surface density.
+subroutine find_ustar_fluxes(fluxes, tv, U_star, G, GV, US, halo, H_T_units)
+  type(ocean_grid_type),   intent(in)  :: G    !< The ocean's grid structure
+  type(verticalGrid_type), intent(in)  :: GV   !< The ocean's vertical grid structure
+  type(unit_scale_type),   intent(in)  :: US   !< A dimensional unit scaling type
+  type(forcing),           intent(in)  :: fluxes !< Surface fluxes container
+  type(thermo_var_ptrs),   intent(in)  :: tv   !< Structure containing pointers to any
+                                               !! available thermodynamic fields.
+  real, dimension(SZI_(G),SZJ_(G)), &
+                           intent(out) :: U_star !< The surface friction velocity [Z T-1 ~> m s-1] or
+                                               !! [H T-1 ~> m s-1 or kg m-2 s-1], depending on H_T_units.
+  integer,       optional, intent(in)  :: halo !< The extra halo size to fill in, 0 by default
+  logical,       optional, intent(in)  :: H_T_units !< If present and true, return U_star in units
+                                               !! of [H T-1 ~> m s-1 or kg m-2 s-1]
+
+  ! Local variables
+  real :: I_rho        ! The inverse of the reference density times a ratio of scaling
+                       ! factors [Z L-1 R-1 ~> m3 kg-1] or in some semi-Boussinesq cases
+                       ! the rescaled reference density [H2 Z-1 L-1 R-1 ~> m3 kg-1 or kg m-3]
+  logical :: Z_T_units ! If true, U_star is returned in units of [Z T-1 ~> m s-1], otherwise it is
+                       ! returned in [H T-1 ~> m s-1 or kg m-2 s-1]
+  integer :: i, j, k, is, ie, js, je, hs
+
+  hs = 0 ; if (present(halo)) hs = max(halo, 0)
+  is = G%isc - hs ; ie = G%iec + hs ; js = G%jsc - hs ; je = G%jec + hs
+
+  Z_T_units = .true. ; if (present(H_T_units)) Z_T_units = .not.H_T_units
+
+  if (.not.(associated(fluxes%ustar) .or. associated(fluxes%tau_mag))) &
+    call MOM_error(FATAL, "find_ustar_fluxes requires that either ustar or tau_mag be associated.")
+
+  if (associated(fluxes%ustar) .and. (GV%Boussinesq .or. .not.associated(fluxes%tau_mag))) then
+    if (Z_T_units) then
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = fluxes%ustar(i,j)
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = GV%Z_to_H * fluxes%ustar(i,j)
+      enddo ; enddo
+    endif
+  elseif (allocated(tv%SpV_avg)) then
+    if (tv%valid_SpV_halo < 0) call MOM_error(FATAL, &
+        "find_ustar_fluxes called in non-Boussinesq mode with invalid values of SpV_avg.")
+    if (tv%valid_SpV_halo < hs) call MOM_error(FATAL, &
+        "find_ustar_fluxes called in non-Boussinesq mode with insufficient valid values of SpV_avg.")
+    if (Z_T_units) then
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = sqrt(US%L_to_Z*fluxes%tau_mag(i,j) * tv%SpV_avg(i,j,1))
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = GV%RZ_to_H * sqrt(US%L_to_Z*fluxes%tau_mag(i,j) / tv%SpV_avg(i,j,1))
+      enddo ; enddo
+    endif
+  else
+    I_rho = US%L_to_Z * GV%Z_to_H * GV%RZ_to_H
+    if (Z_T_units) I_rho = US%L_to_Z * GV%H_to_Z * GV%RZ_to_H ! == US%L_to_Z / GV%Rho0
+    do j=js,je ; do i=is,ie
+      U_star(i,j) = sqrt(fluxes%tau_mag(i,j) * I_rho)
+    enddo ; enddo
+  endif
+
+end subroutine find_ustar_fluxes
+
+
+!> Determine the friction velocity from the contenxts of a forcing type, perhaps
+!! using the evolving surface density.
+subroutine find_ustar_mech_forcing(forces, tv, U_star, G, GV, US, halo, H_T_units)
+  type(ocean_grid_type),   intent(in)  :: G    !< The ocean's grid structure
+  type(verticalGrid_type), intent(in)  :: GV   !< The ocean's vertical grid structure
+  type(unit_scale_type),   intent(in)  :: US   !< A dimensional unit scaling type
+  type(mech_forcing),      intent(in)  :: forces !< Surface forces container
+  type(thermo_var_ptrs),   intent(in)  :: tv   !< Structure containing pointers to any
+                                               !! available thermodynamic fields.
+  real, dimension(SZI_(G),SZJ_(G)), &
+                           intent(out) :: U_star !< The surface friction velocity [Z T-1 ~> m s-1]
+  integer,       optional, intent(in)  :: halo !< The extra halo size to fill in, 0 by default
+  logical,       optional, intent(in)  :: H_T_units !< If present and true, return U_star in units
+                                               !! of [H T-1 ~> m s-1 or kg m-2 s-1]
+
+  ! Local variables
+  real :: I_rho        ! The inverse of the reference density times a ratio of scaling
+                       ! factors [Z L-1 R-1 ~> m3 kg-1] or in some semi-Boussinesq cases
+                       ! the rescaled reference density [H2 Z-1 L-1 R-1 ~> m3 kg-1 or kg m-3]
+  logical :: Z_T_units ! If true, U_star is returned in units of [Z T-1 ~> m s-1], otherwise it is
+                       ! returned in [H T-1 ~> m s-1 or kg m-2 s-1]
+  integer :: i, j, k, is, ie, js, je, hs
+
+  hs = 0 ; if (present(halo)) hs = max(halo, 0)
+  is = G%isc - hs ; ie = G%iec + hs ; js = G%jsc - hs ; je = G%jec + hs
+
+  Z_T_units = .true. ; if (present(H_T_units)) Z_T_units = .not.H_T_units
+
+  if (.not.(associated(forces%ustar) .or. associated(forces%tau_mag))) &
+    call MOM_error(FATAL, "find_ustar_mech requires that either ustar or tau_mag be associated.")
+
+  if (associated(forces%ustar) .and. (GV%Boussinesq .or. .not.associated(forces%tau_mag))) then
+    if (Z_T_units) then
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = forces%ustar(i,j)
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = GV%Z_to_H * forces%ustar(i,j)
+      enddo ; enddo
+    endif
+  elseif (allocated(tv%SpV_avg)) then
+    if (tv%valid_SpV_halo < 0) call MOM_error(FATAL, &
+        "find_ustar_mech called in non-Boussinesq mode with invalid values of SpV_avg.")
+    if (tv%valid_SpV_halo < hs) call MOM_error(FATAL, &
+        "find_ustar_mech called in non-Boussinesq mode with insufficient valid values of SpV_avg.")
+    if (Z_T_units) then
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = sqrt(US%L_to_Z*forces%tau_mag(i,j) * tv%SpV_avg(i,j,1))
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        U_star(i,j) = GV%RZ_to_H * sqrt(US%L_to_Z*forces%tau_mag(i,j) / tv%SpV_avg(i,j,1))
+      enddo ; enddo
+    endif
+  else
+    I_rho = US%L_to_Z * GV%Z_to_H * GV%RZ_to_H
+    if (Z_T_units) I_rho = US%L_to_Z * GV%H_to_Z * GV%RZ_to_H ! == US%L_to_Z / GV%Rho0
+    do j=js,je ; do i=is,ie
+      U_star(i,j) = sqrt(forces%tau_mag(i,j) * I_rho)
+    enddo ; enddo
+  endif
+
+end subroutine find_ustar_mech_forcing
+
+
 !> Write out chksums for thermodynamic fluxes.
 subroutine MOM_forcing_chksum(mesg, fluxes, G, US, haloshift)
   character(len=*),        intent(in) :: mesg      !< message
@@ -1083,6 +1263,8 @@ subroutine MOM_forcing_chksum(mesg, fluxes, G, US, haloshift)
   ! and js...je as their extent.
   if (associated(fluxes%ustar)) &
     call hchksum(fluxes%ustar, mesg//" fluxes%ustar", G%HI, haloshift=hshift, scale=US%Z_to_m*US%s_to_T)
+  if (associated(fluxes%tau_mag)) &
+    call hchksum(fluxes%tau_mag, mesg//" fluxes%tau_mag", G%HI, haloshift=hshift, scale=US%RLZ_T2_to_Pa)
   if (associated(fluxes%buoy)) &
     call hchksum(fluxes%buoy, mesg//" fluxes%buoy ", G%HI, haloshift=hshift, scale=US%L_to_m**2*US%s_to_T**3)
   if (associated(fluxes%sw)) &
@@ -1129,10 +1311,6 @@ subroutine MOM_forcing_chksum(mesg, fluxes, G, US, haloshift)
     call hchksum(fluxes%u10_sqr, mesg//" fluxes%u10_sqr", G%HI, haloshift=hshift, scale=US%L_to_m**2*US%s_to_T**2)
   if (associated(fluxes%ice_fraction)) &
     call hchksum(fluxes%ice_fraction, mesg//" fluxes%ice_fraction", G%HI, haloshift=hshift)
-  if (associated(fluxes%cfc11_flux)) &
-    call hchksum(fluxes%cfc11_flux, mesg//" fluxes%cfc11_flux", G%HI, haloshift=hshift, scale=US%RZ_T_to_kg_m2s)
-  if (associated(fluxes%cfc12_flux)) &
-    call hchksum(fluxes%cfc12_flux, mesg//" fluxes%cfc12_flux", G%HI, haloshift=hshift, scale=US%RZ_T_to_kg_m2s)
   if (associated(fluxes%salt_flux)) &
     call hchksum(fluxes%salt_flux, mesg//" fluxes%salt_flux", G%HI, haloshift=hshift, scale=US%RZ_T_to_kg_m2s)
   if (associated(fluxes%TKE_tidal)) &
@@ -1186,11 +1364,13 @@ subroutine MOM_mech_forcing_chksum(mesg, forces, G, US, haloshift)
   ! and js...je as their extent.
   if (associated(forces%taux) .and. associated(forces%tauy)) &
     call uvchksum(mesg//" forces%tau[xy]", forces%taux, forces%tauy, G%HI, &
-                  haloshift=hshift, symmetric=.true., scale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
+                  haloshift=hshift, symmetric=.true., scale=US%RLZ_T2_to_Pa)
   if (associated(forces%p_surf)) &
     call hchksum(forces%p_surf, mesg//" forces%p_surf", G%HI, haloshift=hshift, scale=US%RL2_T2_to_Pa)
   if (associated(forces%ustar)) &
     call hchksum(forces%ustar, mesg//" forces%ustar", G%HI, haloshift=hshift, scale=US%Z_to_m*US%s_to_T)
+  if (associated(forces%tau_mag)) &
+    call hchksum(forces%tau_mag, mesg//" forces%tau_mag", G%HI, haloshift=hshift, scale=US%RLZ_T2_to_Pa)
   if (associated(forces%rigidity_ice_u) .and. associated(forces%rigidity_ice_v)) &
     call uvchksum(mesg//" forces%rigidity_ice_[uv]", forces%rigidity_ice_u, &
         forces%rigidity_ice_v, G%HI, haloshift=hshift, symmetric=.true., &
@@ -1237,6 +1417,7 @@ subroutine forcing_SinglePointPrint(fluxes, G, i, j, mesg)
   write(0,'(2a)') 'MOM_forcing_type, forcing_SinglePointPrint: Called from ',mesg
   write(0,'(a,2es15.3)') 'MOM_forcing_type, forcing_SinglePointPrint: lon,lat = ',G%geoLonT(i,j),G%geoLatT(i,j)
   call locMsg(fluxes%ustar,'ustar')
+  call locMsg(fluxes%tau_mag,'tau_mag')
   call locMsg(fluxes%buoy,'buoy')
   call locMsg(fluxes%sw,'sw')
   call locMsg(fluxes%sw_vis_dir,'sw_vis_dir')
@@ -1305,21 +1486,28 @@ subroutine register_forcing_type_diags(Time, diag, US, use_temperature, handles,
 
   handles%id_taux = register_diag_field('ocean_model', 'taux', diag%axesCu1, Time,  &
         'Zonal surface stress from ocean interactions with atmos and ice', &
-        'Pa', conversion=US%RZ_T_to_kg_m2s*US%L_T_to_m_s, &
+        'Pa', conversion=US%RLZ_T2_to_Pa, &
         standard_name='surface_downward_x_stress', cmor_field_name='tauuo',         &
         cmor_units='N m-2', cmor_long_name='Surface Downward X Stress',             &
         cmor_standard_name='surface_downward_x_stress')
 
   handles%id_tauy = register_diag_field('ocean_model', 'tauy', diag%axesCv1, Time,  &
         'Meridional surface stress ocean interactions with atmos and ice', &
-        'Pa', conversion=US%RZ_T_to_kg_m2s*US%L_T_to_m_s, &
+        'Pa', conversion=US%RLZ_T2_to_Pa, &
         standard_name='surface_downward_y_stress', cmor_field_name='tauvo',        &
         cmor_units='N m-2', cmor_long_name='Surface Downward Y Stress',            &
         cmor_standard_name='surface_downward_y_stress')
 
+  handles%id_tau_mag = register_diag_field('ocean_model', 'tau_mag', diag%axesT1, Time, &
+        'Average magnitude of the wind stress including contributions from gustiness', &
+        'Pa', conversion=US%RLZ_T2_to_Pa)
+
   handles%id_ustar = register_diag_field('ocean_model', 'ustar', diag%axesT1, Time, &
       'Surface friction velocity = [(gustiness + tau_magnitude)/rho0]^(1/2)', &
       'm s-1', conversion=US%Z_to_m*US%s_to_T)
+
+  !handles%id_omega_w2x = register_diag_field('ocean_model', 'omega_w2x', diag%axesT1, Time, &
+  !    'Counter-clockwise angle of the wind stress from the horizontal axis.', 'rad')
 
   if (present(use_berg_fluxes)) then
     if (use_berg_fluxes) then
@@ -1340,26 +1528,9 @@ subroutine register_forcing_type_diags(Time, diag, US, use_temperature, handles,
     endif
   endif
 
-  ! units for cfc11_flux and cfc12_flux are [Conc R Z T-1 ~> mol m-2 s-1]
   ! See:
-  ! http://clipc-services.ceda.ac.uk/dreq/u/0940cbee6105037e4b7aa5579004f124.html
-  ! http://clipc-services.ceda.ac.uk/dreq/u/e9e21426e4810d0bb2d3dddb24dbf4dc.html
   if (present(use_cfcs)) then
     if (use_cfcs) then
-      handles%id_cfc11 = register_diag_field('ocean_model', 'cfc11_flux', diag%axesT1, Time, &
-          'Gas exchange flux of CFC11 into the ocean ', &
-          'mol m-2 s-1', conversion=US%RZ_T_to_kg_m2s, &
-          cmor_field_name='fgcfc11', &
-          cmor_long_name='Surface Downward CFC11 Flux', &
-          cmor_standard_name='surface_downward_cfc11_flux')
-
-      handles%id_cfc12 = register_diag_field('ocean_model', 'cfc12_flux', diag%axesT1, Time, &
-          'Gas exchange flux of CFC12 into the ocean ', &
-          'mol m-2 s-1', conversion=US%RZ_T_to_kg_m2s, &
-          cmor_field_name='fgcfc12', &
-          cmor_long_name='Surface Downward CFC12 Flux', &
-          cmor_standard_name='surface_downward_cfc12_flux')
-
       handles%id_ice_fraction = register_diag_field('ocean_model', 'ice_fraction', diag%axesT1, Time, &
           'Fraction of cell area covered by sea ice', 'm2 m-2')
 
@@ -1929,6 +2100,10 @@ subroutine register_forcing_type_diags(Time, diag, US, use_temperature, handles,
         diag%axesT1,Time,'Salt flux into ocean at surface due to restoring or flux adjustment', &
         units='kg m-2 s-1', conversion=US%RZ_T_to_kg_m2s)
 
+  handles%id_saltFluxBehind = register_diag_field('ocean_model', 'salt_left_behind', &
+        diag%axesT1,Time,'Salt left in ocean at surface due to ice formation', &
+        units='kg m-2 s-1', conversion=US%RZ_T_to_kg_m2s)
+
   handles%id_saltFluxGlobalAdj = register_scalar_field('ocean_model',              &
         'salt_flux_global_restoring_adjustment', Time, diag,                       &
         'Adjustment needed to balance net global salt flux into ocean at surface', &
@@ -1995,7 +2170,7 @@ subroutine forcing_accumulate(flux_tmp, forces, fluxes, G, wt2)
   type(forcing),         intent(inout) :: fluxes !< A structure containing time-averaged
                                                  !! thermodynamic forcing fields
   type(ocean_grid_type), intent(inout) :: G      !< The ocean's grid structure
-  real,                  intent(out)   :: wt2    !< The relative weight of the new fluxes
+  real,                  intent(out)   :: wt2    !< The relative weight of the new fluxes [nondim]
 
   ! This subroutine copies mechancal forcing from flux_tmp to fluxes and
   ! stores the time-weighted averages of the various buoyancy fluxes in fluxes,
@@ -2013,7 +2188,7 @@ subroutine fluxes_accumulate(flux_tmp, fluxes, G, wt2, forces)
   type(forcing),             intent(inout) :: fluxes !< A structure containing time-averaged
                                                      !! thermodynamic forcing fields
   type(ocean_grid_type),     intent(inout) :: G      !< The ocean's grid structure
-  real,                      intent(out)   :: wt2    !< The relative weight of the new fluxes
+  real,                      intent(out)   :: wt2    !< The relative weight of the new fluxes [nondim]
   type(mech_forcing), optional, intent(in) :: forces !< A structure with the driving mechanical forces
 
   ! This subroutine copies mechanical forcing from flux_tmp to fluxes and
@@ -2038,32 +2213,55 @@ subroutine fluxes_accumulate(flux_tmp, fluxes, G, wt2, forces)
   wt2 = 1.0 - wt1 ! = flux_tmp%dt_buoy_accum / (fluxes%dt_buoy_accum + flux_tmp%dt_buoy_accum)
   fluxes%dt_buoy_accum = fluxes%dt_buoy_accum + flux_tmp%dt_buoy_accum
 
-  ! Copy over the pressure fields and accumulate averages of ustar, either from the forcing
+  ! Copy over the pressure fields and accumulate averages of ustar or tau_mag, either from the forcing
   ! type or from the temporary fluxes type.
   if (present(forces)) then
     do j=js,je ; do i=is,ie
       fluxes%p_surf(i,j) = forces%p_surf(i,j)
       fluxes%p_surf_full(i,j) = forces%p_surf_full(i,j)
-
-      fluxes%ustar(i,j) = wt1*fluxes%ustar(i,j) + wt2*forces%ustar(i,j)
     enddo ; enddo
+
+    if (associated(fluxes%ustar)) then ; do j=js,je ; do i=is,ie
+      fluxes%ustar(i,j) = wt1*fluxes%ustar(i,j) + wt2*forces%ustar(i,j)
+    enddo ; enddo ; endif
+    if (associated(fluxes%tau_mag)) then ; do j=js,je ; do i=is,ie
+      fluxes%tau_mag(i,j) = wt1*fluxes%tau_mag(i,j) + wt2*forces%tau_mag(i,j)
+    enddo ; enddo ; endif
   else
     do j=js,je ; do i=is,ie
       fluxes%p_surf(i,j) = flux_tmp%p_surf(i,j)
       fluxes%p_surf_full(i,j) = flux_tmp%p_surf_full(i,j)
+    enddo ; enddo
 
+    if (associated(fluxes%ustar)) then ; do j=js,je ; do i=is,ie
       fluxes%ustar(i,j) = wt1*fluxes%ustar(i,j) + wt2*flux_tmp%ustar(i,j)
+    enddo ; enddo ; endif
+    if (associated(fluxes%tau_mag)) then ; do j=js,je ; do i=is,ie
+      fluxes%tau_mag(i,j) = wt1*fluxes%tau_mag(i,j) + wt2*flux_tmp%tau_mag(i,j)
+    enddo ; enddo ; endif
+  endif
+
+  ! Average ustar_gustless.
+  if (associated(fluxes%ustar_gustless)) then
+    if (fluxes%gustless_accum_bug) then
+      do j=js,je ; do i=is,ie
+        fluxes%ustar_gustless(i,j) = flux_tmp%ustar_gustless(i,j)
+      enddo ; enddo
+    else
+      do j=js,je ; do i=is,ie
+        fluxes%ustar_gustless(i,j) = wt1*fluxes%ustar_gustless(i,j) + wt2*flux_tmp%ustar_gustless(i,j)
+      enddo ; enddo
+    endif
+  endif
+
+  if (associated(fluxes%tau_mag_gustless)) then
+    do j=js,je ; do i=is,ie
+      fluxes%tau_mag_gustless(i,j) = wt1*fluxes%tau_mag_gustless(i,j) + wt2*flux_tmp%tau_mag_gustless(i,j)
     enddo ; enddo
   endif
 
-  ! Average the water, heat, and salt fluxes, and ustar.
+  ! Average the water, heat, and salt fluxes.
   do j=js,je ; do i=is,ie
-    if (fluxes%gustless_accum_bug) then
-      fluxes%ustar_gustless(i,j) = flux_tmp%ustar_gustless(i,j)
-    else
-      fluxes%ustar_gustless(i,j) = wt1*fluxes%ustar_gustless(i,j) + wt2*flux_tmp%ustar_gustless(i,j)
-    endif
-
     fluxes%evap(i,j) = wt1*fluxes%evap(i,j) + wt2*flux_tmp%evap(i,j)
     fluxes%lprec(i,j) = wt1*fluxes%lprec(i,j) + wt2*flux_tmp%lprec(i,j)
     fluxes%fprec(i,j) = wt1*fluxes%fprec(i,j) + wt2*flux_tmp%fprec(i,j)
@@ -2172,6 +2370,16 @@ subroutine copy_common_forcing_fields(forces, fluxes, G, skip_pres)
       fluxes%ustar(i,j) = forces%ustar(i,j)
     enddo ; enddo
   endif
+  !if (associated(forces%omega_w2x) .and. associated(fluxes%omega_w2x)) then
+  !  do j=js,je ; do i=is,ie
+  !    fluxes%omega_w2x(i,j) = forces%omega_w2x(i,j)
+  !  enddo ; enddo
+  !endif
+  if (associated(forces%tau_mag) .and. associated(fluxes%tau_mag)) then
+    do j=js,je ; do i=is,ie
+      fluxes%tau_mag(i,j) = forces%tau_mag(i,j)
+    enddo ; enddo
+  endif
 
   if (do_pres) then
     if (associated(forces%p_surf) .and. associated(fluxes%p_surf)) then
@@ -2212,8 +2420,8 @@ subroutine set_derived_forcing_fields(forces, fluxes, G, US, Rho0)
 
   Irho0 = US%L_to_Z / Rho0
 
-  if (associated(forces%taux) .and. associated(forces%tauy) .and. &
-      associated(fluxes%ustar_gustless)) then
+  if ( associated(forces%taux) .and. associated(forces%tauy) .and. &
+       (associated(fluxes%ustar_gustless) .or. associated(fluxes%tau_mag_gustless)) ) then
     do j=js,je ; do i=is,ie
       taux2 = 0.0
       if ((G%mask2dCu(I-1,j) + G%mask2dCu(I,j)) > 0.0) &
@@ -2226,11 +2434,16 @@ subroutine set_derived_forcing_fields(forces, fluxes, G, US, Rho0)
                  G%mask2dCv(i,J) * forces%tauy(i,J)**2) / &
                 (G%mask2dCv(i,J-1) + G%mask2dCv(i,J))
 
-      if (fluxes%gustless_accum_bug) then
-        ! This change is just for computational efficiency, but it is wrapped with another change.
-        fluxes%ustar_gustless(i,j) = sqrt(US%L_to_Z * sqrt(taux2 + tauy2) / Rho0)
-      else
-        fluxes%ustar_gustless(i,j) = sqrt(sqrt(taux2 + tauy2) * Irho0)
+      if (associated(fluxes%ustar_gustless)) then
+        if (fluxes%gustless_accum_bug) then
+          ! This change is just for computational efficiency, but it is wrapped with another change.
+          fluxes%ustar_gustless(i,j) = sqrt(US%L_to_Z * sqrt(taux2 + tauy2) / Rho0)
+        else
+          fluxes%ustar_gustless(i,j) = sqrt(sqrt(taux2 + tauy2) * Irho0)
+        endif
+      endif
+      if (associated(fluxes%tau_mag_gustless)) then
+        fluxes%tau_mag_gustless(i,j) = sqrt(taux2 + tauy2)
       endif
     enddo ; enddo
   endif
@@ -2301,6 +2514,16 @@ subroutine copy_back_forcing_fields(fluxes, forces, G)
   if (associated(forces%ustar) .and. associated(fluxes%ustar)) then
     do j=js,je ; do i=is,ie
       forces%ustar(i,j) = fluxes%ustar(i,j)
+    enddo ; enddo
+  endif
+  !if (associated(forces%omega_w2x) .and. associated(fluxes%omega_w2x)) then
+  !  do j=js,je ; do i=is,ie
+  !    forces%omega_w2x(i,j) = fluxes%omega_w2x(i,j)
+  !  enddo ; enddo
+  !endif
+  if (associated(forces%tau_mag) .and. associated(fluxes%tau_mag)) then
+    do j=js,je ; do i=is,ie
+      forces%tau_mag(i,j) = fluxes%tau_mag(i,j)
     enddo ; enddo
   endif
 
@@ -2404,7 +2627,7 @@ subroutine forcing_diagnostics(fluxes_in, sfc_state, G_in, US, time_end, diag, h
   if (turns /= 0) then
     G => diag%G
     allocate(fluxes)
-    call allocate_forcing_type(fluxes_in, G, fluxes)
+    call allocate_forcing_type(fluxes_in, G, fluxes, turns=turns)
     call rotate_forcing(fluxes_in, fluxes, turns)
   else
     G => G_in
@@ -2908,6 +3131,9 @@ subroutine forcing_diagnostics(fluxes_in, sfc_state, G_in, US, time_end, diag, h
       call post_data(handles%id_total_saltFluxIn, total_transport, diag)
     endif
 
+    if (handles%id_saltFluxBehind > 0 .and. associated(fluxes%salt_left_behind)) &
+      call post_data(handles%id_saltFluxBehind, fluxes%salt_left_behind, diag)
+
     if (handles%id_saltFluxGlobalAdj > 0)                                            &
       call post_data(handles%id_saltFluxGlobalAdj, fluxes%saltFluxGlobalAdj, diag)
     if (handles%id_vPrecGlobalAdj > 0)                                               &
@@ -2921,13 +3147,7 @@ subroutine forcing_diagnostics(fluxes_in, sfc_state, G_in, US, time_end, diag, h
     if (handles%id_netFWGlobalScl > 0)                                               &
       call post_data(handles%id_netFWGlobalScl, fluxes%netFWGlobalScl, diag)
 
-    ! post diagnostics related to cfcs  ====================================
-
-    if ((handles%id_cfc11 > 0) .and. associated(fluxes%cfc11_flux)) &
-      call post_data(handles%id_cfc11, fluxes%cfc11_flux, diag)
-
-    if ((handles%id_cfc11 > 0) .and. associated(fluxes%cfc12_flux)) &
-      call post_data(handles%id_cfc12, fluxes%cfc12_flux, diag)
+    ! post diagnostics related to tracer surface fluxes  ========================
 
     if ((handles%id_ice_fraction > 0) .and. associated(fluxes%ice_fraction)) &
       call post_data(handles%id_ice_fraction, fluxes%ice_fraction, diag)
@@ -2946,8 +3166,14 @@ subroutine forcing_diagnostics(fluxes_in, sfc_state, G_in, US, time_end, diag, h
     if ((handles%id_buoy > 0) .and. associated(fluxes%buoy))                         &
       call post_data(handles%id_buoy, fluxes%buoy, diag)
 
+    if ((handles%id_tau_mag > 0) .and. associated(fluxes%tau_mag)) &
+      call post_data(handles%id_tau_mag, fluxes%tau_mag, diag)
+
     if ((handles%id_ustar > 0) .and. associated(fluxes%ustar)) &
       call post_data(handles%id_ustar, fluxes%ustar, diag)
+
+    !if ((handles%id_omega_w2x > 0) .and. associated(fluxes%omega_w2x)) &
+    !  call post_data(handles%id_omega_w2x, fluxes%omega_w2x, diag)
 
     if ((handles%id_ustar_berg > 0) .and. associated(fluxes%ustar_berg)) &
       call post_data(handles%id_ustar_berg, fluxes%ustar_berg, diag)
@@ -2977,7 +3203,7 @@ end subroutine forcing_diagnostics
 !> Conditionally allocate fields within the forcing type
 subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
                                   shelf, iceberg, salt, fix_accum_bug, cfc, waves, &
-                                  shelf_sfc_accumulation, lamult, hevap)
+                                  shelf_sfc_accumulation, lamult, hevap, tau_mag)
   type(ocean_grid_type), intent(in) :: G       !< Ocean grid structure
   type(forcing),      intent(inout) :: fluxes  !< A structure containing thermodynamic forcing fields
   logical, optional,     intent(in) :: water   !< If present and true, allocate water fluxes
@@ -2989,7 +3215,8 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   logical, optional,     intent(in) :: salt    !< If present and true, allocate salt fluxes
   logical, optional,     intent(in) :: fix_accum_bug !< If present and true, avoid using a bug in
                                                !! accumulation of ustar_gustless
-  logical, optional,     intent(in) :: cfc     !< If present and true, allocate cfc fluxes
+  logical, optional,     intent(in) :: cfc     !< If present and true, allocate fields needed
+                                               !! for cfc surface fluxes
   logical, optional,     intent(in) :: waves   !< If present and true, allocate wave fields
   logical, optional,     intent(in) :: shelf_sfc_accumulation !< If present and true, and shelf is true,
                                                !! then allocate surface flux deposition from the atmosphere
@@ -2998,6 +3225,7 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   logical, optional,     intent(in) :: hevap   !< If present and true, allocate heat content evap.
                                                !! This field must be allocated when enthalpy is provided
                                                !! via coupler.
+  logical, optional,     intent(in) :: tau_mag !< If present and true, allocate tau_mag and related fields
 
   ! Local variables
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
@@ -3015,6 +3243,11 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
 
   call myAlloc(fluxes%ustar,isd,ied,jsd,jed, ustar)
   call myAlloc(fluxes%ustar_gustless,isd,ied,jsd,jed, ustar)
+  call myAlloc(fluxes%tau_mag,isd,ied,jsd,jed, ustar)
+
+  ! Note that myAlloc can be called safely multiple times for the same pointer.
+  call myAlloc(fluxes%tau_mag,isd,ied,jsd,jed, tau_mag)
+  call myAlloc(fluxes%tau_mag_gustless,isd,ied,jsd,jed, tau_mag)
 
   call myAlloc(fluxes%evap,isd,ied,jsd,jed, water)
   call myAlloc(fluxes%lprec,isd,ied,jsd,jed, water)
@@ -3064,8 +3297,6 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   call myAlloc(fluxes%mass_berg,isd,ied,jsd,jed, iceberg)
 
   !These fields should only on allocated when USE_CFC_CAP is activated.
-  call myAlloc(fluxes%cfc11_flux,isd,ied,jsd,jed, cfc)
-  call myAlloc(fluxes%cfc12_flux,isd,ied,jsd,jed, cfc)
   call myAlloc(fluxes%ice_fraction,isd,ied,jsd,jed, cfc)
   call myAlloc(fluxes%u10_sqr,isd,ied,jsd,jed, cfc)
 
@@ -3076,20 +3307,23 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   if (present(fix_accum_bug)) fluxes%gustless_accum_bug = .not.fix_accum_bug
 end subroutine allocate_forcing_by_group
 
+!> Allocate elements of a new forcing type based on their status in an existing type.
+subroutine allocate_forcing_by_ref(fluxes_ref, G, fluxes, turns)
+  type(forcing),         intent(in)  :: fluxes_ref !< Reference fluxes
+  type(ocean_grid_type), intent(in)  :: G          !< Grid metric of target fluxes
+  type(forcing),         intent(out) :: fluxes     !< Target fluxes
+  integer,     optional, intent(in)  :: turns      !< If present, the number of counterclockwise
+                                                   !! quarter turns to use on the new grid.
 
-subroutine allocate_forcing_by_ref(fluxes_ref, G, fluxes)
-  type(forcing), intent(in) :: fluxes_ref  !< Reference fluxes
-  type(ocean_grid_type), intent(in) :: G        !< Grid metric of target fluxes
-  type(forcing), intent(out) :: fluxes     !< Target fluxes
+  logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf
+  logical :: do_iceberg, do_heat_added, do_buoy
+  logical :: even_turns  ! True if turns is absent or even
 
-  logical :: do_ustar, do_water, do_heat, do_salt, do_press, do_shelf, &
-      do_iceberg, do_heat_added, do_buoy
-
-  call get_forcing_groups(fluxes_ref, do_water, do_heat, do_ustar, do_press, &
+  call get_forcing_groups(fluxes_ref, do_water, do_heat, do_ustar, do_taumag, do_press, &
       do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
 
   call allocate_forcing_type(G, fluxes, do_water, do_heat, do_ustar, &
-      do_press, do_shelf, do_iceberg, do_salt)
+      do_press, do_shelf, do_iceberg, do_salt, tau_mag=do_taumag)
 
   ! The following fluxes would typically be allocated by the driver
   call myAlloc(fluxes%sw_vis_dir, G%isd, G%ied, G%jsd, G%jed, &
@@ -3122,13 +3356,26 @@ subroutine allocate_forcing_by_ref(fluxes_ref, G, fluxes)
   ! This flag would normally be set by a control flag in allocate_forcing_type.
   ! Here we copy the flag from the reference forcing.
   fluxes%gustless_accum_bug = fluxes_ref%gustless_accum_bug
+
+  if (coupler_type_initialized(fluxes_ref%tr_fluxes)) then
+    ! The data fields in the coupler_2d_bc_type are never rotated.
+    even_turns = .true. ; if (present(turns)) even_turns = (modulo(turns, 2) == 0)
+    if (even_turns) then
+      call coupler_type_spawn(fluxes_ref%tr_fluxes, fluxes%tr_fluxes, &
+                (/G%isc,G%isc,G%iec,G%iec/), (/G%jsc,G%jsc,G%jec,G%jec/))
+    else
+      call coupler_type_spawn(fluxes_ref%tr_fluxes, fluxes%tr_fluxes, &
+                (/G%jsc,G%jsc,G%jec,G%jec/), (/G%isc,G%isc,G%iec,G%iec/))
+    endif
+  endif
+
 end subroutine allocate_forcing_by_ref
 
 
 !> Conditionally allocate fields within the mechanical forcing type using
 !! control flags.
 subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
-                                          press, iceberg, waves, num_stk_bands)
+                                          press, iceberg, waves, num_stk_bands, tau_mag)
   type(ocean_grid_type), intent(in) :: G       !< Ocean grid structure
   type(mech_forcing), intent(inout) :: forces  !< Forcing fields structure
 
@@ -3139,6 +3386,7 @@ subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
   logical, optional,     intent(in) :: iceberg !< If present and true, allocate forces for icebergs
   logical, optional,     intent(in) :: waves   !< If present and true, allocate wave fields
   integer, optional,     intent(in) :: num_stk_bands !< Number of Stokes bands to allocate
+  logical, optional,     intent(in) :: tau_mag !< If present and true, allocate tau_mag
 
   ! Local variables
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
@@ -3150,6 +3398,9 @@ subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
   call myAlloc(forces%tauy,isd,ied,JsdB,JedB, stress)
 
   call myAlloc(forces%ustar,isd,ied,jsd,jed, ustar)
+  call myAlloc(forces%tau_mag,isd,ied,jsd,jed, ustar)
+  ! Note that myAlloc can be called safely multiple times for the same pointer.
+  call myAlloc(forces%tau_mag,isd,ied,jsd,jed, tau_mag)
 
   call myAlloc(forces%p_surf,isd,ied,jsd,jed, press)
   call myAlloc(forces%p_surf_full,isd,ied,jsd,jed, press)
@@ -3189,24 +3440,25 @@ subroutine allocate_mech_forcing_from_ref(forces_ref, G, forces)
   type(ocean_grid_type), intent(in) :: G      !< Grid metric of target forcing
   type(mech_forcing), intent(out) :: forces   !< Mechanical forcing fields
 
-  logical :: do_stress, do_ustar, do_shelf, do_press, do_iceberg
+  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg
 
   ! Identify the active fields in the reference forcing
-  call get_mech_forcing_groups(forces_ref, do_stress, do_ustar, do_shelf, &
-                              do_press, do_iceberg)
+  call get_mech_forcing_groups(forces_ref, do_stress, do_ustar, do_tau_mag, do_shelf, &
+                               do_press, do_iceberg)
 
   call allocate_mech_forcing(G, forces, do_stress, do_ustar, do_shelf, &
-                             do_press, do_iceberg)
+                             do_press, do_iceberg, tau_mag=do_tau_mag)
 end subroutine allocate_mech_forcing_from_ref
 
 
 !> Return flags indicating which groups of forcings are allocated
-subroutine get_forcing_groups(fluxes, water, heat, ustar, press, shelf, &
+subroutine get_forcing_groups(fluxes, water, heat, ustar, tau_mag, press, shelf, &
                              iceberg, salt, heat_added, buoy)
   type(forcing), intent(in) :: fluxes  !< Reference flux fields
   logical, intent(out) :: water   !< True if fluxes contains water-based fluxes
   logical, intent(out) :: heat    !< True if fluxes contains heat-based fluxes
-  logical, intent(out) :: ustar   !< True if fluxes contains ustar fluxes
+  logical, intent(out) :: ustar   !< True if fluxes contains ustar
+  logical, intent(out) :: tau_mag !< True if fluxes contains tau_mag
   logical, intent(out) :: press   !< True if fluxes contains surface pressure
   logical, intent(out) :: shelf   !< True if fluxes contains ice shelf fields
   logical, intent(out) :: iceberg !< True if fluxes contains iceberg fluxes
@@ -3218,8 +3470,8 @@ subroutine get_forcing_groups(fluxes, water, heat, ustar, press, shelf, &
   !   to some degree.  But since this would be enforced at the driver level,
   !   we handle them here as independent flags.
 
-  ustar = associated(fluxes%ustar) &
-      .and. associated(fluxes%ustar_gustless)
+  ustar = associated(fluxes%ustar) .and. associated(fluxes%ustar_gustless)
+  tau_mag = associated(fluxes%tau_mag) .and. associated(fluxes%tau_mag_gustless)
   ! TODO: Check for all associated fields, but for now just check one as a marker
   water = associated(fluxes%evap)
   heat = associated(fluxes%seaice_melt_heat)
@@ -3233,10 +3485,11 @@ end subroutine get_forcing_groups
 
 
 !> Return flags indicating which groups of mechanical forcings are allocated
-subroutine get_mech_forcing_groups(forces, stress, ustar, shelf, press, iceberg)
+subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press, iceberg)
   type(mech_forcing), intent(in) :: forces  !< Reference forcing fields
   logical, intent(out) :: stress  !< True if forces contains wind stress fields
   logical, intent(out) :: ustar   !< True if forces contains ustar field
+  logical, intent(out) :: tau_mag !< True if forces contains tau_mag field
   logical, intent(out) :: shelf   !< True if forces contains ice shelf fields
   logical, intent(out) :: press   !< True if forces contains pressure fields
   logical, intent(out) :: iceberg !< True if forces contains iceberg fields
@@ -3244,6 +3497,7 @@ subroutine get_mech_forcing_groups(forces, stress, ustar, shelf, press, iceberg)
   stress = associated(forces%taux) &
       .and. associated(forces%tauy)
   ustar = associated(forces%ustar)
+  tau_mag = associated(forces%tau_mag)
   shelf = associated(forces%rigidity_ice_u) &
       .and. associated(forces%rigidity_ice_v) &
       .and. associated(forces%frac_shelf_u) &
@@ -3258,7 +3512,7 @@ end subroutine get_mech_forcing_groups
 
 !> Allocates and zeroes-out array.
 subroutine myAlloc(array, is, ie, js, je, flag)
-  real, dimension(:,:), pointer :: array !< Array to be allocated
+  real, dimension(:,:), pointer :: array !< Array to be allocated [arbitrary]
   integer,           intent(in) :: is !< Start i-index
   integer,           intent(in) :: ie !< End i-index
   integer,           intent(in) :: js !< Start j-index
@@ -3274,8 +3528,10 @@ end subroutine myAlloc
 subroutine deallocate_forcing_type(fluxes)
   type(forcing), intent(inout) :: fluxes !< Forcing fields structure
 
+  !if (associated(fluxes%omega_w2x))            deallocate(fluxes%omega_w2x)
   if (associated(fluxes%ustar))                deallocate(fluxes%ustar)
   if (associated(fluxes%ustar_gustless))       deallocate(fluxes%ustar_gustless)
+  if (associated(fluxes%tau_mag))              deallocate(fluxes%tau_mag)
   if (associated(fluxes%buoy))                 deallocate(fluxes%buoy)
   if (associated(fluxes%sw))                   deallocate(fluxes%sw)
   if (associated(fluxes%seaice_melt_heat))     deallocate(fluxes%seaice_melt_heat)
@@ -3322,8 +3578,6 @@ subroutine deallocate_forcing_type(fluxes)
   if (associated(fluxes%mass_berg))            deallocate(fluxes%mass_berg)
   if (associated(fluxes%ice_fraction))         deallocate(fluxes%ice_fraction)
   if (associated(fluxes%u10_sqr))              deallocate(fluxes%u10_sqr)
-  if (associated(fluxes%cfc11_flux))           deallocate(fluxes%cfc11_flux)
-  if (associated(fluxes%cfc12_flux))           deallocate(fluxes%cfc12_flux)
 
   call coupler_type_destructor(fluxes%tr_fluxes)
 
@@ -3334,9 +3588,11 @@ end subroutine deallocate_forcing_type
 subroutine deallocate_mech_forcing(forces)
   type(mech_forcing), intent(inout) :: forces  !< Forcing fields structure
 
-  if (associated(forces%taux))  deallocate(forces%taux)
-  if (associated(forces%tauy))  deallocate(forces%tauy)
-  if (associated(forces%ustar)) deallocate(forces%ustar)
+  !if (associated(forces%omega_w2x))      deallocate(forces%omega_w2x)
+  if (associated(forces%taux))           deallocate(forces%taux)
+  if (associated(forces%tauy))           deallocate(forces%tauy)
+  if (associated(forces%ustar))          deallocate(forces%ustar)
+  if (associated(forces%tau_mag))        deallocate(forces%tau_mag)
   if (associated(forces%p_surf))         deallocate(forces%p_surf)
   if (associated(forces%p_surf_full))    deallocate(forces%p_surf_full)
   if (associated(forces%net_mass_src))   deallocate(forces%net_mass_src)
@@ -3356,16 +3612,21 @@ subroutine rotate_forcing(fluxes_in, fluxes, turns)
   type(forcing), intent(inout) :: fluxes      !< Rotated forcing structure
   integer, intent(in) :: turns                !< Number of quarter turns
 
-  logical :: do_ustar, do_water, do_heat, do_salt, do_press, do_shelf, &
+  logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf, &
       do_iceberg, do_heat_added, do_buoy
 
-  call get_forcing_groups(fluxes_in, do_water, do_heat, do_ustar, do_press, &
+  call get_forcing_groups(fluxes_in, do_water, do_heat, do_ustar, do_taumag, do_press, &
       do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
 
-  if (do_ustar) then
+  if (associated(fluxes_in%ustar)) &
     call rotate_array(fluxes_in%ustar, turns, fluxes%ustar)
+  if (associated(fluxes_in%ustar_gustless)) &
     call rotate_array(fluxes_in%ustar_gustless, turns, fluxes%ustar_gustless)
-  endif
+
+  if (associated(fluxes_in%tau_mag)) &
+    call rotate_array(fluxes_in%tau_mag, turns, fluxes%tau_mag)
+  if (associated(fluxes_in%tau_mag_gustless)) &
+    call rotate_array(fluxes_in%tau_mag_gustless, turns, fluxes%tau_mag_gustless)
 
   if (do_water) then
     call rotate_array(fluxes_in%evap, turns, fluxes%evap)
@@ -3457,9 +3718,11 @@ subroutine rotate_forcing(fluxes_in, fluxes, turns)
   if (associated(fluxes_in%ustar_tidal)) &
     call rotate_array(fluxes_in%ustar_tidal, turns, fluxes%ustar_tidal)
 
-  ! TODO: tracer flux rotation
-  if (coupler_type_initialized(fluxes%tr_fluxes)) &
-    call MOM_error(FATAL, "Rotation of tracer BC fluxes not yet implemented.")
+  ! NOTE: Tracer fields are handled by FMS, so are left unrotated.  Any
+  ! reads/writes to tr_fields must be appropriately rotated.
+  if (coupler_type_initialized(fluxes%tr_fluxes)) then
+    call coupler_type_copy_data(fluxes_in%tr_fluxes, fluxes%tr_fluxes)
+  endif
 
   ! Scalars and flags
   fluxes%accumulate_p_surf = fluxes_in%accumulate_p_surf
@@ -3486,17 +3749,19 @@ subroutine rotate_mech_forcing(forces_in, turns, forces)
   integer, intent(in) :: turns                  !< Number of quarter-turns
   type(mech_forcing), intent(inout) :: forces   !< Forcing on the rotated domain
 
-  logical :: do_stress, do_ustar, do_shelf, do_press, do_iceberg
+  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg
 
-  call get_mech_forcing_groups(forces_in, do_stress, do_ustar, do_shelf, &
+  call get_mech_forcing_groups(forces_in, do_stress, do_ustar, do_tau_mag, do_shelf, &
                               do_press, do_iceberg)
 
   if (do_stress) &
     call rotate_vector(forces_in%taux, forces_in%tauy, turns, &
         forces%taux, forces%tauy)
 
-  if (do_ustar) &
+  if (associated(forces_in%ustar)) &
     call rotate_array(forces_in%ustar, turns, forces%ustar)
+  if (associated(forces_in%tau_mag)) &
+    call rotate_array(forces_in%tau_mag, turns, forces%tau_mag)
 
   if (do_shelf) then
     call rotate_array_pair( &
@@ -3510,10 +3775,18 @@ subroutine rotate_mech_forcing(forces_in, turns, forces)
   endif
 
   if (do_press) then
-    ! NOTE: p_surf_SSH either points to p_surf or p_surf_full
     call rotate_array(forces_in%p_surf, turns, forces%p_surf)
     call rotate_array(forces_in%p_surf_full, turns, forces%p_surf_full)
     call rotate_array(forces_in%net_mass_src, turns, forces%net_mass_src)
+
+    ! p_surf_SSH points to either p_surf or p_surf_full
+    if (associated(forces_in%p_surf_SSH, forces_in%p_surf)) then
+      forces%p_surf_SSH => forces%p_surf
+    else if (associated(forces_in%p_surf_SSH, forces_in%p_surf_full)) then
+      forces%p_surf_SSH => forces%p_surf_full
+    else
+      forces%p_surf_SSH => null()
+    endif
   endif
 
   if (do_iceberg) then
@@ -3540,8 +3813,9 @@ subroutine homogenize_mech_forcing(forces, G, US, Rho0, UpdateUstar)
                                                  !! or updated from mean tau.
 
   real :: tx_mean, ty_mean ! Mean wind stresses [R L Z T-2 ~> Pa]
+  real :: tau_mag      ! The magnitude of the wind stresses [R L Z T-2 ~> Pa]
   real :: Irho0        ! Inverse of the mean density rescaled to [Z L-1 R-1 ~> m3 kg-1]
-  logical :: do_stress, do_ustar, do_shelf, do_press, do_iceberg, tau2ustar
+  logical :: do_stress, do_ustar, do_taumag, do_shelf, do_press, do_iceberg, tau2ustar
   integer :: i, j, is, ie, js, je, isB, ieB, jsB, jeB
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   isB = G%iscB ; ieB = G%iecB ; jsB = G%jscB ; jeB = G%jecB
@@ -3551,29 +3825,37 @@ subroutine homogenize_mech_forcing(forces, G, US, Rho0, UpdateUstar)
   tau2ustar = .false.
   if (present(UpdateUstar)) tau2ustar = UpdateUstar
 
-  call get_mech_forcing_groups(forces, do_stress, do_ustar, do_shelf, &
+  call get_mech_forcing_groups(forces, do_stress, do_ustar, do_taumag, do_shelf, &
                               do_press, do_iceberg)
 
   if (do_stress) then
-    tx_mean = global_area_mean_u(forces%taux, G, tmp_scale=US%Z_to_L*US%RL2_T2_to_Pa)
+    tx_mean = global_area_mean_u(forces%taux, G, tmp_scale=US%RLZ_T2_to_Pa)
     do j=js,je ; do i=isB,ieB
       if (G%mask2dCu(I,j) > 0.0) forces%taux(I,j) = tx_mean
     enddo ; enddo
-    ty_mean = global_area_mean_v(forces%tauy, G, tmp_scale=US%Z_to_L*US%RL2_T2_to_Pa)
+    ty_mean = global_area_mean_v(forces%tauy, G, tmp_scale=US%RLZ_T2_to_Pa)
     do j=jsB,jeB ; do i=is,ie
       if (G%mask2dCv(i,J) > 0.0) forces%tauy(i,J) = ty_mean
     enddo ; enddo
     if (tau2ustar) then
-      do j=js,je ; do i=is,ie
-        if (G%mask2dT(i,j) > 0.0) forces%ustar(i,j) = sqrt(sqrt(tx_mean**2 + ty_mean**2)*Irho0)
-      enddo ; enddo
+      tau_mag = sqrt(tx_mean**2 + ty_mean**2)
+      if (associated(forces%tau_mag)) then ; do j=js,je ; do i=is,ie ; if (G%mask2dT(i,j) > 0.0) then
+        forces%tau_mag(i,j) = tau_mag
+      endif ; enddo ; enddo ; endif
+      if (associated(forces%ustar)) then ; do j=js,je ; do i=is,ie ; if (G%mask2dT(i,j) > 0.0) then
+        forces%ustar(i,j) = sqrt(tau_mag * Irho0)
+      endif ; enddo ; enddo ; endif
     else
-      call homogenize_field_t(forces%ustar, G, tmp_scale=US%Z_to_m*US%s_to_T)
+      if (associated(forces%ustar)) &
+        call homogenize_field_t(forces%ustar, G, tmp_scale=US%Z_to_m*US%s_to_T)
+      if (associated(forces%tau_mag)) &
+        call homogenize_field_t(forces%tau_mag, G, tmp_scale=US%RLZ_T2_to_Pa)
     endif
   else
-    if (do_ustar) then
+    if (associated(forces%ustar)) &
       call homogenize_field_t(forces%ustar, G, tmp_scale=US%Z_to_m*US%s_to_T)
-    endif
+    if (associated(forces%tau_mag)) &
+      call homogenize_field_t(forces%tau_mag, G, tmp_scale=US%RLZ_T2_to_Pa)
   endif
 
   if (do_shelf) then
@@ -3604,16 +3886,21 @@ subroutine homogenize_forcing(fluxes, G, GV, US)
   type(verticalGrid_type), intent(in)    :: GV     !< ocean vertical grid structure
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
 
-  logical :: do_ustar, do_water, do_heat, do_salt, do_press, do_shelf, &
-      do_iceberg, do_heat_added, do_buoy
+  logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf
+  logical :: do_iceberg, do_heat_added, do_buoy
 
-  call get_forcing_groups(fluxes, do_water, do_heat, do_ustar, do_press, &
+  call get_forcing_groups(fluxes, do_water, do_heat, do_ustar, do_taumag, do_press, &
       do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
 
-  if (do_ustar) then
+  if (associated(fluxes%ustar)) &
     call homogenize_field_t(fluxes%ustar, G, tmp_scale=US%Z_to_m*US%s_to_T)
+  if (associated(fluxes%ustar_gustless)) &
     call homogenize_field_t(fluxes%ustar_gustless, G, tmp_scale=US%Z_to_m*US%s_to_T)
-  endif
+
+  if (associated(fluxes%tau_mag)) &
+    call homogenize_field_t(fluxes%tau_mag, G, tmp_scale=US%RLZ_T2_to_Pa)
+  if (associated(fluxes%tau_mag_gustless)) &
+    call homogenize_field_t(fluxes%tau_mag_gustless, G, tmp_scale=US%RLZ_T2_to_Pa)
 
   if (do_water) then
     call homogenize_field_t(fluxes%evap, G, tmp_scale=US%RZ_T_to_kg_m2s)
@@ -3713,11 +4000,12 @@ end subroutine homogenize_forcing
 
 subroutine homogenize_field_t(var, G, tmp_scale)
   type(ocean_grid_type),            intent(in)    :: G   !< The ocean's grid structure
-  real, dimension(SZI_(G),SZJ_(G)), intent(inout) :: var !< The variable to homogenize
-  real,                   optional, intent(in)    :: tmp_scale !< A temporary rescaling factor for the
-                                                         !! variable that is reversed in the return value
+  real, dimension(SZI_(G),SZJ_(G)), intent(inout) :: var !< The variable to homogenize [A ~> a]
+  real,                    optional, intent(in)    :: tmp_scale !< A temporary rescaling factor for the
+                                                         !! variable that is reversed in the
+                                                         !! return value [a A-1 ~> 1]
 
-  real    :: avg   ! Global average of var, in the same units as var
+  real    :: avg   ! Global average of var, in the same units as var [A ~> a]
   integer :: i, j, is, ie, js, je
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
@@ -3730,11 +4018,12 @@ end subroutine homogenize_field_t
 
 subroutine homogenize_field_v(var, G, tmp_scale)
   type(ocean_grid_type),             intent(in)    :: G    !< The ocean's grid structure
-  real, dimension(SZI_(G),SZJB_(G)), intent(inout) :: var  !< The variable to homogenize
+  real, dimension(SZI_(G),SZJB_(G)), intent(inout) :: var  !< The variable to homogenize [A ~> a]
   real,                    optional, intent(in)    :: tmp_scale !< A temporary rescaling factor for the
-                                                         !! variable that is reversed in the return value
+                                                           !! variable that is reversed in the
+                                                           !! return value [a A-1 ~> 1]
 
-  real    :: avg   ! Global average of var, in the same units as var
+  real    :: avg   ! Global average of var, in the same units as var [A ~> a]
   integer :: i, j, is, ie, jsB, jeB
   is = G%isc ; ie = G%iec ; jsB = G%jscB ; jeB = G%jecB
 
@@ -3747,11 +4036,12 @@ end subroutine homogenize_field_v
 
 subroutine homogenize_field_u(var, G, tmp_scale)
   type(ocean_grid_type),             intent(in)    :: G    !< The ocean's grid structure
-  real, dimension(SZI_(G),SZJB_(G)), intent(inout) :: var  !< The variable to homogenize
+  real, dimension(SZI_(G),SZJB_(G)), intent(inout) :: var  !< The variable to homogenize [A ~> a]
   real,                    optional, intent(in)    :: tmp_scale !< A temporary rescaling factor for the
-                                                         !! variable that is reversed in the return value
+                                                           !! variable that is reversed in the
+                                                           !! return value [a A-1 ~> 1]
 
-  real    :: avg   ! Global average of var, in the same units as var
+  real    :: avg   ! Global average of var, in the same units as var [A ~> a]
   integer :: i, j, isB, ieB, js, je
   isB = G%iscB ; ieB = G%iecB ; js = G%jsc ; je = G%jec
 

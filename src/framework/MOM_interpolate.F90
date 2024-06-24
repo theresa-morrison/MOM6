@@ -9,12 +9,14 @@ use MOM_interp_infra,    only : time_interp_extern, init_external_field=>init_ex
 use MOM_interp_infra,    only : time_interp_external_init=>time_interp_extern_init
 use MOM_interp_infra,    only : horiz_interp_type, get_external_field_info
 use MOM_interp_infra,    only : run_horiz_interp, build_horiz_interp_weights
+use MOM_interp_infra,    only : external_field
 use MOM_time_manager,    only : time_type
 
 implicit none ; private
 
 public :: time_interp_external, init_external_field, time_interp_external_init, get_external_field_info
 public :: horiz_interp_type, run_horiz_interp, build_horiz_interp_weights
+public :: external_field
 
 !> Read a field based on model time, and rotate to the model domain.
 interface time_interp_external
@@ -26,16 +28,15 @@ end interface time_interp_external
 contains
 
 !> Read a scalar field based on model time.
-subroutine time_interp_external_0d(field_id, time, data_in, verbose, scale)
-  integer,           intent(in)    :: field_id !< The integer index of the external field returned
-                                               !! from a previous call to init_external_field()
+subroutine time_interp_external_0d(field, time, data_in, verbose, scale)
+  type(external_field), intent(in) :: field    !< Handle for time interpolated field
   type(time_type),   intent(in)    :: time     !< The target time for the data
-  real,              intent(inout) :: data_in  !< The interpolated value
+  real,              intent(inout) :: data_in  !< The interpolated value in arbitrary units [A ~> a]
   logical, optional, intent(in)    :: verbose  !< If true, write verbose output for debugging
-  real,     optional, intent(in)    :: scale   !< A scaling factor that new values of data_in are
-                                               !! multiplied by before it is returned
-  real :: data_in_pre_scale ! The input data before rescaling
-  real :: I_scale ! The inverse of scale
+  real,    optional, intent(in)    :: scale    !< A scaling factor that new values of data_in are
+                                               !! multiplied by before it is returned [A a-1 ~> 1]
+  real :: data_in_pre_scale ! The input data before rescaling [a]
+  real :: I_scale ! The inverse of scale [a A-1 ~> 1]
 
   ! Store the input value in case the scaling factor is perfectly invertable.
   data_in_pre_scale = data_in
@@ -48,7 +49,7 @@ subroutine time_interp_external_0d(field_id, time, data_in, verbose, scale)
     data_in = data_in * I_scale
   endif ; endif
 
-  call time_interp_extern(field_id, time, data_in, verbose=verbose)
+  call time_interp_extern(field, time, data_in, verbose=verbose)
 
   if (present(scale)) then ; if (scale /= 1.0) then
     ! Rescale data that has been newly set and restore the scaling of unset data.
@@ -63,12 +64,12 @@ end subroutine time_interp_external_0d
 
 !> Read a 2d field from an external based on model time, potentially including horizontal
 !! interpolation and rotation of the data
-subroutine time_interp_external_2d(field_id, time, data_in, interp, &
+subroutine time_interp_external_2d(field, time, data_in, interp, &
                                    verbose, horz_interp, mask_out, turns, scale)
-  integer,              intent(in)    :: field_id !< The integer index of the external field returned
-                                                  !! from a previous call to init_external_field()
+  type(external_field), intent(in)    :: field    !< Handle for time interpolated field
   type(time_type),      intent(in)    :: time     !< The target time for the data
-  real, dimension(:,:), intent(inout) :: data_in  !< The array in which to store the interpolated values
+  real, dimension(:,:), intent(inout) :: data_in  !< The array in which to store the interpolated
+                                                  !! values in arbitrary units [A ~> a]
   integer,    optional, intent(in)    :: interp   !< A flag indicating the temporal interpolation method
   logical,    optional, intent(in)    :: verbose  !< If true, write verbose output for debugging
   type(horiz_interp_type), &
@@ -77,11 +78,11 @@ subroutine time_interp_external_2d(field_id, time, data_in, interp, &
               optional, intent(out)   :: mask_out !< An array that is true where there is valid data
   integer,    optional, intent(in)    :: turns    !< Number of quarter turns to rotate the data
   real,       optional, intent(in)    :: scale    !< A scaling factor that new values of data_in are
-                                                  !! multiplied by before it is returned
+                                                  !! multiplied by before it is returned [A a-1 ~> 1]
 
-  real, allocatable :: data_in_pre_scale(:,:) ! The input data before rescaling
-  real, allocatable :: data_pre_rot(:,:)      ! The unscaled input data before rotation
-  real    :: I_scale ! The inverse of scale
+  real, allocatable :: data_in_pre_scale(:,:) ! The input data before rescaling [a]
+  real, allocatable :: data_pre_rot(:,:)      ! The unscaled input data before rotation [a]
+  real    :: I_scale ! The inverse of scale [a A-1 ~> 1]
   integer :: qturns ! The number of quarter turns to rotate the data
   integer :: i, j
 
@@ -105,11 +106,11 @@ subroutine time_interp_external_2d(field_id, time, data_in, interp, &
   qturns = 0 ; if (present(turns)) qturns = modulo(turns, 4)
 
   if (qturns == 0) then
-    call time_interp_extern(field_id, time, data_in, interp=interp, &
+    call time_interp_extern(field, time, data_in, interp=interp, &
                             verbose=verbose, horz_interp=horz_interp)
   else
     call allocate_rotated_array(data_in, [1,1], -qturns, data_pre_rot)
-    call time_interp_extern(field_id, time, data_pre_rot, interp=interp, &
+    call time_interp_extern(field, time, data_pre_rot, interp=interp, &
                             verbose=verbose, horz_interp=horz_interp)
     call rotate_array(data_pre_rot, turns, data_in)
     deallocate(data_pre_rot)
@@ -136,12 +137,12 @@ end subroutine time_interp_external_2d
 
 
 !> Read a 3d field based on model time, and rotate to the model grid
-subroutine time_interp_external_3d(field_id, time, data_in, interp, &
+subroutine time_interp_external_3d(field, time, data_in, interp, &
                                    verbose, horz_interp, mask_out, turns, scale)
-  integer,                intent(in)    :: field_id !< The integer index of the external field returned
-                                                    !! from a previous call to init_external_field()
+  type(external_field), intent(in)      :: field    !< Handle for time interpolated field
   type(time_type),        intent(in)    :: time     !< The target time for the data
-  real, dimension(:,:,:), intent(inout) :: data_in  !< The array in which to store the interpolated values
+  real, dimension(:,:,:), intent(inout) :: data_in  !< The array in which to store the interpolated
+                                                    !! values in arbitrary units [A ~> a]
   integer,      optional, intent(in)    :: interp   !< A flag indicating the temporal interpolation method
   logical,      optional, intent(in)    :: verbose  !< If true, write verbose output for debugging
   type(horiz_interp_type), &
@@ -150,11 +151,11 @@ subroutine time_interp_external_3d(field_id, time, data_in, interp, &
                 optional, intent(out)   :: mask_out !< An array that is true where there is valid data
   integer,      optional, intent(in)    :: turns    !< Number of quarter turns to rotate the data
   real,         optional, intent(in)    :: scale    !< A scaling factor that new values of data_in are
-                                                    !! multiplied by before it is returned
+                                                    !! multiplied by before it is returned [A a-1 ~> 1]
 
-  real, allocatable :: data_in_pre_scale(:,:,:) ! The input data before rescaling
-  real, allocatable :: data_pre_rot(:,:,:)      ! The unscaled input data before rotation
-  real    :: I_scale ! The inverse of scale
+  real, allocatable :: data_in_pre_scale(:,:,:) ! The input data before rescaling [a]
+  real, allocatable :: data_pre_rot(:,:,:)      ! The unscaled input data before rotation [a]
+  real    :: I_scale ! The inverse of scale [a A-1 ~> 1]
   integer :: qturns  ! The number of quarter turns to rotate the data
   integer :: i, j, k
 
@@ -178,11 +179,11 @@ subroutine time_interp_external_3d(field_id, time, data_in, interp, &
   qturns = 0 ; if (present(turns)) qturns = modulo(turns, 4)
 
   if (qturns == 0) then
-    call time_interp_extern(field_id, time, data_in, interp=interp, &
+    call time_interp_extern(field, time, data_in, interp=interp, &
                             verbose=verbose, horz_interp=horz_interp)
   else
     call allocate_rotated_array(data_in, [1,1,1], -qturns, data_pre_rot)
-    call time_interp_extern(field_id, time, data_pre_rot, interp=interp, &
+    call time_interp_extern(field, time, data_pre_rot, interp=interp, &
                             verbose=verbose, horz_interp=horz_interp)
     call rotate_array(data_pre_rot, turns, data_in)
     deallocate(data_pre_rot)

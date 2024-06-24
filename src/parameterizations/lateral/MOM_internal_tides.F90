@@ -16,30 +16,37 @@ use MOM_domains, only       : group_pass_type, start_group_pass, complete_group_
 use MOM_error_handler, only : MOM_error, FATAL, WARNING, MOM_mesg, is_root_pe
 use MOM_file_parser, only   : read_param, get_param, log_param, log_version, param_file_type
 use MOM_grid, only          : ocean_grid_type
-use MOM_io, only            : slasher, MOM_read_data, file_exists
+use MOM_int_tide_input, only: int_tide_input_CS, get_input_TKE, get_barotropic_tidal_vel
+use MOM_io, only            : slasher, MOM_read_data, file_exists, axis_info
+use MOM_io, only            : set_axis_info, get_axis_info
 use MOM_restart, only       : register_restart_field, MOM_restart_CS, restart_init, save_restart
+use MOM_restart, only       : lock_check, restart_registry_lock
 use MOM_spatial_means, only : global_area_integral
+use MOM_string_functions, only: extract_real
 use MOM_time_manager, only  : time_type, time_type_to_real, operator(+), operator(/), operator(-)
 use MOM_unit_scaling, only  : unit_scale_type
 use MOM_variables, only     : surface, thermo_var_ptrs
 use MOM_verticalGrid, only  : verticalGrid_type
-use MOM_wave_structure, only: wave_structure_init, wave_structure, wave_structure_CS
+use MOM_wave_speed, only    : wave_speeds, wave_speed_CS, wave_speed_init
 
 implicit none ; private
 
 #include <MOM_memory.h>
 
-public propagate_int_tide !, register_int_tide_restarts
+public propagate_int_tide, register_int_tide_restarts
 public internal_tides_init, internal_tides_end
 public get_lowmode_loss
 
 !> This control structure has parameters for the MOM_internal_tides module
 type, public :: int_tide_CS ; private
+  logical :: initialized = .false.   !< True if this control structure has been initialized.
   logical :: do_int_tides    !< If true, use the internal tide code.
   integer :: nFreq = 0       !< The number of internal tide frequency bands
   integer :: nMode = 1       !< The number of internal tide vertical modes
   integer :: nAngle = 24     !< The number of internal tide angular orientations
   integer :: energized_angle = -1 !< If positive, only this angular band is energized for debugging purposes
+  real    :: uniform_test_cg !< Uniform group velocity of internal tide
+                             !! for testing internal tides [L T-1 ~> m s-1]
   logical :: corner_adv      !< If true, use a corner advection rather than PPM.
   logical :: upwind_1st      !< If true, use a first-order upwind scheme.
   logical :: simple_2nd      !< If true, use a simple second order (arithmetic mean) interpolation
@@ -49,6 +56,9 @@ type, public :: int_tide_CS ; private
                              !! the default is false; it is always true with aggress_adjust.
   logical :: use_PPMang      !< If true, use PPM for advection of energy in angular space.
 
+  real, allocatable, dimension(:,:) :: fraction_tidal_input
+                        !< how the energy from one tidal component is distributed
+                        !! over the various vertical modes, 2d in frequency and mode [nondim]
   real, allocatable, dimension(:,:) :: refl_angle
                         !< local coastline/ridge/shelf angles read from file [rad]
                         ! (could be in G control structure)
@@ -64,9 +74,9 @@ type, public :: int_tide_CS ; private
                         !! is possible (i.e. ridge cells)
                         ! (could be in G control structure)
   real, allocatable, dimension(:,:) :: trans
-                        !< partial transmission coeff for each "coast cell"
+                        !< partial transmission coeff for each "coast cell" [nondim]
   real, allocatable, dimension(:,:) :: residual
-                        !< residual of reflection and transmission coeff for each "coast cell"
+                        !< residual of reflection and transmission coeff for each "coast cell" [nondim]
   real, allocatable, dimension(:,:,:,:) :: cp
                         !< horizontal phase speed [L T-1 ~> m s-1]
   real, allocatable, dimension(:,:,:,:,:) :: TKE_leak_loss
@@ -76,9 +86,10 @@ type, public :: int_tide_CS ; private
   real, allocatable, dimension(:,:,:,:,:) :: TKE_Froude_loss
                         !< energy lost due to wave breaking [R Z3 T-3 ~> W m-2]
   real, allocatable, dimension(:,:) :: TKE_itidal_loss_fixed
-                        !< Fixed part of the energy lost due to small-scale drag [R L-2 Z3 ~> kg m-2] here;
-                        !! This will be multiplied by N and the squared near-bottom velocity to get
-                        !! the energy losses in [R Z3 T-3 ~> W m-2]
+                        !< Fixed part of the energy lost due to small-scale drag [R Z3 L-2 ~> kg m-2] here;
+                        !! This will be multiplied by N and the squared near-bottom velocity (and by
+                        !! the near-bottom density in non-Boussinesq mode) to get the energy losses
+                        !! in [R Z4 H-1 L-2 ~> kg m-2 or m]
   real, allocatable, dimension(:,:,:,:,:) :: TKE_itidal_loss
                         !< energy lost due to small-scale wave drag [R Z3 T-3 ~> W m-2]
   real, allocatable, dimension(:,:,:,:,:) :: TKE_residual_loss
@@ -95,6 +106,20 @@ type, public :: int_tide_CS ; private
                         !! summed over angle, frequency and mode [R Z3 T-3 ~> W m-2]
   real, allocatable, dimension(:,:) :: tot_allprocesses_loss !< Energy loss rates due to all processes,
                         !! summed over angle, frequency and mode [R Z3 T-3 ~> W m-2]
+  real, allocatable, dimension(:,:,:,:) :: w_struct !< Vertical structure of vertical velocity (normalized)
+                        !! for each frequency and each mode [nondim]
+  real, allocatable, dimension(:,:,:,:) :: u_struct !< Vertical structure of horizontal velocity (normalized and
+                        !! divided by layer thicknesses) for each frequency and each mode [Z-1 ~> m-1]
+  real, allocatable, dimension(:,:,:) :: u_struct_max !< Maximum of u_struct,
+                        !! for each mode [Z-1 ~> m-1]
+  real, allocatable, dimension(:,:,:) :: u_struct_bot !< Bottom value of u_struct,
+                        !! for each mode [Z-1 ~> m-1]
+  real, allocatable, dimension(:,:,:) :: int_w2 !< Vertical integral of w_struct squared,
+                        !! for each mode [H ~> m or kg m-2]
+  real, allocatable, dimension(:,:,:) :: int_U2 !< Vertical integral of u_struct squared,
+                        !! for each mode [H Z-2 ~> m-1 or kg m-4]
+  real, allocatable, dimension(:,:,:) :: int_N2w2 !< Depth-integrated Brunt Vaissalla freqency times
+                        !! vertical profile squared, for each mode [H T-2 ~> m s-2 or kg m-2 s-2]
   real :: q_itides      !< fraction of local dissipation [nondim]
   real :: En_sum        !< global sum of energy for use in debugging, in MKS units [J]
   type(time_type), pointer :: Time => NULL() !< A pointer to the model's clock.
@@ -104,7 +129,7 @@ type, public :: int_tide_CS ; private
   real :: cdrag         !< The bottom drag coefficient [nondim].
   real :: drag_min_depth !< The minimum total ocean thickness that will be used in the denominator
                         !! of the quadratic drag terms for internal tides when
-                        !! INTERNAL_TIDE_QUAD_DRAG is true [Z ~> m]
+                        !! INTERNAL_TIDE_QUAD_DRAG is true [H ~> m or kg m-2]
   logical :: apply_background_drag
                         !< If true, apply a drag due to background processes as a sink.
   logical :: apply_bottom_drag
@@ -120,17 +145,33 @@ type, public :: int_tide_CS ; private
   real, allocatable :: En(:,:,:,:,:)
                         !< The internal wave energy density as a function of (i,j,angle,frequency,mode)
                         !! integrated within an angular and frequency band [R Z3 T-2 ~> J m-2]
-  real, allocatable :: En_restart(:,:,:)
-                        !< The internal wave energy density as a function of (i,j,angle); temporary for restart
+  real, allocatable :: En_restart_mode1(:,:,:,:)
+                        !< The internal wave energy density as a function of (i,j,angle,freq)
+                        !! for mode 1 [R Z3 T-2 ~> J m-2]
+  real, allocatable :: En_restart_mode2(:,:,:,:)
+                        !< The internal wave energy density as a function of (i,j,angle,freq)
+                        !! for mode 2 [R Z3 T-2 ~> J m-2]
+  real, allocatable :: En_restart_mode3(:,:,:,:)
+                        !< The internal wave energy density as a function of (i,j,angle,freq)
+                        !! for mode 3 [R Z3 T-2 ~> J m-2]
+  real, allocatable :: En_restart_mode4(:,:,:,:)
+                        !< The internal wave energy density as a function of (i,j,angle,freq)
+                        !! for mode 4 [R Z3 T-2 ~> J m-2]
+  real, allocatable :: En_restart_mode5(:,:,:,:)
+                        !< The internal wave energy density as a function of (i,j,angle,freq)
+                        !! for mode 5 [R Z3 T-2 ~> J m-2]
+
   real, allocatable, dimension(:) :: frequency  !< The frequency of each band [T-1 ~> s-1].
 
+  type(wave_speed_CS) :: wave_speed  !< Wave speed control structure
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to regulate the
                         !! timing of diagnostic output.
-  type(wave_structure_CS) :: wave_struct    !< Wave structure control structure
 
   !>@{ Diag handles
   ! Diag handles relevant to all modes, frequencies, and angles
-  integer :: id_tot_En = -1, id_TKE_itidal_input = -1, id_itide_drag = -1
+  integer :: id_cg1      = -1                 ! diagnostic handle for mode-1 speed
+  integer, allocatable, dimension(:) :: id_cn ! diagnostic handle for all mode speeds
+  integer :: id_tot_En = -1
   integer :: id_refl_pref = -1, id_refl_ang = -1, id_land_mask = -1
   integer :: id_trans = -1, id_residual = -1
   integer :: id_dx_Cv = -1, id_dy_Cu = -1
@@ -141,13 +182,25 @@ type, public :: int_tide_CS ; private
   integer, allocatable, dimension(:,:) :: &
              id_En_mode, &
              id_itidal_loss_mode, &
+             id_leak_loss_mode, &
+             id_quad_loss_mode, &
+             id_Froude_loss_mode, &
+             id_residual_loss_mode, &
              id_allprocesses_loss_mode, &
+             id_itide_drag, &
              id_Ub_mode, &
              id_cp_mode
-  ! Diag handles considering: all modes, freqs, and angles
+  ! Diag handles considering: all modes, frequencies, and angles
   integer, allocatable, dimension(:,:) :: &
              id_En_ang_mode, &
              id_itidal_loss_ang_mode
+  integer, allocatable, dimension(:) :: &
+             id_TKE_itidal_input, &
+             id_Ustruct_mode, &
+             id_Wstruct_mode, &
+             id_int_w2_mode, &
+             id_int_U2_mode, &
+             id_int_N2w2_mode
   !>@}
 
 end type int_tide_CS
@@ -163,8 +216,7 @@ contains
 
 !> Calls subroutines in this file that are needed to refract, propagate,
 !! and dissipate energy density of the internal tide.
-subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
-                              G, GV, US, CS)
+subroutine propagate_int_tide(h, tv, Nb, Rho_bot, dt, G, GV, US, inttide_input_CSp, CS)
   type(ocean_grid_type),            intent(inout) :: G  !< The ocean's grid structure.
   type(verticalGrid_type),          intent(in)    :: GV !< The ocean's vertical grid structure.
   type(unit_scale_type),            intent(in)    :: US !< A dimensional unit scaling type
@@ -172,46 +224,66 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
                                     intent(in)    :: h  !< Layer thicknesses [H ~> m or kg m-2]
   type(thermo_var_ptrs),            intent(in)    :: tv !< Pointer to thermodynamic variables
                                                         !! (needed for wave structure).
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)    :: TKE_itidal_input !< The energy input to the
-                                                        !! internal waves [R Z3 T-3 ~> W m-2].
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)    :: vel_btTide !< Barotropic velocity read
-                                                        !! from file [L T-1 ~> m s-1].
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)    :: Nb !< Near-bottom buoyancy frequency [T-1 ~> s-1].
+  real, dimension(SZI_(G),SZJ_(G)), intent(inout) :: Nb !< Near-bottom buoyancy frequency [T-1 ~> s-1].
+                                                        !! In some cases the input values are used, but in
+                                                        !! others this is set along with the wave speeds.
+  real, dimension(SZI_(G),SZJ_(G)), intent(in)    :: Rho_bot !< Near-bottom density or the Boussinesq
+                                                        !! reference density [R ~> kg m-3].
   real,                             intent(in)    :: dt !< Length of time over which to advance
                                                         !! the internal tides [T ~> s].
+  type(int_tide_input_CS),          intent(in)    :: inttide_input_CSp !< Internal tide input control structure
   type(int_tide_CS),                intent(inout) :: CS !< Internal tide control structure
-  real, dimension(SZI_(G),SZJ_(G),CS%nMode), &
-                                    intent(in)    :: cn !< The internal wave speeds of each
-                                                        !! mode [L T-1 ~> m s-1].
+
   ! Local variables
+  real, dimension(SZI_(G),SZJ_(G),CS%nFreq) :: &
+    TKE_itidal_input, & !< The energy input to the internal waves [R Z3 T-3 ~> W m-2].
+    vel_btTide !< Barotropic velocity read from file [L T-1 ~> m s-1].
+
   real, dimension(SZI_(G),SZJ_(G),2) :: &
-    test
+    test           ! A test unit vector used to determine grid rotation in halos [nondim]
+  real, dimension(SZI_(G),SZJ_(G),CS%nMode) :: &
+    cn             ! baroclinic internal gravity wave speeds for each mode [L T-1 ~> m s-1]
   real, dimension(SZI_(G),SZJ_(G),CS%nFreq,CS%nMode) :: &
     tot_En_mode, & ! energy summed over angles only [R Z3 T-2 ~> J m-2]
     Ub, &          ! near-bottom horizontal velocity of wave (modal) [L T-1 ~> m s-1]
     Umax           ! Maximum horizontal velocity of wave (modal) [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJ_(G),CS%nFreq,CS%nMode) :: &
+    drag_scale     ! bottom drag scale [T-1 ~> s-1]
   real, dimension(SZI_(G),SZJ_(G)) :: &
+    tot_vel_btTide2, &
     tot_En, &      ! energy summed over angles, modes, frequencies [R Z3 T-2 ~> J m-2]
     tot_leak_loss, tot_quad_loss, tot_itidal_loss, tot_Froude_loss, tot_residual_loss, tot_allprocesses_loss, &
                    ! energy loss rates summed over angle, freq, and mode [R Z3 T-3 ~> W m-2]
     htot, &        ! The vertical sum of the layer thicknesses [H ~> m or kg m-2]
-    drag_scale, &  ! bottom drag scale [T-1 ~> s-1]
-    itidal_loss_mode, allprocesses_loss_mode
-                   ! energy loss rates for a given mode and frequency (summed over angles) [R Z3 T-3 ~> W m-2]
-  real :: frac_per_sector, f2, Kmag2
-  real :: I_D_here ! The inverse of the local depth [Z-1 ~> m-1]
-  real :: I_rho0  ! The inverse fo the Boussinesq density [R-1 ~> m3 kg-1]
-  real :: freq2 ! The frequency squared [T-2 ~> s-2]
-  real :: c_phase ! The phase speed [L T-1 ~> m s-1]
+    itidal_loss_mode, & ! Energy lost due to small-scale wave drag, summed over angles [R Z3 T-3 ~> W m-2]
+    leak_loss_mode, &
+    quad_loss_mode, &
+    Froude_loss_mode, &
+    residual_loss_mode, &
+    allprocesses_loss_mode  ! Total energy loss rates for a given mode and frequency (summed over
+                   ! all angles) [R Z3 T-3 ~> W m-2]
+
+  real :: frac_per_sector ! The inverse of the number of angular, modal and frequency bins [nondim]
+  real :: f2       ! The squared Coriolis parameter interpolated to a tracer point [T-2 ~> s-2]
+  real :: Kmag2    ! A squared horizontal wavenumber [L-2 ~> m-2]
+  real :: I_D_here ! The inverse of the local water column thickness [H-1 ~> m-1 or m2 kg-1]
+  real :: I_mass   ! The inverse of the local water mass [R-1 Z-1 ~> m2 kg-1]
+  real :: freq2    ! The frequency squared [T-2 ~> s-2]
+  real :: PE_term  ! total potential energy of profile [R Z ~> kg m-2]
+  real :: KE_term  ! total kinetic energy of profile [R Z ~> kg m-2]
+  real :: U_mag    ! rescaled magnitude of horizontal profile [L Z T-1 ~> m2 s-1]
+  real :: W0       ! rescaled magnitude of vertical profile [Z T-1 ~> m s-1]
+  real :: c_phase  ! The phase speed [L T-1 ~> m s-1]
   real :: loss_rate  ! An energy loss rate [T-1 ~> s-1]
-  real :: Fr2_max
+  real :: Fr2_max    ! The column maximum internal wave Froude number squared [nondim]
   real :: cn_subRO        ! A tiny wave speed to prevent division by zero [L T-1 ~> m s-1]
   real :: en_subRO        ! A tiny energy to prevent division by zero [R Z3 T-2 ~> J m-2]
   real :: En_new, En_check                           ! Energies for debugging [R Z3 T-2 ~> J m-2]
   real :: En_initial, Delta_E_check                  ! Energies for debugging [R Z3 T-2 ~> J m-2]
   real :: TKE_Froude_loss_check, TKE_Froude_loss_tot ! Energy losses for debugging [R Z3 T-3 ~> W m-2]
   character(len=160) :: mesg  ! The text of an error message
-  integer :: a, m, fr, i, j, k, is, ie, js, je, isd, ied, jsd, jed, nAngle, nzm
+  integer :: En_halo_ij_stencil ! The halo size needed for energy advection
+  integer :: a, m, fr, i, j, k, is, ie, js, je, isd, ied, jsd, jed, nAngle
   integer :: id_g, jd_g         ! global (decomp-invar) indices (for debugging)
   type(group_pass_type), save :: pass_test, pass_En
   type(time_type) :: time_end
@@ -219,40 +291,91 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed ; nAngle = CS%NAngle
-  I_rho0 = 1.0 / GV%Rho0
+
   cn_subRO = 1e-30*US%m_s_to_L_T
   en_subRO = 1e-30*US%W_m2_to_RZ3_T3*US%s_to_T
 
-  ! init local arrays
-  drag_scale(:,:) = 0.
+  ! initialize local arrays
+  TKE_itidal_input(:,:,:) = 0.
+  vel_btTide(:,:,:) = 0.
+  tot_vel_btTide2(:,:) = 0.
+  drag_scale(:,:,:,:) = 0.
   Ub(:,:,:,:) = 0.
+  Umax(:,:,:,:) = 0.
+
+  cn(:,:,:) = 0.
+
+  ! Rebuild energy density array from multiple restarts
+  do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+    CS%En(i,j,a,fr,1) = CS%En_restart_mode1(i,j,a,fr)
+  enddo ; enddo ; enddo ; enddo
+
+  if (CS%nMode >= 2) then
+    do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,2) = CS%En_restart_mode2(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+  endif
+
+  if (CS%nMode >= 3) then
+    do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,3) = CS%En_restart_mode3(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+  endif
+
+  if (CS%nMode >= 4) then
+    do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,4) = CS%En_restart_mode4(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+  endif
+
+  if (CS%nMode >= 5) then
+    do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,5) = CS%En_restart_mode5(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+  endif
+
+  ! Set properties related to the internal tides, such as the wave speeds, storing some
+  ! of them in the control structure for this module.
+  if (CS%uniform_test_cg > 0.0) then
+    do m=1,CS%nMode ; cn(:,:,m) = CS%uniform_test_cg ; enddo
+  else
+    call wave_speeds(h, tv, G, GV, US, CS%nMode, cn, CS%wave_speed, &
+                     CS%w_struct, CS%u_struct, CS%u_struct_max, CS%u_struct_bot, &
+                     Nb, CS%int_w2, CS%int_U2, CS%int_N2w2, halo_size=2)
+                   ! The value of halo_size above would have to be larger if there were
+                   ! not a halo update between the calls to propagate_x and propagate_y.
+                   ! It can be 1 point smaller if teleport is not used.
+  endif
 
   ! Set the wave speeds for the modes, using cg(n) ~ cg(1)/n.**********************
   ! This is wrong, of course, but it works reasonably in some cases.
   ! Uncomment if wave_speed is not used to calculate the true values (BDM).
-  !do m=1,CS%nMode ; do j=jsd,jed ; do i=isd,ied
+  !do m=1,CS%nMode ; do j=js-2,je+2 ; do i=is-2,ie+2
   !  cn(i,j,m) = cn(i,j,1) / real(m)
   !enddo ; enddo ; enddo
 
   ! Add the forcing.***************************************************************
+
+  call get_input_TKE(G, TKE_itidal_input, CS%nFreq, inttide_input_CSp)
+
   if (CS%energized_angle <= 0) then
-    frac_per_sector = 1.0 / real(CS%nAngle * CS%nMode * CS%nFreq)
+    frac_per_sector = 1.0 / real(CS%nAngle)
     do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
       f2 = 0.25*((G%CoriolisBu(I,J)**2 + G%CoriolisBu(I-1,J-1)**2) + &
                  (G%CoriolisBu(I-1,J)**2 + G%CoriolisBu(I,J-1)**2))
       if (CS%frequency(fr)**2 > f2) &
         CS%En(i,j,a,fr,m) = CS%En(i,j,a,fr,m) + dt*frac_per_sector*(1.0-CS%q_itides) * &
-                            TKE_itidal_input(i,j)
+                            CS%fraction_tidal_input(fr,m) * TKE_itidal_input(i,j,fr)
     enddo ; enddo ; enddo ; enddo ; enddo
   elseif (CS%energized_angle <= CS%nAngle) then
-    frac_per_sector = 1.0 / real(CS%nMode * CS%nFreq)
+    frac_per_sector = 1.0
     a = CS%energized_angle
     do m=1,CS%nMode ; do fr=1,CS%nFreq ; do j=js,je ; do i=is,ie
       f2 = 0.25*((G%CoriolisBu(I,J)**2 + G%CoriolisBu(I-1,J-1)**2) + &
                  (G%CoriolisBu(I-1,J)**2 + G%CoriolisBu(I,J-1)**2))
       if (CS%frequency(fr)**2 > f2) &
         CS%En(i,j,a,fr,m) = CS%En(i,j,a,fr,m) + dt*frac_per_sector*(1.0-CS%q_itides) * &
-                            TKE_itidal_input(i,j)
+                            CS%fraction_tidal_input(fr,m) * TKE_itidal_input(i,j,fr)
     enddo ; enddo ; enddo ; enddo
   else
     call MOM_error(WARNING, "Internal tide energy is being put into a angular "//&
@@ -272,9 +395,10 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
     call refract(CS%En(:,:,:,fr,m), cn(:,:,m), CS%frequency(fr), 0.5*dt, &
                  G, US, CS%nAngle, CS%use_PPMang)
   enddo ; enddo
+  ! A this point, CS%En is only valid on the computational domain.
 
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
@@ -291,12 +415,18 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
 
   call complete_group_pass(pass_test, G%domain)
 
+  ! Set the halo size to work on, using similar logic to that used in propagate.  This may need
+  ! to be adjusted depending on the advection scheme and whether teleport is used.
+  if (CS%upwind_1st) then ; En_halo_ij_stencil = 2
+  else ; En_halo_ij_stencil = 3 ; endif
+
   ! Rotate points in the halos as necessary.
-  call correct_halo_rotation(CS%En, test, G, CS%nAngle)
+  call correct_halo_rotation(CS%En, test, G, CS%nAngle, halo=En_halo_ij_stencil)
 
   ! Propagate the waves.
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq
 
+    ! initialize residual loss, will be computed in propagate
     CS%TKE_residual_loss(:,:,:,fr,m) = 0.
 
     call propagate(CS%En(:,:,:,fr,m), cn(:,:,m), CS%frequency(fr), dt, &
@@ -304,7 +434,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   enddo ; enddo
 
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset
@@ -320,18 +450,19 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   enddo ; enddo ; enddo
 
   ! Apply the other half of the refraction.
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq
     call refract(CS%En(:,:,:,fr,m), cn(:,:,m), CS%frequency(fr), 0.5*dt, &
                  G, US, CS%NAngle, CS%use_PPMang)
   enddo ; enddo
+  ! A this point, CS%En is only valid on the computational domain.
 
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
         write(mesg,*) 'After second refraction: En<0.0 at ig=', id_g, ', jg=', jd_g, &
-                      'En=',CS%En(i,j,a,fr,m)
+                      'En=', CS%En(i,j,a,fr,m)
         call MOM_error(WARNING, "propagate_int_tide: "//trim(mesg))
         CS%En(i,j,a,fr,m) = 0.0
 !        call MOM_error(FATAL, "propagate_int_tide: stopped due to negative energy.")
@@ -345,8 +476,8 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
       .or. (CS%id_tot_En > 0)) then
     tot_En(:,:) = 0.0
     tot_En_mode(:,:,:,:) = 0.0
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq
-      do j=jsd,jed ; do i=isd,ied ; do a=1,CS%nAngle
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq
+      do j=js,je ; do i=is,ie ; do a=1,CS%nAngle
         tot_En(i,j) = tot_En(i,j) + CS%En(i,j,a,fr,m)
         tot_En_mode(i,j,fr,m) = tot_En_mode(i,j,fr,m) + CS%En(i,j,a,fr,m)
       enddo ; enddo ; enddo
@@ -355,7 +486,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
 
   ! Extract the energy for mixing due to misc. processes (background leakage)------
   if (CS%apply_background_drag) then
-    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
     ! Calculate loss rate and apply loss over the time step ; apply the same drag timescale
     ! to each En component (technically not correct; fix later)
     CS%TKE_leak_loss(i,j,a,fr,m)  = CS%En(i,j,a,fr,m) * CS%decay_rate ! loss rate [R Z3 T-3 ~> W m-2]
@@ -363,7 +494,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
     enddo ; enddo ; enddo ; enddo ; enddo
   endif
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
@@ -379,23 +510,40 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   ! Extract the energy for mixing due to bottom drag-------------------------------
   if (CS%apply_bottom_drag) then
     do j=jsd,jed ; do i=isd,ied ; htot(i,j) = 0.0 ; enddo ; enddo
+
+    call get_barotropic_tidal_vel(G, vel_btTide, CS%nFreq, inttide_input_CSp)
+
+    do fr=1,CS%Nfreq ; do j=jsd,jed ; do i=isd,ied
+      tot_vel_btTide2(i,j) =  tot_vel_btTide2(i,j) + vel_btTide(i,j,fr)**2
+    enddo ; enddo ; enddo
+
     do k=1,GV%ke ; do j=jsd,jed ; do i=isd,ied
       htot(i,j) = htot(i,j) + h(i,j,k)
     enddo ; enddo ; enddo
-    do j=jsd,jed ; do i=isd,ied
-      I_D_here = 1.0 / (max(GV%H_to_Z*htot(i,j), CS%drag_min_depth))
-      drag_scale(i,j) = CS%cdrag * sqrt(max(0.0, US%L_to_Z**2*vel_btTide(i,j)**2 + &
-                        tot_En(i,j) * I_rho0 * I_D_here)) * I_D_here
-    enddo ; enddo
-    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+    if (GV%Boussinesq) then
+      ! This is mathematically equivalent to the form in the option below, but they differ at roundoff.
+      do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do j=jsd,jed ; do i=isd,ied
+        I_D_here = 1.0 / (max(htot(i,j), CS%drag_min_depth))
+        drag_scale(i,j,fr,m) = CS%cdrag * sqrt(max(0.0, US%L_to_Z**2*tot_vel_btTide2(i,j)**2 + &
+                             tot_En_mode(i,j,fr,m) * GV%RZ_to_H * I_D_here)) * GV%Z_to_H*I_D_here
+      enddo ; enddo ; enddo ; enddo
+    else
+      do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do j=jsd,jed ; do i=isd,ied
+        I_mass = GV%RZ_to_H / (max(htot(i,j), CS%drag_min_depth))
+        drag_scale(i,j,fr,m) = (CS%cdrag * (Rho_bot(i,j)*I_mass)) * &
+                              sqrt(max(0.0, US%L_to_Z**2*tot_vel_btTide2(i,j)**2 + &
+                                            tot_En_mode(i,j,fr,m) * I_mass))
+      enddo ; enddo ; enddo ; enddo
+    endif
+    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
       ! Calculate loss rate and apply loss over the time step ; apply the same drag timescale
       ! to each En component (technically not correct; fix later)
-      CS%TKE_quad_loss(i,j,a,fr,m)  = CS%En(i,j,a,fr,m) * drag_scale(i,j) ! loss rate
-      CS%En(i,j,a,fr,m) = CS%En(i,j,a,fr,m) / (1.0 + dt * drag_scale(i,j)) ! implicit update
+      CS%TKE_quad_loss(i,j,a,fr,m)  = CS%En(i,j,a,fr,m) * drag_scale(i,j,fr,m) ! loss rate
+      CS%En(i,j,a,fr,m) = CS%En(i,j,a,fr,m) / (1.0 + dt * drag_scale(i,j,fr,m)) ! implicit update
     enddo ; enddo ; enddo ; enddo ; enddo
   endif
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
@@ -413,27 +561,55 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   ! still need to allow a portion of the extracted energy to go to higher modes.
   ! First, find velocity profiles
   if (CS%apply_wave_drag .or. CS%apply_Froude_drag) then
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq
-      ! Calculate modal structure for given mode and frequency
-      call wave_structure(h, tv, G, GV, US, cn(:,:,m), m, CS%frequency(fr), &
-                          CS%wave_struct, tot_En_mode(:,:,fr,m), full_halos=.true.)
-      ! Pick out near-bottom and max horizontal baroclinic velocity values at each point
-      do j=jsd,jed ; do i=isd,ied
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq
+
+      ! compute near-bottom and max horizontal baroclinic velocity values at each point
+      do j=js,je ; do i=is,ie
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
-        nzm = CS%wave_struct%num_intfaces(i,j)
-        Ub(i,j,fr,m) = CS%wave_struct%Uavg_profile(i,j,nzm)
-        Umax(i,j,fr,m) = maxval(CS%wave_struct%Uavg_profile(i,j,1:nzm))
+
+        ! Calculate wavenumber magnitude
+        freq2 = CS%frequency(fr)**2
+
+        f2 = (0.25*(G%CoriolisBu(I,J) + G%CoriolisBu(max(I-1,1),max(J-1,1)) + &
+                    G%CoriolisBu(I,max(J-1,1)) + G%CoriolisBu(max(I-1,1),J)))**2
+        Kmag2 = (freq2 - f2) / (cn(i,j,m)**2 + cn_subRO**2)
+
+
+        ! Back-calculate amplitude from energy equation
+        if ( (G%mask2dT(i,j) > 0.5) .and. (freq2*Kmag2 > 0.0)) then
+          ! Units here are [R Z ~> kg m-2]
+          KE_term = 0.25*GV%H_to_RZ*( ((freq2 + f2) / (freq2*Kmag2))*US%L_to_Z**2*CS%int_U2(i,j,m) + &
+                                   CS%int_w2(i,j,m) )
+          PE_term = 0.25*GV%H_to_RZ*( CS%int_N2w2(i,j,m) / freq2 )
+
+          if (KE_term + PE_term > 0.0) then
+            W0 = sqrt( tot_En_mode(i,j,fr,m) / (KE_term + PE_term) )
+          else
+            !call MOM_error(WARNING, "MOM internal tides: KE + PE <= 0.0; setting to W0 to 0.0")
+            W0 = 0.0
+          endif
+
+          U_mag = W0 * sqrt((freq2 + f2) / (2.0*freq2*Kmag2))
+          ! scaled maximum tidal velocity
+          Umax(i,j,fr,m) = abs(U_mag * CS%u_struct_max(i,j,m))
+          ! scaled bottom tidal velocity
+          Ub(i,j,fr,m) = abs(U_mag * CS%u_struct_bot(i,j,m))
+        else
+          Umax(i,j,fr,m) = 0.
+          Ub(i,j,fr,m) = 0.
+        endif
+
       enddo ; enddo ! i-loop, j-loop
     enddo ; enddo ! fr-loop, m-loop
   endif ! apply_wave or _Froude_drag (Ub or Umax needed)
   ! Finally, apply loss
   if (CS%apply_wave_drag) then
     ! Calculate loss rate and apply loss over the time step
-    call itidal_lowmode_loss(G, US, CS, Nb, Ub, CS%En, CS%TKE_itidal_loss_fixed, &
-                             CS%TKE_itidal_loss, dt, full_halos=.false.)
+    call itidal_lowmode_loss(G, GV, US, CS, Nb, Rho_bot, Ub, CS%En, CS%TKE_itidal_loss_fixed, &
+                             CS%TKE_itidal_loss, dt, halo_size=0)
   endif
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
@@ -449,9 +625,9 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   ! Extract the energy for mixing due to wave breaking-----------------------------
   if (CS%apply_Froude_drag) then
     ! Pick out maximum baroclinic velocity values; calculate Fr=max(u)/cg
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq
       freq2 = CS%frequency(fr)**2
-      do j=jsd,jed ; do i=isd,ied
+      do j=js,je ; do i=is,ie
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset ! for debugging
         ! Calculate horizontal phase velocity magnitudes
         f2 = 0.25*((G%CoriolisBu(I,J)**2 + G%CoriolisBu(I-1,J-1)**2) + &
@@ -460,7 +636,6 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
         c_phase = 0.0
         if (Kmag2 > 0.0) then
           c_phase = sqrt(freq2/Kmag2)
-          nzm = CS%wave_struct%num_intfaces(i,j)
           Fr2_max = (Umax(i,j,fr,m) / c_phase)**2
           ! Dissipate energy if Fr>1; done here with an arbitrary time scale
           if (Fr2_max > 1.0) then
@@ -501,7 +676,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
     enddo ; enddo
   endif
   ! Check for En<0 - for debugging, delete later
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle
     do j=js,je ; do i=is,ie
       if (CS%En(i,j,a,fr,m)<0.0) then
         id_g = i + G%idg_offset ; jd_g = j + G%jdg_offset
@@ -518,7 +693,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   ! loss from residual of reflection/transmission coefficients
   if (CS%apply_residual_drag) then
 
-    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+    do m=1,CS%nMode ; do fr=1,CS%nFreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
       ! implicit form
       !CS%En(i,j,a,fr,m) = CS%En(i,j,a,fr,m) / (1.0 + dt * CS%TKE_residual_loss(i,j,a,fr,m) / &
       !                                        (CS%En(i,j,a,fr,m) + en_subRO))
@@ -533,7 +708,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
 
 
   ! Check for energy conservation on computational domain.*************************
-  do m=1,CS%NMode ; do fr=1,CS%Nfreq
+  do m=1,CS%nMode ; do fr=1,CS%Nfreq
     call sum_En(G, US, CS, CS%En(:,:,:,fr,m), 'prop_int_tide')
   enddo ; enddo
 
@@ -542,14 +717,23 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
   call enable_averages(dt, time_end, CS%diag)
 
   if (query_averaging_enabled(CS%diag)) then
+    ! Output internal wave modal wave speeds
+    if (CS%id_cg1 > 0) call post_data(CS%id_cg1, cn(:,:,1),CS%diag)
+    do m=1,CS%nMode ; if (CS%id_cn(m) > 0) call post_data(CS%id_cn(m), cn(:,:,m), CS%diag) ; enddo
+
     ! Output two-dimensional diagnostics
     if (CS%id_tot_En > 0)     call post_data(CS%id_tot_En, tot_En, CS%diag)
-    if (CS%id_itide_drag > 0) call post_data(CS%id_itide_drag, drag_scale, CS%diag)
-    if (CS%id_TKE_itidal_input > 0) call post_data(CS%id_TKE_itidal_input, &
-                                                   TKE_itidal_input, CS%diag)
+    do fr=1,CS%nFreq
+      if (CS%id_TKE_itidal_input(fr) > 0) call post_data(CS%id_TKE_itidal_input(fr), &
+                                                         TKE_itidal_input(:,:,fr), CS%diag)
+    enddo
 
-    ! Output 2-D energy density (summed over angles) for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; if (CS%id_En_mode(fr,m) > 0) then
+    do m=1,CS%nMode ; do fr=1,CS%nFreq
+      if (CS%id_itide_drag(fr,m) > 0) call post_data(CS%id_itide_drag(fr,m), drag_scale(:,:,fr,m), CS%diag)
+    enddo ; enddo
+
+    ! Output 2-D energy density (summed over angles) for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; if (CS%id_En_mode(fr,m) > 0) then
       tot_En(:,:) = 0.0
       do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
         tot_En(i,j) = tot_En(i,j) + CS%En(i,j,a,fr,m)
@@ -557,8 +741,37 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
       call post_data(CS%id_En_mode(fr,m), tot_En, CS%diag)
     endif ; enddo ; enddo
 
-    ! Output 3-D (i,j,a) energy density for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; if (CS%id_En_ang_mode(fr,m) > 0) then
+    ! split energy array into multiple restarts
+    do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+      CS%En_restart_mode1(i,j,a,fr) = CS%En(i,j,a,fr,1)
+    enddo ; enddo ; enddo ; enddo
+
+    if (CS%nMode >= 2) then
+      do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+        CS%En_restart_mode2(i,j,a,fr) = CS%En(i,j,a,fr,2)
+      enddo ; enddo ; enddo ; enddo
+    endif
+
+    if (CS%nMode >= 3) then
+      do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+        CS%En_restart_mode3(i,j,a,fr) = CS%En(i,j,a,fr,3)
+      enddo ; enddo ; enddo ; enddo
+    endif
+
+    if (CS%nMode >= 4) then
+      do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+        CS%En_restart_mode4(i,j,a,fr) = CS%En(i,j,a,fr,4)
+      enddo ; enddo ; enddo ; enddo
+    endif
+
+    if (CS%nMode >= 5) then
+      do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=jsd,jed ; do i=isd,ied
+        CS%En_restart_mode5(i,j,a,fr) = CS%En(i,j,a,fr,5)
+      enddo ; enddo ; enddo ; enddo
+    endif
+
+    ! Output 3-D (i,j,a) energy density for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; if (CS%id_En_ang_mode(fr,m) > 0) then
       call post_data(CS%id_En_ang_mode(fr,m), CS%En(:,:,:,fr,m) , CS%diag)
     endif ; enddo ; enddo
 
@@ -569,7 +782,7 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
     tot_Froude_loss(:,:) = 0.0
     tot_residual_loss(:,:) = 0.0
     tot_allprocesses_loss(:,:) = 0.0
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
       tot_leak_loss(i,j)   = tot_leak_loss(i,j)   + CS%TKE_leak_loss(i,j,a,fr,m)
       tot_quad_loss(i,j)   = tot_quad_loss(i,j)   + CS%TKE_quad_loss(i,j,a,fr,m)
       tot_itidal_loss(i,j) = tot_itidal_loss(i,j) + CS%TKE_itidal_loss(i,j,a,fr,m)
@@ -606,34 +819,66 @@ subroutine propagate_int_tide(h, tv, cn, TKE_itidal_input, vel_btTide, Nb, dt, &
       call post_data(CS%id_tot_allprocesses_loss, tot_allprocesses_loss, CS%diag)
     endif
 
-    ! Output 2-D energy loss (summed over angles) for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq
+    ! Output 2-D energy loss (summed over angles) for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq
     if (CS%id_itidal_loss_mode(fr,m) > 0 .or. CS%id_allprocesses_loss_mode(fr,m) > 0) then
       itidal_loss_mode(:,:) = 0.0 ! wave-drag processes (could do others as well)
+      leak_loss_mode(:,:) = 0.0
+      quad_loss_mode(:,:) = 0.0
+      Froude_loss_mode(:,:) = 0.0
+      residual_loss_mode(:,:) = 0.0
       allprocesses_loss_mode(:,:) = 0.0 ! all processes summed together
       do a=1,CS%nAngle ; do j=js,je ; do i=is,ie
         itidal_loss_mode(i,j)       = itidal_loss_mode(i,j) + CS%TKE_itidal_loss(i,j,a,fr,m)
+        leak_loss_mode(i,j) =  leak_loss_mode(i,j) + CS%TKE_leak_loss(i,j,a,fr,m)
+        quad_loss_mode(i,j) = quad_loss_mode(i,j) + CS%TKE_quad_loss(i,j,a,fr,m)
+        Froude_loss_mode(i,j) = Froude_loss_mode(i,j) + CS%TKE_Froude_loss(i,j,a,fr,m)
+        residual_loss_mode(i,j) = residual_loss_mode(i,j) +  CS%TKE_residual_loss(i,j,a,fr,m)
         allprocesses_loss_mode(i,j) = allprocesses_loss_mode(i,j) + &
                                  ((((CS%TKE_leak_loss(i,j,a,fr,m) + CS%TKE_quad_loss(i,j,a,fr,m)) + &
                                  CS%TKE_itidal_loss(i,j,a,fr,m)) + CS%TKE_Froude_loss(i,j,a,fr,m)) + &
                                  CS%TKE_residual_loss(i,j,a,fr,m))
       enddo ; enddo ; enddo
       call post_data(CS%id_itidal_loss_mode(fr,m), itidal_loss_mode, CS%diag)
+      call post_data(CS%id_leak_loss_mode(fr,m), leak_loss_mode, CS%diag)
+      call post_data(CS%id_quad_loss_mode(fr,m), quad_loss_mode, CS%diag)
+      call post_data(CS%id_Froude_loss_mode(fr,m), Froude_loss_mode, CS%diag)
+      call post_data(CS%id_residual_loss_mode(fr,m), residual_loss_mode, CS%diag)
       call post_data(CS%id_allprocesses_loss_mode(fr,m), allprocesses_loss_mode, CS%diag)
     endif ; enddo ; enddo
 
-    ! Output 3-D (i,j,a) energy loss for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; if (CS%id_itidal_loss_ang_mode(fr,m) > 0) then
+    ! Output 3-D (i,j,a) energy loss for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; if (CS%id_itidal_loss_ang_mode(fr,m) > 0) then
       call post_data(CS%id_itidal_loss_ang_mode(fr,m), CS%TKE_itidal_loss(:,:,:,fr,m) , CS%diag)
     endif ; enddo ; enddo
 
-    ! Output 2-D period-averaged horizontal near-bottom mode velocity for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; if (CS%id_Ub_mode(fr,m) > 0) then
+    ! Output 2-D period-averaged horizontal near-bottom mode velocity for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; if (CS%id_Ub_mode(fr,m) > 0) then
       call post_data(CS%id_Ub_mode(fr,m), Ub(:,:,fr,m), CS%diag)
     endif ; enddo ; enddo
 
-    ! Output 2-D horizontal phase velocity for each freq and mode
-    do m=1,CS%NMode ; do fr=1,CS%Nfreq ; if (CS%id_cp_mode(fr,m) > 0) then
+    do m=1,CS%nMode ; if (CS%id_Ustruct_mode(m) > 0) then
+      call post_data(CS%id_Ustruct_mode(m), CS%u_struct(:,:,:,m), CS%diag)
+    endif ; enddo
+
+    do m=1,CS%nMode ; if (CS%id_Wstruct_mode(m) > 0) then
+      call post_data(CS%id_Wstruct_mode(m), CS%w_struct(:,:,:,m), CS%diag)
+    endif ; enddo
+
+    do m=1,CS%nMode ; if (CS%id_int_w2_mode(m) > 0) then
+      call post_data(CS%id_int_w2_mode(m), CS%int_w2(:,:,m), CS%diag)
+    endif ; enddo
+
+    do m=1,CS%nMode ; if (CS%id_int_U2_mode(m) > 0) then
+      call post_data(CS%id_int_U2_mode(m), CS%int_U2(:,:,m), CS%diag)
+    endif ; enddo
+
+    do m=1,CS%nMode ; if (CS%id_int_N2w2_mode(m) > 0) then
+      call post_data(CS%id_int_N2w2_mode(m), CS%int_N2w2(:,:,m), CS%diag)
+    endif ; enddo
+
+    ! Output 2-D horizontal phase velocity for each frequency and mode
+    do m=1,CS%nMode ; do fr=1,CS%Nfreq ; if (CS%id_cp_mode(fr,m) > 0) then
       call post_data(CS%id_cp_mode(fr,m), CS%cp(:,:,fr,m), CS%diag)
     endif ; enddo ; enddo
 
@@ -654,9 +899,10 @@ subroutine sum_En(G, US, CS, En, label)
   ! Local variables
   real :: En_sum   ! The total energy in MKS units for potential output [J]
   integer :: a
-  ! real :: En_sum_diff, En_sum_pdiff
+  ! real :: En_sum_diff  ! Change in energy from the expected value [J]
+  ! real :: En_sum_pdiff ! Percentage change in energy from the expected value [nondim]
   ! character(len=160) :: mesg  ! The text of an error message
-  ! real :: days
+  ! real :: days          ! The time in days for use in output messages [days]
 
   En_sum = 0.0
   do a=1,CS%nAngle
@@ -683,28 +929,30 @@ end subroutine sum_En
 
 !> Calculates the energy lost from the propagating internal tide due to
 !! scattering over small-scale roughness along the lines of Jayne & St. Laurent (2001).
-subroutine itidal_lowmode_loss(G, US, CS, Nb, Ub, En, TKE_loss_fixed, TKE_loss, dt, full_halos)
+subroutine itidal_lowmode_loss(G, GV, US, CS, Nb, Rho_bot, Ub, En, TKE_loss_fixed, TKE_loss, dt, halo_size)
   type(ocean_grid_type),     intent(in)    :: G  !< The ocean's grid structure.
+  type(verticalGrid_type),   intent(in)    :: GV !< The ocean's vertical grid structure.
   type(unit_scale_type),     intent(in)    :: US !< A dimensional unit scaling type
   type(int_tide_CS),         intent(in)    :: CS !< Internal tide control structure
   real, dimension(G%isd:G%ied,G%jsd:G%jed), &
                              intent(in)    :: Nb !< Near-bottom stratification [T-1 ~> s-1].
+  real, dimension(G%isd:G%ied,G%jsd:G%jed), &
+                             intent(in)    :: Rho_bot !< Near-bottom density [R ~> kg m-3].
   real, dimension(G%isd:G%ied,G%jsd:G%jed,CS%nFreq,CS%nMode), &
                              intent(inout) :: Ub !< RMS (over one period) near-bottom horizontal
                                                  !! mode velocity [L T-1 ~> m s-1].
   real, dimension(G%isd:G%ied,G%jsd:G%jed), &
-                             intent(in) :: TKE_loss_fixed !< Fixed part of energy loss [R L-2 Z3 ~> kg m-2]
-                                                 !! (rho*kappa*h^2).
+                             intent(in) :: TKE_loss_fixed !< Fixed part of energy loss [R Z4 H-1 L-2 ~> kg m-2 or m]
+                                                 !! (rho*kappa*h^2) or (kappa*h^2).
   real, dimension(G%isd:G%ied,G%jsd:G%jed,CS%NAngle,CS%nFreq,CS%nMode), &
                              intent(inout) :: En !< Energy density of the internal waves [R Z3 T-2 ~> J m-2].
   real, dimension(G%isd:G%ied,G%jsd:G%jed,CS%NAngle,CS%nFreq,CS%nMode), &
                              intent(out)   :: TKE_loss    !< Energy loss rate [R Z3 T-3 ~> W m-2]
                                                  !! (q*rho*kappa*h^2*N*U^2).
   real,                      intent(in)    :: dt !< Time increment [T ~> s].
-  logical,optional,          intent(in)    :: full_halos  !< If true, do the calculation over the
-                                                 !! entire computational domain.
+  integer, optional,         intent(in)    :: halo_size !< The halo size over which to do the calculations
   ! Local variables
-  integer :: j,i,m,fr,a, is, ie, js, je
+  integer :: j, i, m, fr, a, is, ie, js, je, halo
   real    :: En_tot          ! energy for a given mode, frequency, and point summed over angles [R Z3 T-2 ~> J m-2]
   real    :: TKE_loss_tot    ! dissipation for a given mode, frequency, and point summed over angles [R Z3 T-3 ~> W m-2]
   real    :: frac_per_sector ! fraction of energy in each wedge [nondim]
@@ -718,9 +966,10 @@ subroutine itidal_lowmode_loss(G, US, CS, Nb, Ub, En, TKE_loss_fixed, TKE_loss, 
   q_itides = CS%q_itides
   En_negl = 1e-30*US%kg_m3_to_R*US%m_to_Z**3*US%T_to_s**2
 
-  if (present(full_halos)) then ; if (full_halos) then
-    is = G%isd ; ie = G%ied ; js = G%jsd ; je = G%jed
-  endif ; endif
+  if (present(halo_size)) then
+    halo = halo_size
+    is = G%isc - halo ; ie = G%iec + halo ; js = G%jsc - halo ; je = G%jec + halo
+  endif
 
   do j=js,je ; do i=is,ie ; do m=1,CS%nMode ; do fr=1,CS%nFreq
 
@@ -731,20 +980,26 @@ subroutine itidal_lowmode_loss(G, US, CS, Nb, Ub, En, TKE_loss_fixed, TKE_loss, 
     enddo
 
     ! Calculate TKE loss rate; units of [R Z3 T-3 ~> W m-2] here.
-    TKE_loss_tot = q_itides * TKE_loss_fixed(i,j) * Nb(i,j) * Ub(i,j,fr,m)**2
+    if (GV%Boussinesq .or. GV%semi_Boussinesq) then
+      TKE_loss_tot = q_itides * GV%Z_to_H * TKE_loss_fixed(i,j) * Nb(i,j) * Ub(i,j,fr,m)**2
+    else
+      TKE_loss_tot = q_itides * (GV%RZ_to_H * Rho_bot(i,j)) * TKE_loss_fixed(i,j) * Nb(i,j) * Ub(i,j,fr,m)**2
+    endif
 
     ! Update energy remaining (this is a pseudo implicit calc)
     ! (E(t+1)-E(t))/dt = -TKE_loss(E(t+1)/E(t)), which goes to zero as E(t+1) goes to zero
     if (En_tot > 0.0) then
       do a=1,CS%nAngle
         frac_per_sector = En(i,j,a,fr,m)/En_tot
-        TKE_loss(i,j,a,fr,m) = frac_per_sector*TKE_loss_tot           ! Wm-2
+        TKE_loss(i,j,a,fr,m) = frac_per_sector*TKE_loss_tot           ! [R Z3 T-3  ~> W m-2]
         loss_rate = TKE_loss(i,j,a,fr,m) / (En(i,j,a,fr,m) + En_negl) ! [T-1 ~> s-1]
         En(i,j,a,fr,m) = En(i,j,a,fr,m) / (1.0 + dt*loss_rate)
       enddo
     else
       ! no loss if no energy
-      TKE_loss(i,j,:,fr,m) = 0.0
+      do a=1,CS%nAngle
+        TKE_loss(i,j,a,fr,m) = 0.0
+      enddo
     endif
 
     ! Update energy remaining (this is the old explicit calc)
@@ -808,29 +1063,33 @@ subroutine refract(En, cn, freq, dt, G, US, NAngle, use_PPMang)
   ! Local variables
   integer, parameter :: stencil = 2
   real, dimension(SZI_(G),1-stencil:NAngle+stencil) :: &
-    En2d
+    En2d                  ! The internal gravity wave energy density in zonal slices [R Z3 T-2 ~> J m-2]
   real, dimension(1-stencil:NAngle+stencil) :: &
-    cos_angle, sin_angle
+    cos_angle, sin_angle  ! The cosine and sine of each angle [nondim]
   real, dimension(SZI_(G)) :: &
-    Dk_Dt_Kmag, Dl_Dt_Kmag
+    Dk_Dt_Kmag, Dl_Dt_Kmag ! Rates of angular refraction [T-1 ~> s-1]
   real, dimension(SZI_(G),0:nAngle) :: &
-    Flux_E
+    Flux_E                ! The flux of energy between successive angular wedges within a timestep [R Z3 T-2 ~> J m-2]
   real, dimension(SZI_(G),SZJ_(G),1-stencil:NAngle+stencil) :: &
-    CFL_ang
-  real, dimension(G%IsdB:G%IedB,G%jsd:G%jed) :: cn_u !< Internal wave group velocity at U-point
-  real, dimension(G%isd:G%ied,G%JsdB:G%JedB) :: cn_v !< Internal wave group velocity at V-point
-  real, dimension(G%isd:G%ied,G%jsd:G%jed) :: cnmask !< Local mask for group velocity
+    CFL_ang               ! The CFL number of angular refraction [nondim]
+  real, dimension(G%IsdB:G%IedB,G%jsd:G%jed) :: cn_u !< Internal wave group velocity at U-point [L T-1 ~> m s-1]
+  real, dimension(G%isd:G%ied,G%JsdB:G%JedB) :: cn_v !< Internal wave group velocity at V-point [L T-1 ~> m s-1]
+  real, dimension(G%isd:G%ied,G%jsd:G%jed) :: cnmask !< Local mask for group velocity [nondim]
   real :: f2              ! The squared Coriolis parameter [T-2 ~> s-2].
   real :: favg            ! The average Coriolis parameter at a point [T-1 ~> s-1].
   real :: df_dy, df_dx    ! The x- and y- gradients of the Coriolis parameter [T-1 L-1 ~> s-1 m-1].
   real :: dlnCn_dx        ! The x-gradient of the wave speed divided by itself [L-1 ~> m-1].
   real :: dlnCn_dy        ! The y-gradient of the wave speed divided by itself [L-1 ~> m-1].
-  real :: Angle_size, dt_Angle_size, angle
-  real :: Ifreq, Kmag2, I_Kmag
+  real :: Angle_size      ! The size of each wedge of angles [rad]
+  real :: dt_Angle_size   ! The time step divided by the angle size [T rad-1 ~> s rad-1]
+  real :: angle           ! The central angle of each wedge [rad]
+  real :: Ifreq           ! The inverse of the wave frequency [T ~> s]
+  real :: Kmag2           ! A squared horizontal wavenumber [L-2 ~> m-2]
+  real :: I_Kmag          ! The inverse of the magnitude of the horizontal wavenumber [L ~> m]
   real :: cn_subRO        ! A tiny wave speed to prevent division by zero [L T-1 ~> m s-1]
   integer :: is, ie, js, je, asd, aed, na
   integer :: i, j, a
-  real :: wgt1, wgt2
+  real :: wgt1, wgt2      ! Weights in an average, both of which may be 0 [nondim]
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; na = size(En,3)
   asd = 1-stencil ; aed = NAngle+stencil
@@ -938,18 +1197,18 @@ end subroutine refract
 !! piecewise parabolic scheme. This needs to be called from within i and j spatial loops.
 subroutine PPM_angular_advect(En2d, CFL_ang, Flux_En, NAngle, dt, halo_ang)
   integer,                   intent(in)    :: NAngle  !< The number of wave orientations in the
-                                                      !! discretized wave energy spectrum.
+                                                      !! discretized wave energy spectrum [nondim]
   real,                      intent(in)    :: dt      !< Time increment [T ~> s].
   integer,                   intent(in)    :: halo_ang !< The halo size in angular space
   real, dimension(1-halo_ang:NAngle+halo_ang),   &
                              intent(in)    :: En2d    !< The internal gravity wave energy density as a
                                                       !! function of angular resolution [R Z3 T-2 ~> J m-2].
   real, dimension(1-halo_ang:NAngle+halo_ang),   &
-                             intent(in)    :: CFL_ang !< The CFL number of the energy advection across angles
+                             intent(in)    :: CFL_ang !< The CFL number of the energy advection across angles [nondim]
   real, dimension(0:NAngle), intent(out)   :: Flux_En !< The time integrated internal wave energy flux
                                                       !! across angles  [R Z3 T-2 ~> J m-2].
   ! Local variables
-  real :: flux
+  real :: flux         ! The internal wave energy flux across angles  [R Z3 T-3 ~> W m-2].
   real :: u_ang        ! Angular propagation speed [Rad T-1 ~> Rad s-1]
   real :: Angle_size   ! The size of each orientation wedge in radians [Rad]
   real :: I_Angle_size ! The inverse of the orientation wedges [Rad-1]
@@ -1052,11 +1311,16 @@ subroutine propagate(En, cn, freq, dt, G, US, CS, NAngle, residual_loss)
   real, dimension(SZI_(G),SZJB_(G)) :: &
     speed_y  ! The magnitude of the group velocity at the Cv points [L T-1 ~> m s-1].
   real, dimension(0:NAngle) :: &
-    cos_angle, sin_angle
+    cos_angle, sin_angle  ! The cosine and sine of each angle [nondim]
   real, dimension(NAngle) :: &
-    Cgx_av, Cgy_av, dCgx, dCgy
+    Cgx_av, &  ! The average projection of the wedge into the x-direction [nondim]
+    Cgy_av, &  ! The average projection of the wedge into the y-direction [nondim]
+    dCgx, &    ! The difference in x-projections between the edges of each angular band [nondim].
+    dCgy       ! The difference in y-projections between the edges of each angular band [nondim].
   real :: f2   ! The squared Coriolis parameter [T-2 ~> s-2].
-  real :: Angle_size, I_Angle_size, angle
+  real :: Angle_size      ! The size of each wedge of angles [rad]
+  real :: I_Angle_size    ! The inverse of the size of each wedge of angles [rad-1]
+  real :: angle           ! The central angle of each wedge [rad]
   real :: Ifreq ! The inverse of the frequency [T ~> s]
   real :: freq2 ! The frequency squared [T-2 ~> s-2]
   type(loop_bounds_type) :: LB
@@ -1172,26 +1436,32 @@ subroutine propagate_corner_spread(En, energized_wedge, NAngle, speed, dt, G, CS
   type(loop_bounds_type), intent(in)    :: LB    !< A structure with the active energy loop bounds.
   ! Local variables
   integer :: i, j, ish, ieh, jsh, jeh, m
-  real :: TwoPi, Angle_size
-  real :: energized_angle ! angle through center of current wedge
-  real :: theta ! angle at edge of wedge
-  real :: Nsubrays     ! number of sub-rays for averaging
+  real :: TwoPi        ! The radius of the circumference of a circle to its radius [nondim]
+  real :: Angle_size   ! The size of each angular wedge [radians]
+  real :: energized_angle ! angle through center of current wedge [radians]
+  real :: theta        ! angle at edge of each sub-wedge [radians]
+  real :: Nsubrays     ! number of sub-rays for averaging [nondim]
                        ! count includes the two rays that bound the current wedge,
                        ! i.e. those at -dtheta/2 and +dtheta/2 from energized angle
-  real :: I_Nsubwedges ! inverse of number of sub-wedges
-  real :: cos_thetaDT, sin_thetaDT ! cos(theta)*dt, sin(theta)*dt
-  real :: xNE,xNW,xSW,xSE,yNE,yNW,ySW,ySE ! corner point coordinates of advected fluid parcel
-  real :: CFL_xNE,CFL_xNW,CFL_xSW,CFL_xSE,CFL_yNE,CFL_yNW,CFL_ySW,CFL_ySE,CFL_max
-  real :: xN,xS,xE,xW,yN,yS,yE,yW ! intersection point coordinates of parcel edges and grid
-  real :: xCrn,yCrn ! grid point contained within advected fluid parcel
-  real :: xg,yg ! grid point of interest
-  real :: slopeN,slopeW,slopeS,slopeE, bN,bW,bS,bE ! parameters defining parcel sides
-  real :: aNE,aN,aNW,aW,aSW,aS,aSE,aE,aC ! sub-areas of advected parcel
-  real :: a_total ! total area of advected parcel
-  ! real :: a1,a2,a3,a4 ! areas used in calculating polygon areas (sub-areas) of advected parcel
-  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: x,y ! coordinates of cell corners
-  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: Idx,Idy ! inverse of dx,dy at cell corners
-  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: dx,dy ! dx,dy at cell corners
+  real :: I_Nsubwedges ! inverse of number of sub-wedges [nondim]
+  real :: cos_thetaDT, sin_thetaDT ! cos(theta)*dt, sin(theta)*dt [T ~> s]
+  real :: xNE, xNW, xSW, xSE ! corner point x-coordinates of advected fluid parcel [L ~> m]
+  real :: yNE, yNW, ySW, ySE ! corner point y-coordinates of advected fluid parcel [L ~> m]
+  real :: CFL_xNE, CFL_xNW, CFL_xSW, CFL_xSE ! Various x-direction CFL numbers for propagation [nondim]
+  real :: CFL_yNE, CFL_yNW, CFL_ySW, CFL_ySE ! Various y-direction CFL numbers for propagation [nondim]
+  real :: CFL_max ! The maximum of the x- and y-CFL numbers for propagation [nondim]
+  real :: xN, xS, xE, xW ! intersection point x-coordinates of parcel edges and grid [L ~> m]
+  real :: yN, yS, yE, yW ! intersection point y-coordinates of parcel edges and grid [L ~> m]
+  real :: xCrn, yCrn ! Coordinates of grid point contained within advected fluid parcel [L ~> m]
+  real :: xg, yg ! Positions of grid point of interest [L ~> m]
+  real :: slopeN, slopeW, slopeS, slopeE ! Coordinate-space slopes of parcel sides [nondim]
+  real :: bN, bW, bS, bE ! parameters defining parcel sides [L ~> m]
+  real :: aNE, aN, aNW, aW, aSW, aS, aSE, aE, aC ! sub-areas of advected parcel [L2 ~> m2]
+  real :: a_total ! total area of advected parcel [L2 ~> m2]
+  ! real :: a1,a2,a3,a4 ! areas used in calculating polygon areas (sub-areas) of advected parcel [L2 ~> m2]
+  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: x, y ! coordinates of cell corners [L ~> m]
+  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: Idx, Idy ! inverse of dx,dy at cell corners [L-1 ~> m-1]
+  real, dimension(G%IsdB:G%IedB,G%Jsd:G%Jed) :: dx, dy ! dx,dy at cell corners [L ~> m]
   real, dimension(2) :: E_new ! Energy in cell after advection for subray [R Z3 T-2 ~> J m-2]; set size
                               ! here to define Nsubrays - this should be made an input option later!
 
@@ -1449,9 +1719,9 @@ subroutine propagate_x(En, speed_x, Cgx_av, dCgx, dt, G, US, Nangle, CS, LB, res
   real, dimension(G%IsdB:G%IedB,G%jsd:G%jed),        &
                            intent(in)    :: speed_x !< The magnitude of the group velocity at the
                                                !! Cu points [L T-1 ~> m s-1].
-  real, dimension(Nangle), intent(in)    :: Cgx_av !< The average x-projection in each angular band.
+  real, dimension(Nangle), intent(in)    :: Cgx_av !< The average x-projection in each angular band [nondim]
   real, dimension(Nangle), intent(in)    :: dCgx !< The difference in x-projections between the
-                                               !! edges of each angular band.
+                                               !! edges of each angular band [nondim].
   real,                    intent(in)    :: dt !< Time increment [T ~> s].
   type(unit_scale_type),   intent(in)    :: US !< A dimensional unit scaling type
   type(int_tide_CS),       intent(in)    :: CS !< Internal tide control structure
@@ -1465,8 +1735,8 @@ subroutine propagate_x(En, speed_x, Cgx_av, dCgx, dt, G, US, Nangle, CS, LB, res
   real, dimension(SZIB_(G),SZJ_(G)) :: &
     flux_x      ! The internal wave energy flux [R Z3 L2 T-3 ~> J s-1].
   real, dimension(SZIB_(G)) :: &
-    cg_p, flux1
-  !real, dimension(SZI_(G),SZJB_(G),Nangle) :: En_m, En_p
+    cg_p, &     ! The x-direction group velocity [L T-1 ~> m s-1]
+    flux1       ! A 1-d copy of the x-direction internal wave energy flux [R Z3 L2 T-3 ~> J s-1].
   real, dimension(G%isd:G%ied,G%jsd:G%jed,Nangle) :: &
     Fdt_m, Fdt_p! Left and right energy fluxes [R Z3 L2 T-2 ~> J]
   integer :: i, j, ish, ieh, jsh, jeh, a
@@ -1530,9 +1800,9 @@ subroutine propagate_y(En, speed_y, Cgy_av, dCgy, dt, G, US, Nangle, CS, LB, res
   real, dimension(G%isd:G%ied,G%JsdB:G%JedB),      &
                            intent(in)    :: speed_y !< The magnitude of the group velocity at the
                                                !! Cv points [L T-1 ~> m s-1].
-  real, dimension(Nangle), intent(in)    :: Cgy_av !< The average y-projection in each angular band.
+  real, dimension(Nangle), intent(in)    :: Cgy_av !< The average y-projection in each angular band [nondim]
   real, dimension(Nangle), intent(in)    :: dCgy !< The difference in y-projections between the
-                                               !! edges of each angular band.
+                                               !! edges of each angular band [nondim]
   real,                    intent(in)    :: dt !< Time increment [T ~> s].
   type(unit_scale_type),   intent(in)    :: US !< A dimensional unit scaling type
   type(int_tide_CS),       intent(in)    :: CS !< Internal tide control structure
@@ -1545,8 +1815,9 @@ subroutine propagate_y(En, speed_y, Cgy_av, dCgy, dt, G, US, Nangle, CS, LB, res
     EnL, EnR    ! South and north face energy densities [R Z3 T-2 ~> J m-2].
   real, dimension(SZI_(G),SZJB_(G)) :: &
     flux_y      ! The internal wave energy flux [R Z3 L2 T-3 ~> J s-1].
-  real, dimension(SZI_(G)) :: cg_p, flux1
-  !real, dimension(SZI_(G),SZJB_(G),Nangle) :: En_m, En_p
+  real, dimension(SZI_(G)) :: &
+    cg_p, &     ! The y-direction group velocity [L T-1 ~> m s-1]
+    flux1       ! A 1-d copy of the y-direction internal wave energy flux [R Z3 L2 T-3 ~> J s-1].
   real, dimension(G%isd:G%ied,G%jsd:G%jed,Nangle) :: &
     Fdt_m, Fdt_p! South and north energy fluxes [R Z3 L2 T-2 ~> J]
   integer :: i, j, ish, ieh, jsh, jeh, a
@@ -1823,23 +2094,18 @@ subroutine teleport(En, NAngle, CS, G, LB)
   real                        :: TwoPi      ! 2*pi = 6.2831853... [nondim]
   real                        :: Angle_size ! size of beam wedge [rad]
   real, dimension(1:NAngle)   :: angle_i    ! angle of incident ray wrt equator [rad]
-  real, dimension(1:NAngle)   :: cos_angle, sin_angle
+  real, dimension(1:NAngle)   :: cos_angle  ! Cosine of the beam angle relative to eastward [nondim]
+  real, dimension(1:NAngle)   :: sin_angle  ! Sine of the beam angle relative to eastward [nondim]
   real                        :: En_tele    ! energy to be "teleported" [R Z3 T-2 ~> J m-2]
   character(len=160) :: mesg  ! The text of an error message
   integer :: i, j, a
-  !integer :: isd, ied, jsd, jed    ! start and end local indices on data domain
-  !                                 ! (values include halos)
-  !integer :: isc, iec, jsc, jec    ! start and end local indices on PE
-  !                                 ! (values exclude halos)
   integer :: ish, ieh, jsh, jeh     ! start and end local indices on data domain
                                     ! leaving out outdated halo points (march in)
   integer :: id_g, jd_g             ! global (decomposition-invariant) indices
   integer :: jos, ios               ! offsets
-  real    :: cos_normal, sin_normal, angle_wall
-                                    ! cos/sin of cross-ridge normal, ridge angle
+  real    :: cos_normal, sin_normal ! cos/sin of cross-ridge normal direction [nondim]
+  real    :: angle_wall             ! The coastline angle or the complementary angle [radians]
 
-  !isd = G%isd  ; ied = G%ied  ; jsd = G%jsd  ; jed = G%jed
-  !isc = G%isc  ; iec = G%iec  ; jsc = G%jsc  ; jec = G%jec
   ish = LB%ish ; ieh = LB%ieh ; jsh = LB%jsh ; jeh = LB%jeh
 
   TwoPi = 8.0*atan(1.0)
@@ -1901,7 +2167,7 @@ end subroutine teleport
 
 !> Rotates points in the halos where required to accommodate
 !! changes in grid orientation, such as at the tripolar fold.
-subroutine correct_halo_rotation(En, test, G, NAngle)
+subroutine correct_halo_rotation(En, test, G, NAngle, halo)
   type(ocean_grid_type),      intent(in)    :: G    !< The ocean's grid structure
   real, dimension(:,:,:,:,:), intent(inout) :: En   !< The internal gravity wave energy density as a
                                        !! function of space, angular orientation, frequency,
@@ -1909,20 +2175,22 @@ subroutine correct_halo_rotation(En, test, G, NAngle)
   real, dimension(SZI_(G),SZJ_(G),2), &
                               intent(in)    :: test !< An x-unit vector that has been passed through
                                        !! the halo updates, to enable the rotation of the
-                                       !! wave energies in the halo region to be corrected.
+                                       !! wave energies in the halo region to be corrected [nondim].
   integer,                    intent(in)    :: NAngle !< The number of wave orientations in the
                                                       !! discretized wave energy spectrum.
+  integer,                    intent(in)    :: halo   !< The halo size over which to do the calculations
   ! Local variables
-  real, dimension(G%isd:G%ied,NAngle) :: En2d
+  real, dimension(G%isd:G%ied,NAngle) :: En2d ! A zonal row of the internal gravity wave energy density
+                                              ! in a frequency band and mode [R Z3 T-2 ~> J m-2].
   integer, dimension(G%isd:G%ied) :: a_shift
   integer :: i_first, i_last, a_new
-  integer :: a, i, j, isd, ied, jsd, jed, m, fr
+  integer :: a, i, j, ish, ieh, jsh, jeh, m, fr
   character(len=160) :: mesg  ! The text of an error message
-  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  ish = G%isc-halo ; ieh = G%iec+halo ; jsh = G%jsc-halo ; jeh = G%jec+halo
 
-  do j=jsd,jed
-    i_first = ied+1 ; i_last = isd-1
-    do i=isd,ied
+  do j=jsh,jeh
+    i_first = ieh+1 ; i_last = ish-1
+    do i=ish,ieh
       a_shift(i) = 0
       if (test(i,j,1) /= 1.0) then
         if (i<i_first) i_first = i
@@ -1960,18 +2228,19 @@ end subroutine correct_halo_rotation
 !> Calculates left/right edge values for PPM reconstruction in x-direction.
 subroutine PPM_reconstruction_x(h_in, h_l, h_r, G, LB, simple_2nd)
   type(ocean_grid_type),            intent(in)  :: G    !< The ocean's grid structure.
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: h_in !< Energy density in a sector (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_l  !< Left edge value of reconstruction (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_r  !< Right edge value of reconstruction (2D).
+  real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: h_in !< Energy density in a sector (2D) [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_l  !< Left edge value of reconstruction (2D) [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_r  !< Right edge value of reconstruction (2D) [R Z3 T-2 ~> J m-2]
   type(loop_bounds_type),           intent(in)  :: LB   !< A structure with the active loop bounds.
   logical,                          intent(in)  :: simple_2nd !< If true, use the arithmetic mean
                                                         !! energy densities as default edge values
                                                         !! for a simple 2nd order scheme.
   ! Local variables
-  real, dimension(SZI_(G),SZJ_(G))  :: slp ! The slopes.
-  real, parameter :: oneSixth = 1./6.
-  real :: h_ip1, h_im1
-  real :: dMx, dMn
+  real, dimension(SZI_(G),SZJ_(G))  :: slp ! The slope in energy density times the cell width [R Z3 T-2 ~> J m-2]
+  real, parameter :: oneSixth = 1./6. ! One sixth [nondim]
+  real :: h_ip1, h_im1 ! The energy densities at adjacent points [R Z3 T-2 ~> J m-2]
+  real :: dMx, dMn ! The maximum and minimum of values of energy density at adjacent points
+                   ! relative to the center point [R Z3 T-2 ~> J m-2]
   character(len=256) :: mesg  ! The text of an error message
   integer :: i, j, isl, iel, jsl, jel, stencil
 
@@ -2034,18 +2303,19 @@ end subroutine PPM_reconstruction_x
 !> Calculates left/right edge valus for PPM reconstruction in y-direction.
 subroutine PPM_reconstruction_y(h_in, h_l, h_r, G, LB, simple_2nd)
   type(ocean_grid_type),            intent(in)  :: G    !< The ocean's grid structure.
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: h_in !< Energy density in a sector (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_l  !< Left edge value of reconstruction (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_r  !< Right edge value of reconstruction (2D).
+  real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: h_in !< Energy density in a sector (2D) [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_l  !< Left edge value of reconstruction (2D) [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(out) :: h_r  !< Right edge value of reconstruction (2D) [R Z3 T-2 ~> J m-2]
   type(loop_bounds_type),           intent(in)  :: LB   !< A structure with the active loop bounds.
   logical,                          intent(in)  :: simple_2nd !< If true, use the arithmetic mean
                                                         !! energy densities as default edge values
                                                         !! for a simple 2nd order scheme.
   ! Local variables
-  real, dimension(SZI_(G),SZJ_(G))  :: slp ! The slopes.
-  real, parameter :: oneSixth = 1./6.
-  real :: h_jp1, h_jm1
-  real :: dMx, dMn
+  real, dimension(SZI_(G),SZJ_(G))  :: slp ! The slope in energy density times the cell width [R Z3 T-2 ~> J m-2]
+  real, parameter :: oneSixth = 1./6. ! One sixth [nondim]
+  real :: h_jp1, h_jm1 ! The energy densities at adjacent points [R Z3 T-2 ~> J m-2]
+  real :: dMx, dMn ! The maximum and minimum of values of energy density at adjacent points
+                   ! relative to the center point [R Z3 T-2 ~> J m-2]
   character(len=256) :: mesg  ! The text of an error message
   integer :: i, j, isl, iel, jsl, jel, stencil
 
@@ -2105,22 +2375,24 @@ end subroutine PPM_reconstruction_y
 
 !> Limits the left/right edge values of the PPM reconstruction
 !! to give a reconstruction that is positive-definite.  Here this is
-!! reinterpreted as giving a constant thickness if the mean thickness is less
+!! reinterpreted as giving a constant value if the mean value is less
 !! than h_min, with a minimum of h_min otherwise.
 subroutine PPM_limit_pos(h_in, h_L, h_R, h_min, G, iis, iie, jis, jie)
   type(ocean_grid_type),            intent(in)     :: G     !< The ocean's grid structure.
-  real, dimension(SZI_(G),SZJ_(G)), intent(in)     :: h_in  !< Thickness of layer (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(inout)  :: h_L   !< Left edge value (2D).
-  real, dimension(SZI_(G),SZJ_(G)), intent(inout)  :: h_R   !< Right edge value (2D).
-  real,                             intent(in)     :: h_min !< The minimum thickness that can be
-                                                            !! obtained by a concave parabolic fit.
+  real, dimension(SZI_(G),SZJ_(G)), intent(in)     :: h_in  !< Energy density in each sector (2D) [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(inout)  :: h_L   !< Left edge value of reconstruction  [R Z3 T-2 ~> J m-2]
+  real, dimension(SZI_(G),SZJ_(G)), intent(inout)  :: h_R   !< Right edge value of reconstruction [R Z3 T-2 ~> J m-2]
+  real,                             intent(in)     :: h_min !< The minimum value that can be
+                                                            !! obtained by a concave parabolic fit [R Z3 T-2 ~> J m-2]
   integer,                          intent(in)     :: iis   !< Start i-index for computations
   integer,                          intent(in)     :: iie   !< End i-index for computations
   integer,                          intent(in)     :: jis   !< Start j-index for computations
   integer,                          intent(in)     :: jie   !< End j-index for computations
   ! Local variables
-  real    :: curv, dh, scale
-  integer :: i,j
+  real    :: curv    ! The cell-area normalized curvature [R Z3 T-2 ~> J m-2]
+  real    :: dh      ! The difference between the edge values [R Z3 T-2 ~> J m-2]
+  real    :: scale   ! A rescaling factor used to give a minimum cell value of at least h_min [nondim]
+  integer :: i, j
 
   do j=jis,jie ; do i=iis,iie
     ! This limiter prevents undershooting minima within the domain with
@@ -2143,43 +2415,120 @@ subroutine PPM_limit_pos(h_in, h_L, h_R, h_min, G, iis, iie, jis, jie)
   enddo ; enddo
 end subroutine PPM_limit_pos
 
-! subroutine register_int_tide_restarts(G, param_file, CS, restart_CS)
-!   type(ocean_grid_type), intent(inout) :: G    !< The ocean's grid structure
-!   type(param_file_type), intent(in) :: param_file !< A structure to parse for run-time parameters
-!   type(int_tide_CS),     intent(in)    :: CS   !< Internal tide control structure
-!   type(MOM_restart_CS),  intent(inout) :: restart_CS !< MOM restart control structure
+subroutine register_int_tide_restarts(G, US, param_file, CS, restart_CS)
+  type(ocean_grid_type), intent(in) :: G          !< The ocean's grid structure
+  type(unit_scale_type), intent(in) :: US         !< A dimensional unit scaling type
+  type(param_file_type), intent(in) :: param_file !< A structure to parse for run-time parameters
+  type(int_tide_CS),     pointer    :: CS         !< Internal tide control structure
+  type(MOM_restart_CS),  pointer    :: restart_CS !< MOM restart control structure
 
-!   ! This subroutine is not currently in use!!
+  ! This subroutine is used to allocate and register any fields in this module
+  ! that should be written to or read from the restart file.
+  logical :: use_int_tides
+  integer :: num_freq, num_angle , num_mode, period_1
+  integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, i, j, a, fr
+  character(64) :: var_name, cfr
 
-!   ! This subroutine is used to allocate and register any fields in this module
-!   ! that should be written to or read from the restart file.
-!   logical :: use_int_tides
-!   integer :: num_freq, num_angle , num_mode, period_1
-!   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, a
-!   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
-!   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
+  type(axis_info) :: axes_inttides(2)
+  real, dimension(:), allocatable :: angles, freqs ! Lables for angles and frequencies [nondim]
 
-!   if (associated(CS)) then
-!     call MOM_error(WARNING, "register_int_tide_restarts called "//&
-!                              "with an associated control structure.")
-!     return
-!   endif
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
-!   use_int_tides = .false.
-!   call read_param(param_file, "INTERNAL_TIDES", use_int_tides)
-!   if (.not.use_int_tides) return
+  if (associated(CS)) then
+    call MOM_error(WARNING, "register_int_tide_restarts called "//&
+                             "with an associated control structure.")
+    return
+  endif
 
-!   allocate(CS)
+  allocate(CS)
 
-!   num_angle = 24
-!   call read_param(param_file, "INTERNAL_TIDE_ANGLES", num_angle)
-!   allocate(CS%En_restart(isd:ied, jsd:jed, num_angle), source=0.0)
+  ! write extra axes
+  call get_param(param_file, "MOM", "INTERNAL_TIDE_ANGLES", num_angle, default=24)
+  call get_param(param_file, "MOM", "INTERNAL_TIDE_FREQS", num_freq, default=1)
+  call get_param(param_file, "MOM", "INTERNAL_TIDE_MODES", num_mode, default=1)
 
-!   call register_restart_field(CS%En_restart, "En_restart", .false., restart_CS, &
-!            longname="The internal wave energy density as a function of (i,j,angle,frequency,mode)", &
-!            units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1')
+  allocate (angles(num_angle))
+  allocate (freqs(num_freq))
 
-! end subroutine register_int_tide_restarts
+  do a=1,num_angle ; angles(a)= a ; enddo
+  do fr=1,num_freq ; freqs(fr)= fr ; enddo
+
+  call set_axis_info(axes_inttides(1), "angle", "", "angle direction", num_angle, angles, "N", 1)
+  call set_axis_info(axes_inttides(2), "freq", "", "wave frequency", num_freq, freqs, "N", 1)
+
+  ! full energy array
+  allocate(CS%En(isd:ied, jsd:jed, num_angle, num_freq, num_mode), source=0.0)
+
+  ! restart strategy: support for 5d restart is not yet available so we split into
+  ! 4d restarts. Vertical modes >= 6 are dissipated locally and do not propagate
+  ! so we only allow for 5 vertical modes and each has its own variable
+
+  ! allocate restart arrays
+  allocate(CS%En_restart_mode1(isd:ied, jsd:jed, num_angle, num_freq), source=0.0)
+  if (num_mode >= 2) allocate(CS%En_restart_mode2(isd:ied, jsd:jed, num_angle, num_freq), source=0.0)
+  if (num_mode >= 3) allocate(CS%En_restart_mode3(isd:ied, jsd:jed, num_angle, num_freq), source=0.0)
+  if (num_mode >= 4) allocate(CS%En_restart_mode4(isd:ied, jsd:jed, num_angle, num_freq), source=0.0)
+  if (num_mode >= 5) allocate(CS%En_restart_mode5(isd:ied, jsd:jed, num_angle, num_freq), source=0.0)
+
+  ! register all 4d restarts and copy into full Energy array when restarting from previous state
+  call register_restart_field(CS%En_restart_mode1(:,:,:,:), "IW_energy_mode1", .false., restart_CS, &
+                              longname="The internal wave energy density f(i,j,angle,freq) for mode 1", &
+                              units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1', t_grid="s", &
+                              extra_axes=axes_inttides)
+
+  do fr=1,num_freq ; do a=1,num_angle ; do j=jsd,jed ; do i=isd,ied
+    CS%En(i,j,a,fr,1) = CS%En_restart_mode1(i,j,a,fr)
+  enddo ; enddo ; enddo ; enddo
+
+  if (num_mode >= 2) then
+    call register_restart_field(CS%En_restart_mode2(:,:,:,:), "IW_energy_mode2", .false., restart_CS, &
+                                longname="The internal wave energy density f(i,j,angle,freq) for mode 2", &
+                                units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1', t_grid="s", &
+                                extra_axes=axes_inttides)
+
+    do fr=1,num_freq ; do a=1,num_angle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,2) = CS%En_restart_mode2(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+
+  endif
+
+  if (num_mode >= 3) then
+    call register_restart_field(CS%En_restart_mode3(:,:,:,:), "IW_energy_mode3", .false., restart_CS, &
+                                longname="The internal wave energy density f(i,j,angle,freq) for mode 3", &
+                                units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1', t_grid="s", &
+                                extra_axes=axes_inttides)
+
+    do fr=1,num_freq ; do a=1,num_angle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,3) = CS%En_restart_mode3(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+
+  endif
+
+  if (num_mode >= 4) then
+    call register_restart_field(CS%En_restart_mode4(:,:,:,:), "IW_energy_mode4", .false., restart_CS, &
+                                longname="The internal wave energy density f(i,j,angle,freq) for mode 4", &
+                                units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1', t_grid="s", &
+                                extra_axes=axes_inttides)
+
+    do fr=1,num_freq ; do a=1,num_angle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,4) = CS%En_restart_mode4(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+
+  endif
+
+  if (num_mode >= 5) then
+    call register_restart_field(CS%En_restart_mode5(:,:,:,:), "IW_energy_mode5", .false., restart_CS, &
+                                longname="The internal wave energy density f(i,j,angle,freq) for mode 5", &
+                                units="J m-2", conversion=US%RZ3_T3_to_W_m2*US%T_to_s, z_grid='1', t_grid="s", &
+                                extra_axes=axes_inttides)
+
+    do fr=1,num_freq ; do a=1,num_angle ; do j=jsd,jed ; do i=isd,ied
+      CS%En(i,j,a,fr,5) = CS%En_restart_mode5(i,j,a,fr)
+    enddo ; enddo ; enddo ; enddo
+
+  endif
+
+end subroutine register_int_tide_restarts
 
 !> This subroutine initializes the internal tides module.
 subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
@@ -2191,22 +2540,25 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                                                    !! parameters.
   type(diag_ctrl), target,   intent(in)    :: diag !< A structure that is used to regulate
                                                    !! diagnostic output.
-  type(int_tide_CS),         intent(inout) :: CS   !< Internal tide control structure
+  type(int_tide_CS),         pointer :: CS         !< Internal tide control structure
 
   ! Local variables
-  real                              :: Angle_size ! size of wedges, rad
-  real, allocatable                 :: angles(:)  ! orientations of wedge centers, rad
+  real                              :: Angle_size ! size of wedges [rad]
+  real, allocatable                 :: angles(:)  ! orientations of wedge centers [rad]
   real, dimension(:,:), allocatable :: h2         ! topographic roughness scale squared [Z2 ~> m2]
   real                              :: kappa_itides ! characteristic topographic wave number [L-1 ~> m-1]
   real, dimension(:,:), allocatable :: ridge_temp ! array for temporary storage of flags
-                                                  ! of cells with double-reflecting ridges
+                                                  ! of cells with double-reflecting ridges [nondim]
   logical :: use_int_tides, use_temperature
+  real    :: IGW_c1_thresh ! A threshold first mode internal wave speed below which all higher
+                 ! mode speeds are not calculated but simply assigned a speed of 0 [L T-1 ~> m s-1].
   real    :: kappa_h2_factor    ! A roughness scaling factor [nondim]
   real    :: RMS_roughness_frac ! The maximum RMS topographic roughness as a fraction of the
                                 ! nominal ocean depth, or a negative value for no limit [nondim]
   real    :: period_1           ! The period of the gravest modeled mode [T ~> s]
+  real    :: period             ! A tidal period read from namelist [T ~> s]
   integer :: num_angle, num_freq, num_mode, m, fr
-  integer :: isd, ied, jsd, jed, a, id_ang, i, j
+  integer :: isd, ied, jsd, jed, a, id_ang, i, j, nz
   type(axes_grp) :: axes_ang
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
@@ -2220,7 +2572,13 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   character(len=200) :: h2_file
   character(len=80)  :: rough_var ! Input file variable names
 
+  character(len=240), dimension(:), allocatable :: energy_fractions
+  character(len=240) :: periods
+
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  nz = GV%ke
+
+  CS%initialized = .true.
 
   use_int_tides = .false.
   call read_param(param_file, "INTERNAL_TIDES", use_int_tides)
@@ -2230,8 +2588,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   use_temperature = .true.
   call read_param(param_file, "ENABLE_THERMODYNAMICS", use_temperature)
   if (.not.use_temperature) call MOM_error(FATAL, &
-    "register_int_tide_restarts: internal_tides only works with "//&
-    "ENABLE_THERMODYNAMICS defined.")
+      "internal_tides_init: internal_tides only works with ENABLE_THERMODYNAMICS defined.")
 
   ! Set number of frequencies, angles, and modes to consider
   num_freq = 1 ; num_angle = 24 ; num_mode = 1
@@ -2241,20 +2598,29 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   if (.not.((num_freq > 0) .and. (num_angle > 0) .and. (num_mode > 0))) return
   CS%nFreq = num_freq ; CS%nAngle = num_angle ; CS%nMode = num_mode
 
-  ! Allocate energy density array
-  allocate(CS%En(isd:ied, jsd:jed, num_angle, num_freq, num_mode), source=0.0)
+  allocate(energy_fractions(num_freq))
+  allocate(CS%fraction_tidal_input(num_freq,num_mode))
+
+  call read_param(param_file, "ENERGY_FRACTION_PER_MODE", energy_fractions)
+
+  do fr=1,num_freq ; do m=1,num_mode
+    CS%fraction_tidal_input(fr,m) = extract_real(energy_fractions(fr), " ,", m, 0.)
+  enddo ; enddo
 
   ! Allocate phase speed array
   allocate(CS%cp(isd:ied, jsd:jed, num_freq, num_mode), source=0.0)
 
   ! Allocate and populate frequency array (each a multiple of first for now)
   allocate(CS%frequency(num_freq))
-  call get_param(param_file, mdl, "FIRST_MODE_PERIOD", period_1, &
-                 "The period of the first mode for internal tides", default=44567., &
-                 units="s", scale=US%s_to_T)
+
+
+  ! The periods of the tidal constituents for internal tides raytracing
+  call read_param(param_file, "TIDAL_PERIODS", periods)
 
   do fr=1,num_freq
-    CS%frequency(fr) = (8.0*atan(1.0) * (real(fr)) / period_1) ! ADDED BDM
+    period = extract_real(periods, " ,", fr, 0.)
+    if (period == 0.) call MOM_error(FATAL, "MOM_internal_tides: invalid tidal period")
+    CS%frequency(fr) = 8.0*atan(1.0)/period
   enddo
 
   ! Read all relevant parameters and write them to the model log.
@@ -2295,7 +2661,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
       "Inconsistent number of frequencies.")
   if (CS%NAngle /= num_angle) call MOM_error(FATAL, "Internal_tides_init: "//&
       "Inconsistent number of angles.")
-  if (CS%NMode /= num_mode) call MOM_error(FATAL, "Internal_tides_init: "//&
+  if (CS%nMode /= num_mode) call MOM_error(FATAL, "Internal_tides_init: "//&
       "Inconsistent number of modes.")
   if (4*(num_angle/4) /= num_angle) call MOM_error(FATAL, &
     "Internal_tides_init: INTERNAL_TIDE_ANGLES must be a multiple of 4.")
@@ -2341,8 +2707,8 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   call get_param(param_file, mdl, "INTERNAL_TIDE_DRAG_MIN_DEPTH", CS%drag_min_depth, &
                  "The minimum total ocean thickness that will be used in the denominator "//&
                  "of the quadratic drag terms for internal tides.", &
-                 units="m", default=1.0, scale=US%m_to_Z, do_not_log=.not.CS%apply_bottom_drag)
-  CS%drag_min_depth = MAX(CS%drag_min_depth, GV%H_subroundoff * GV%H_to_Z)
+                 units="m", default=1.0, scale=GV%m_to_H, do_not_log=.not.CS%apply_bottom_drag)
+  CS%drag_min_depth = MAX(CS%drag_min_depth, GV%H_subroundoff)
   call get_param(param_file, mdl, "INTERNAL_TIDE_FROUDE_DRAG", CS%apply_Froude_drag, &
                  "If true, apply wave breaking as a sink.", &
                  default=.false.)
@@ -2355,6 +2721,15 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                  "CDRAG is the drag coefficient relating the magnitude of "//&
                  "the velocity field to the bottom stress.", &
                  units="nondim", default=0.003)
+  call get_param(param_file, mdl, "INTERNAL_WAVE_CG1_THRESH", IGW_c1_thresh, &
+                 "A minimal value of the first mode internal wave speed below which all higher "//&
+                 "mode speeds are not calculated but are simply reported as 0.  This must be "//&
+                 "non-negative for the wave_speeds routine to be used.", &
+                 units="m s-1", default=0.01, scale=US%m_s_to_L_T)
+
+  call get_param(param_file, mdl, "UNIFORM_TEST_CG", CS%uniform_test_cg, &
+                 "If positive, a uniform group velocity of internal tide for test case", &
+                 default=-1., units="m s-1", scale=US%m_s_to_L_T)
   call get_param(param_file, mdl, "INTERNAL_TIDE_ENERGIZED_ANGLE", CS%energized_angle, &
                  "If positive, only one angular band of the internal tides "//&
                  "gets all of the energy.  (This is for debugging.)", default=-1)
@@ -2387,6 +2762,13 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   allocate(CS%tot_itidal_loss(isd:ied,jsd:jed), source=0.0)
   allocate(CS%tot_Froude_loss(isd:ied,jsd:jed), source=0.0)
   allocate(CS%tot_residual_loss(isd:ied,jsd:jed), source=0.0)
+  allocate(CS%u_struct_bot(isd:ied,jsd:jed,num_mode), source=0.0)
+  allocate(CS%u_struct_max(isd:ied,jsd:jed,num_mode), source=0.0)
+  allocate(CS%int_w2(isd:ied,jsd:jed,num_mode), source=0.0)
+  allocate(CS%int_U2(isd:ied,jsd:jed,num_mode), source=0.0)
+  allocate(CS%int_N2w2(isd:ied,jsd:jed,num_mode), source=0.0)
+  allocate(CS%w_struct(isd:ied,jsd:jed,1:nz+1,num_mode), source=0.0)
+  allocate(CS%u_struct(isd:ied,jsd:jed,1:nz,num_mode), source=0.0)
 
   ! Compute the fixed part of the bottom drag loss from baroclinic modes
   call get_param(param_file, mdl, "H2_FILE", h2_file, &
@@ -2410,9 +2792,10 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
     else
       h2(i,j) = max(h2(i,j), 0.0)
     endif
-    ! Compute the fixed part; units are [R L-2 Z3 ~> kg m-2] here
-    ! will be multiplied by N and the squared near-bottom velocity to get into [R Z3 T-3 ~> W m-2]
-    CS%TKE_itidal_loss_fixed(i,j) = 0.5*kappa_h2_factor*GV%Rho0 * US%L_to_Z*kappa_itides * h2(i,j)
+    ! Compute the fixed part; units are [R Z4 H-1 L-2 ~> kg m-2 or m] here
+    ! will be multiplied by N and the squared near-bottom velocity (and by the
+    ! near-bottom density in non-Boussinesq mode) to get into [R Z3 T-3 ~> W m-2]
+    CS%TKE_itidal_loss_fixed(i,j) = 0.5*kappa_h2_factor* GV%H_to_RZ * US%L_to_Z*kappa_itides * h2(i,j)
   enddo ; enddo
 
   deallocate(h2)
@@ -2431,11 +2814,11 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
     if (trim(refl_angle_file) /= '' ) call MOM_error(FATAL, &
                                                      "REFL_ANGLE_FILE: "//trim(filename)//" not found")
   endif
-  ! replace NANs with null value
+  ! replace NaNs with null value
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if (is_NaN(CS%refl_angle(i,j))) CS%refl_angle(i,j) = CS%nullangle
   enddo ; enddo
-  call pass_var(CS%refl_angle,G%domain)
+  call pass_var(CS%refl_angle, G%domain)
 
   ! Read in prescribed partial reflection coefficients from file
   call get_param(param_file, mdl, "REFL_PREF_FILE", refl_pref_file, &
@@ -2451,19 +2834,17 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                                                     "REFL_PREF_FILE: "//trim(filename)//" not found")
   endif
   !CS%refl_pref = CS%refl_pref*1 ! adjust partial reflection if desired
-  call pass_var(CS%refl_pref,G%domain)
+  call pass_var(CS%refl_pref, G%domain)
 
   ! Tag reflection cells with partial reflection (done here for speed)
   allocate(CS%refl_pref_logical(isd:ied,jsd:jed), source=.false.)
-  do j=jsd,jed
-    do i=isd,ied
-      ! flag cells with partial reflection
-      if (CS%refl_angle(i,j) /= CS%nullangle .and. &
-        CS%refl_pref(i,j) < 1.0 .and. CS%refl_pref(i,j) > 0.0) then
-        CS%refl_pref_logical(i,j) = .true.
-      endif
-    enddo
-  enddo
+  do j=jsd,jed ; do i=isd,ied
+    ! flag cells with partial reflection
+    if ((CS%refl_angle(i,j) /= CS%nullangle) .and. &
+        (CS%refl_pref(i,j) < 1.0) .and. (CS%refl_pref(i,j) > 0.0)) then
+      CS%refl_pref_logical(i,j) = .true.
+    endif
+  enddo ; enddo
 
   ! Read in double-reflective (ridge) tags from file
   call get_param(param_file, mdl, "REFL_DBL_FILE", refl_dbl_file, &
@@ -2478,11 +2859,10 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
     if (trim(refl_dbl_file) /= '' ) call MOM_error(FATAL, &
                                                    "REFL_DBL_FILE: "//trim(filename)//" not found")
   endif
-  call pass_var(ridge_temp,G%domain)
+  call pass_var(ridge_temp, G%domain)
   allocate(CS%refl_dbl(isd:ied,jsd:jed), source=.false.)
-  do i=isd,ied ; do j=jsd,jed
-    if (ridge_temp(i,j) == 1) then; CS%refl_dbl(i,j) = .true.
-    else ; CS%refl_dbl(i,j) = .false. ; endif
+  do j=jsd,jed ; do i=isd,ied
+    CS%refl_dbl(i,j) = (ridge_temp(i,j) == 1)
   enddo ; enddo
 
   ! Read in the transmission coefficient and infer the residual
@@ -2499,17 +2879,27 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                                                 "TRANS_FILE: "//trim(filename)//" not found")
   endif
 
-  call pass_var(CS%trans,G%domain)
+  call pass_var(CS%trans, G%domain)
+
   ! residual
   allocate(CS%residual(isd:ied,jsd:jed), source=0.0)
-  do j=jsd,jed
-    do i=isd,ied
-      if (CS%refl_pref_logical(i,j)) then
-        CS%residual(i,j) = 1. - CS%refl_pref(i,j) - CS%trans(i,j)
-      endif
-    enddo
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if (CS%refl_pref_logical(i,j)) then
+      CS%residual(i,j) = 1. - CS%refl_pref(i,j) - CS%trans(i,j)
+    endif
+  enddo ; enddo
+  call pass_var(CS%residual, G%domain)
+
+  CS%id_cg1 = register_diag_field('ocean_model', 'cn1', diag%axesT1, &
+               Time, 'First baroclinic mode (eigen) speed', 'm s-1', conversion=US%L_T_to_m_s)
+  allocate(CS%id_cn(CS%nMode), source=-1)
+  do m=1,CS%nMode
+    write(var_name, '("cn_mode",i1)') m
+    write(var_descript, '("Baroclinic (eigen) speed of mode ",i1)') m
+    CS%id_cn(m) = register_diag_field('ocean_model',var_name, diag%axesT1, &
+                 Time, var_descript, 'm s-1', conversion=US%L_T_to_m_s)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
   enddo
-  call pass_var(CS%residual,G%domain)
 
   ! Register maps of reflection parameters
   CS%id_refl_ang = register_diag_field('ocean_model', 'refl_angle', diag%axesT1, &
@@ -2526,7 +2916,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                  Time, 'East face unblocked width', 'm', conversion=US%L_to_m)
   CS%id_land_mask = register_diag_field('ocean_model', 'land_mask', diag%axesT1, &
                  Time, 'Land mask', 'nondim')
-  ! Output reflection parameters as diags here (not needed every timestep)
+  ! Output reflection parameters as diagnostics here (not needed every timestep)
   if (CS%id_refl_ang > 0)   call post_data(CS%id_refl_ang, CS%refl_angle, CS%diag)
   if (CS%id_refl_pref > 0)  call post_data(CS%id_refl_pref, CS%refl_pref, CS%diag)
   if (CS%id_trans > 0)      call post_data(CS%id_trans, CS%trans, CS%diag)
@@ -2539,14 +2929,18 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   CS%id_tot_En = register_diag_field('ocean_model', 'ITide_tot_En', diag%axesT1, &
                  Time, 'Internal tide total energy density', &
                  'J m-2', conversion=US%RZ3_T3_to_W_m2*US%T_to_s)
-  ! Register 2-D drag scale used for quadratic bottom drag
-  CS%id_itide_drag = register_diag_field('ocean_model', 'ITide_drag', diag%axesT1, &
-                 Time, 'Interior and bottom drag internal tide decay timescale', 's-1', conversion=US%s_to_T)
-  !Register 2-D energy input into internal tides
-  CS%id_TKE_itidal_input = register_diag_field('ocean_model', 'TKE_itidal_input', diag%axesT1, &
-                 Time, 'Conversion from barotropic to baroclinic tide, '//&
-                 'a fraction of which goes into rays', &
-                 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+
+  allocate(CS%id_itide_drag(CS%nFreq, CS%nMode), source=-1)
+  allocate(CS%id_TKE_itidal_input(CS%nFreq), source=-1)
+  do fr=1,CS%nFreq
+    ! Register 2-D energy input into internal tides for each frequency
+    write(var_name, '("TKE_itidal_input_freq",i1)') fr
+    write(var_descript, '("a fraction of which goes into rays in frequency ",i1)') fr
+
+    CS%id_TKE_itidal_input(fr) = register_diag_field('ocean_model', var_name, diag%axesT1, &
+                                                     Time, 'Conversion from barotropic to baroclinic tide, '//&
+                                                     var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+  enddo
   ! Register 2-D energy losses (summed over angles, freq, modes)
   CS%id_tot_leak_loss = register_diag_field('ocean_model', 'ITide_tot_leak_loss', diag%axesT1, &
                 Time, 'Internal tide energy loss to background drag', &
@@ -2570,9 +2964,18 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   allocate(CS%id_En_mode(CS%nFreq,CS%nMode), source=-1)
   allocate(CS%id_En_ang_mode(CS%nFreq,CS%nMode), source=-1)
   allocate(CS%id_itidal_loss_mode(CS%nFreq,CS%nMode), source=-1)
+  allocate(CS%id_leak_loss_mode(CS%nFreq,CS%nMode), source=-1)
+  allocate(CS%id_quad_loss_mode(CS%nFreq,CS%nMode), source=-1)
+  allocate(CS%id_Froude_loss_mode(CS%nFreq,CS%nMode), source=-1)
+  allocate(CS%id_residual_loss_mode(CS%nFreq,CS%nMode), source=-1)
   allocate(CS%id_allprocesses_loss_mode(CS%nFreq,CS%nMode), source=-1)
   allocate(CS%id_itidal_loss_ang_mode(CS%nFreq,CS%nMode), source=-1)
   allocate(CS%id_Ub_mode(CS%nFreq,CS%nMode), source=-1)
+  allocate(CS%id_Ustruct_mode(CS%nMode), source=-1)
+  allocate(CS%id_Wstruct_mode(CS%nMode), source=-1)
+  allocate(CS%id_int_w2_mode(CS%nMode), source=-1)
+  allocate(CS%id_int_U2_mode(CS%nMode), source=-1)
+  allocate(CS%id_int_N2w2_mode(CS%nMode), source=-1)
   allocate(CS%id_cp_mode(CS%nFreq,CS%nMode), source=-1)
 
   allocate(angles(CS%NAngle), source=0.0)
@@ -2584,25 +2987,49 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                          axes_ang, is_h_point=.true.)
   do fr=1,CS%nFreq ; write(freq_name(fr), '("freq",i1)') fr ; enddo
   do m=1,CS%nMode ; do fr=1,CS%nFreq
-    ! Register 2-D energy density (summed over angles) for each freq and mode
+    ! Register 2-D energy density (summed over angles) for each frequency and mode
     write(var_name, '("Itide_En_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Internal tide energy density in frequency ",i1," mode ",i1)') fr, m
     CS%id_En_mode(fr,m) = register_diag_field('ocean_model', var_name, &
                  diag%axesT1, Time, var_descript, 'J m-2', conversion=US%RZ3_T3_to_W_m2*US%T_to_s)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
-    ! Register 3-D (i,j,a) energy density for each freq and mode
+    ! Register 3-D (i,j,a) energy density for each frequency and mode
     write(var_name, '("Itide_En_ang_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Internal tide angular energy density in frequency ",i1," mode ",i1)') fr, m
     CS%id_En_ang_mode(fr,m) = register_diag_field('ocean_model', var_name, &
                  axes_ang, Time, var_descript, 'J m-2 band-1', conversion=US%RZ3_T3_to_W_m2*US%T_to_s)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
-    ! Register 2-D energy loss (summed over angles) for each freq and mode
+    ! Register 2-D energy loss (summed over angles) for each frequency and mode
     ! wave-drag only
     write(var_name, '("Itide_wavedrag_loss_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Internal tide energy loss due to wave-drag from frequency ",i1," mode ",i1)') fr, m
     CS%id_itidal_loss_mode(fr,m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+    ! Leakage loss
+    write(var_name, '("Itide_leak_loss_freq",i1,"_mode",i1)') fr, m
+    write(var_descript, '("Internal tide energy loss due to leakage from frequency ",i1," mode ",i1)') fr, m
+    CS%id_leak_loss_mode(fr,m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+    ! Quad loss
+    write(var_name, '("Itide_quad_loss_freq",i1,"_mode",i1)') fr, m
+    write(var_descript, '("Internal tide energy quad loss from frequency ",i1," mode ",i1)') fr, m
+    CS%id_quad_loss_mode(fr,m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+    ! Froude loss
+    write(var_name, '("Itide_froude_loss_freq",i1,"_mode",i1)') fr, m
+    write(var_descript, '("Internal tide energy Froude loss from frequency ",i1," mode ",i1)') fr, m
+    CS%id_froude_loss_mode(fr,m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+    ! residual losses
+    write(var_name, '("Itide_residual_loss_freq",i1,"_mode",i1)') fr, m
+    write(var_descript, '("Internal tide energy residual loss from frequency ",i1," mode ",i1)') fr, m
+    CS%id_residual_loss_mode(fr,m) = register_diag_field('ocean_model', var_name, &
                  diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
     ! all loss processes
@@ -2612,7 +3039,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                  diag%axesT1, Time, var_descript, 'W m-2', conversion=US%RZ3_T3_to_W_m2)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
-    ! Register 3-D (i,j,a) energy loss for each freq and mode
+    ! Register 3-D (i,j,a) energy loss for each frequency and mode
     ! wave-drag only
     write(var_name, '("Itide_wavedrag_loss_ang_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Internal tide energy loss due to wave-drag from frequency ",i1," mode ",i1)') fr, m
@@ -2620,36 +3047,85 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                  axes_ang, Time, var_descript, 'W m-2 band-1', conversion=US%RZ3_T3_to_W_m2)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
-    ! Register 2-D period-averaged near-bottom horizontal velocity for each freq and mode
+    ! Register 2-D period-averaged near-bottom horizontal velocity for each frequency and mode
     write(var_name, '("Itide_Ub_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Near-bottom horizontal velocity for frequency ",i1," mode ",i1)') fr, m
     CS%id_Ub_mode(fr,m) = register_diag_field('ocean_model', var_name, &
                  diag%axesT1, Time, var_descript, 'm s-1', conversion=US%L_T_to_m_s)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
-    ! Register 2-D horizonal phase velocity for each freq and mode
+    ! Register 2-D horizontal phase velocity for each frequency and mode
     write(var_name, '("Itide_cp_freq",i1,"_mode",i1)') fr, m
     write(var_descript, '("Horizontal phase velocity for frequency ",i1," mode ",i1)') fr, m
     CS%id_cp_mode(fr,m) = register_diag_field('ocean_model', var_name, &
                  diag%axesT1, Time, var_descript, 'm s-1', conversion=US%L_T_to_m_s)
     call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
 
+    ! Register 2-D drag scale used for quadratic bottom drag for each frequency and mode
+    write(var_name, '("ITide_drag_freq",i1,"_mode",i1)') fr, m
+    write(var_descript, '("Interior and bottom drag int tide decay timescale in frequency ",i1, " mode ",i1)') fr, m
+
+    CS%id_itide_drag(fr,m) = register_diag_field('ocean_model', var_name, diag%axesT1, Time, &
+                                                 's-1', conversion=US%s_to_T)
   enddo ; enddo
 
-  ! Initialize wave_structure (not sure if this should be here - BDM)
-  call wave_structure_init(Time, G, GV, param_file, diag, CS%wave_struct)
+
+  do m=1,CS%nMode
+
+    ! Register 3-D internal tide horizonal velocity profile for each mode
+    write(var_name, '("Itide_Ustruct","_mode",i1)') m
+    write(var_descript, '("horizonal velocity profile for mode ",i1)') m
+    CS%id_Ustruct_mode(m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesTl, Time, var_descript, 'm-1', conversion=US%m_to_L)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+
+    ! Register 3-D internal tide vertical velocity profile for each mode
+    write(var_name, '("Itide_Wstruct","_mode",i1)') m
+    write(var_descript, '("vertical velocity profile for mode ",i1)') m
+    CS%id_Wstruct_mode(m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesTi, Time, var_descript, '[]')
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+
+    write(var_name, '("Itide_int_w2","_mode",i1)') m
+    write(var_descript, '("integral of w2 for mode ",i1)') m
+    CS%id_int_w2_mode(m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'm', conversion=GV%H_to_m)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+
+    write(var_name, '("Itide_int_U2","_mode",i1)') m
+    write(var_descript, '("integral of U2 for mode ",i1)') m
+    CS%id_int_U2_mode(m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'm-1', conversion=US%m_to_Z*GV%H_to_Z)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+
+    write(var_name, '("Itide_int_N2w2","_mode",i1)') m
+    write(var_descript, '("integral of N2w2 for mode ",i1)') m
+    CS%id_int_N2w2_mode(m) = register_diag_field('ocean_model', var_name, &
+                 diag%axesT1, Time, var_descript, 'm s-2', conversion=GV%H_to_m*US%s_to_T**2)
+    call MOM_mesg("Registering "//trim(var_name)//", Described as: "//var_descript, 5)
+
+  enddo
+
+  ! Initialize the module that calculates the wave speeds.
+  call wave_speed_init(CS%wave_speed, c1_thresh=IGW_c1_thresh)
 
 end subroutine internal_tides_init
 
 !> This subroutine deallocates the memory associated with the internal tides control structure
 subroutine internal_tides_end(CS)
-  type(int_tide_CS), intent(inout) :: CS  !<  Internal tide control struct
+  type(int_tide_CS), intent(inout) :: CS  !<  Internal tide control structure
 
   if (allocated(CS%En)) deallocate(CS%En)
   if (allocated(CS%frequency)) deallocate(CS%frequency)
   if (allocated(CS%id_En_mode)) deallocate(CS%id_En_mode)
   if (allocated(CS%id_Ub_mode)) deallocate(CS%id_Ub_mode)
   if (allocated(CS%id_cp_mode)) deallocate(CS%id_cp_mode)
+  if (allocated(CS%id_Ustruct_mode)) deallocate(CS%id_Ustruct_mode)
+  if (allocated(CS%id_Wstruct_mode)) deallocate(CS%id_Wstruct_mode)
+  if (allocated(CS%id_int_w2_mode)) deallocate(CS%id_int_w2_mode)
+  if (allocated(CS%id_int_U2_mode)) deallocate(CS%id_int_U2_mode)
+  if (allocated(CS%id_int_N2w2_mode)) deallocate(CS%id_int_N2w2_mode)
+
 end subroutine internal_tides_end
 
 end module MOM_internal_tides

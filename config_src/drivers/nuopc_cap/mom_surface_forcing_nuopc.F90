@@ -17,7 +17,7 @@ use MOM_domains,          only : pass_vector, pass_var, fill_symmetric_edges
 use MOM_domains,          only : AGRID, BGRID_NE, CGRID_NE, To_All
 use MOM_domains,          only : To_North, To_East, Omit_Corners
 use MOM_error_handler,    only : MOM_error, WARNING, FATAL, is_root_pe, MOM_mesg
-use MOM_file_parser,      only : get_param, log_version, param_file_type
+use MOM_file_parser,      only : get_param, log_param, log_version, param_file_type
 use MOM_forcing_type,     only : forcing, mech_forcing
 use MOM_forcing_type,     only : forcing_diags, mech_forcing_diags, register_forcing_type_diags
 use MOM_forcing_type,     only : allocate_forcing_type, deallocate_forcing_type
@@ -26,7 +26,7 @@ use MOM_get_input,        only : Get_MOM_Input, directories
 use MOM_grid,             only : ocean_grid_type
 use MOM_interpolate,      only : init_external_field, time_interp_external
 use MOM_interpolate,      only : time_interp_external_init
-use MOM_CFC_cap,          only : CFC_cap_fluxes
+use MOM_interpolate,      only : external_field
 use MOM_io,               only : slasher, write_version_number, MOM_read_data
 use MOM_io,               only : stdout
 use MOM_restart,          only : register_restart_field, restart_init, MOM_restart_CS
@@ -81,14 +81,14 @@ type, public :: surface_forcing_CS ; private
   logical :: use_CFC            !< enables the MOM_CFC_cap tracer package.
   logical :: enthalpy_cpl       !< Controls if enthalpy terms are provided by the coupler or computed
                                 !! internally.
-  real :: gust_const            !< constant unresolved background gustiness for ustar [R L Z T-1 ~> Pa]
+  real :: gust_const            !< constant unresolved background gustiness for ustar [R L Z T-2 ~> Pa]
   logical :: read_gust_2d       !< If true, use a 2-dimensional gustiness supplied
                                 !! from an input file.
   real, pointer, dimension(:,:) :: &
     TKE_tidal => NULL(), &      !< turbulent kinetic energy introduced to the
                                 !! bottom boundary layer by drag on the tidal flows [R Z3 T-3 ~> W m-2]
     gust => NULL(), &           !< spatially varying unresolved background
-                                !! gustiness that contributes to ustar [R L Z T-1 ~> Pa].
+                                !! gustiness that contributes to ustar [R L Z T-2 ~> Pa].
                                 !! gust is used when read_gust_2d is true.
     ustar_tidal => NULL()       !< tidal contribution to the bottom friction velocity [Z T-1 ~> m s-1]
   real :: cd_tides              !< drag coefficient that applies to the tides (nondimensional)
@@ -124,12 +124,11 @@ type, public :: surface_forcing_CS ; private
   real    :: max_delta_srestore             !< maximum delta salinity used for restoring [S ~> ppt]
   real    :: max_delta_trestore             !< maximum delta sst used for restoring [C ~> degC]
   real, pointer, dimension(:,:) :: basin_mask => NULL() !< mask for SSS restoring by basin
-  logical :: fix_ustar_gustless_bug         !< If true correct a bug in the time-averaging of the
+  logical :: ustar_gustless_bug             !< If true, include a bug in the time-averaging of the
                                             !! gustless wind friction velocity.
 
   type(diag_ctrl), pointer :: diag                  !< structure to regulate diagnostic output timing
   character(len=200)       :: inputdir              !< directory where NetCDF input files are
-  character(len=200)       :: CFC_BC_file           !< filename with cfc11 and cfc12 data
   character(len=200)       :: salt_restore_file     !< filename for salt restoring data
   character(len=30)        :: salt_restore_var_name !< name of surface salinity in salt_restore_file
   logical                  :: mask_srestore         !< if true, apply a 2-dimensional mask to the surface
@@ -143,14 +142,11 @@ type, public :: surface_forcing_CS ; private
                                                     !! temperature restoring fluxes. The masking file should be
                                                     !! in inputdir/temp_restore_mask.nc and the field should
                                                     !! be named 'mask'
-  character(len=30)        :: cfc11_var_name        !< name of cfc11 in CFC_BC_file
-  character(len=30)        :: cfc12_var_name        !< name of cfc11 in CFC_BC_file
   real, pointer, dimension(:,:) :: trestore_mask => NULL() !< mask for SST restoring
-  integer :: id_srestore = -1    !< id number for time_interp_external.
-  integer :: id_trestore = -1    !< id number for time_interp_external.
-  integer :: id_cfc11_atm = -1   !< id number for time_interp_external.
-  integer :: id_cfc12_atm = -1   !< id number for time_interp_external.
-
+  type(external_field) :: srestore_handle
+    !< Handle for time-interpolated salt restoration field
+  type(external_field) :: trestore_handle
+    !< Handle for time-interpolated temperature restoration field
   ! Diagnostics handles
   type(forcing_diags), public :: handles
 
@@ -245,8 +241,6 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
   ! local variables
   real, dimension(SZI_(G),SZJ_(G)) :: &
-    cfc11_atm,     & !< CFC11 concentration in the atmopshere [???????]
-    cfc12_atm,     & !< CFC11 concentration in the atmopshere [???????]
     data_restore,  & !< The surface value toward which to restore [S ~> ppt] or [C ~> degC]
     PmE_adj,       & !< The adjustment to PminusE that will cause the salinity
                      !! to be restored toward its target value [kg/(m^2 * s)]
@@ -302,8 +296,9 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
   ! flux type has been used.
   if (fluxes%dt_buoy_accum < 0) then
     call allocate_forcing_type(G, fluxes, water=.true., heat=.true., ustar=.true., &
-                               press=.true., fix_accum_bug=CS%fix_ustar_gustless_bug, &
-                               cfc=CS%use_CFC, hevap=CS%enthalpy_cpl)
+                               press=.true., fix_accum_bug=.not.CS%ustar_gustless_bug, &
+                               cfc=CS%use_CFC, hevap=CS%enthalpy_cpl, tau_mag=.true.)
+    !call safe_alloc_ptr(fluxes%omega_w2x,isd,ied,jsd,jed)
 
     call safe_alloc_ptr(fluxes%sw_vis_dir,isd,ied,jsd,jed)
     call safe_alloc_ptr(fluxes%sw_vis_dif,isd,ied,jsd,jed)
@@ -377,7 +372,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
   ! Salinity restoring logic
   if (restore_salinity) then
-    call time_interp_external(CS%id_srestore, Time, data_restore, scale=US%ppt_to_S)
+    call time_interp_external(CS%srestore_handle, Time, data_restore, scale=US%ppt_to_S)
     ! open_ocn_mask indicates where to restore salinity (1 means restore, 0 does not)
     open_ocn_mask(:,:) = 1.0
     if (CS%mask_srestore_under_ice) then ! Do not restore under sea-ice
@@ -434,7 +429,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
   ! SST restoring logic
   if (restore_sst) then
-    call time_interp_external(CS%id_trestore, Time, data_restore, scale=US%degC_to_C)
+    call time_interp_external(CS%trestore_handle, Time, data_restore, scale=US%degC_to_C)
     do j=js,je ; do i=is,ie
       delta_sst = data_restore(i,j) - sfc_state%SST(i,j)
       delta_sst = sign(1.0,delta_sst)*min(abs(delta_sst),CS%max_delta_trestore)
@@ -594,11 +589,6 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     fluxes%accumulate_p_surf = .true. ! Multiple components may contribute to surface pressure.
   endif
 
-  ! CFCs
-  if (CS%use_CFC) then
-    call CFC_cap_fluxes(fluxes, sfc_state, G, US, CS%Rho0, Time, CS%id_cfc11_atm, CS%id_cfc11_atm)
-  endif
-
   if (associated(IOB%salt_flux)) then
     do j=js,je ; do i=is,ie
       fluxes%salt_flux(i,j)    = G%mask2dT(i,j)*(fluxes%salt_flux(i,j) + kg_m2_s_conversion*IOB%salt_flux(i-i0,j-j0))
@@ -710,10 +700,11 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS)
   ! mechanical forcing type has been used.
   if (.not.forces%initialized) then
 
-    call allocate_mech_forcing(G, forces, stress=.true., ustar=.true., press=.true.)
+    call allocate_mech_forcing(G, forces, stress=.true., ustar=.true., press=.true., tau_mag=.true.)
 
     call safe_alloc_ptr(forces%p_surf,isd,ied,jsd,jed)
     call safe_alloc_ptr(forces%p_surf_full,isd,ied,jsd,jed)
+    !call safe_alloc_ptr(forces%omega_w2x,isd,ied,jsd,jed)
 
     if (CS%rigid_sea_ice) then
       call safe_alloc_ptr(forces%rigidity_ice_u,IsdB,IedB,jsd,jed)
@@ -769,7 +760,6 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS)
   endif
   forces%accumulate_p_surf = .true. ! Multiple components may contribute to surface pressure.
 
-  ! TODO: this does not seem correct for NEMS
 #ifdef CESMCOUPLED
   wind_stagger = AGRID
 #else
@@ -846,6 +836,7 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS)
           ((G%mask2dBu(I,J) + G%mask2dBu(I-1,J-1)) + (G%mask2dBu(I,J-1) + G%mask2dBu(I-1,J))) )
         if (CS%read_gust_2d) gustiness = CS%gust(i,j)
       endif
+      forces%tau_mag(i,j) = gustiness + tau_mag
       forces%ustar(i,j) = sqrt(gustiness*Irho0 + Irho0*tau_mag)
     enddo ; enddo
     call pass_vector(forces%taux, forces%tauy, G%Domain, halo=1)
@@ -871,8 +862,10 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS)
     do j=js,je ; do i=is,ie
       gustiness = CS%gust_const
       if (CS%read_gust_2d .and. (G%mask2dT(i,j) > 0.0)) gustiness = CS%gust(i,j)
+      forces%tau_mag(i,j) = gustiness + G%mask2dT(i,j) * sqrt(taux_at_h(i,j)**2 + tauy_at_h(i,j)**2)
       forces%ustar(i,j) = sqrt(gustiness*Irho0 + Irho0 * G%mask2dT(i,j) * &
                                sqrt(taux_at_h(i,j)**2 + tauy_at_h(i,j)**2))
+      !forces%omega_w2x(i,j) = atan(tauy_at_h(i,j), taux_at_h(i,j))
     enddo ; enddo
     call pass_vector(forces%taux, forces%tauy, G%Domain, halo=1)
   else ! C-grid wind stresses.
@@ -892,8 +885,10 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS)
                  G%mask2dCv(i,J)*forces%tauy(i,J)**2) / (G%mask2dCv(i,J-1) + G%mask2dCv(i,J))
 
       if (CS%read_gust_2d) then
+        forces%tau_mag(i,j) = CS%gust(i,j) + sqrt(taux2 + tauy2)
         forces%ustar(i,j) = sqrt(CS%gust(i,j)*Irho0 + Irho0*sqrt(taux2 + tauy2))
       else
+        forces%tau_mag(i,j) = CS%gust_const + sqrt(taux2 + tauy2)
         forces%ustar(i,j) = sqrt(CS%gust_const*Irho0 + Irho0*sqrt(taux2 + tauy2))
       endif
     enddo ; enddo
@@ -1108,11 +1103,13 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, restore_salt,
   ! Local variables
   real :: utide  ! The RMS tidal velocity [Z T-1 ~> m s-1].
   type(directories)  :: dirs
-  logical            :: new_sim, iceberg_flux_diags
+  logical            :: new_sim, iceberg_flux_diags, fix_ustar_gustless_bug
+  logical :: test_value  ! This is used to determine whether a logical parameter is being set explicitly.
+  logical :: explicit_bug, explicit_fix ! These indicate which parameters are set explicitly.
   type(time_type)    :: Time_frc
   character(len=200) :: TideAmp_file, gust_file, salt_file, temp_file ! Input file names.
-! This include declares and sets the variable "version".
-#include "version_variable.h"
+  ! This include declares and sets the variable "version".
+# include "version_variable.h"
   character(len=40)  :: mdl = "MOM_surface_forcing_nuopc"  ! This module's name.
   character(len=48)  :: stagger
   character(len=48)  :: flnam
@@ -1347,9 +1344,32 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, restore_salt,
     call MOM_read_data(gust_file, 'gustiness', CS%gust, G%domain, timelevel=1, &
                scale=US%kg_m3_to_R*US%m_s_to_L_T**2*US%L_to_Z) ! units in file should be Pa
   endif
-  call get_param(param_file, mdl, "FIX_USTAR_GUSTLESS_BUG", CS%fix_ustar_gustless_bug, &
+
+  call get_param(param_file, mdl, "USTAR_GUSTLESS_BUG", CS%ustar_gustless_bug, &
+                 "If true include a bug in the time-averaging of the gustless wind friction velocity", &
+                 default=.false., do_not_log=.true.)
+  ! This is used to test whether USTAR_GUSTLESS_BUG is being actively set.
+  call get_param(param_file, mdl, "USTAR_GUSTLESS_BUG", test_value, default=.true., do_not_log=.true.)
+  explicit_bug = CS%ustar_gustless_bug .eqv. test_value
+  call get_param(param_file, mdl, "FIX_USTAR_GUSTLESS_BUG", fix_ustar_gustless_bug, &
                  "If true correct a bug in the time-averaging of the gustless wind friction velocity", &
-                 default=.true.)
+                 default=.true., do_not_log=.true.)
+  call get_param(param_file, mdl, "FIX_USTAR_GUSTLESS_BUG", test_value, default=.false., do_not_log=.true.)
+  explicit_fix = fix_ustar_gustless_bug .eqv. test_value
+
+  if (explicit_bug .and. explicit_fix .and. (fix_ustar_gustless_bug .eqv. CS%ustar_gustless_bug)) then
+    ! USTAR_GUSTLESS_BUG is being explicitly set, and should not be changed.
+    call MOM_error(FATAL, "USTAR_GUSTLESS_BUG and FIX_USTAR_GUSTLESS_BUG are both being set "//&
+                   "with inconsistent values.  FIX_USTAR_GUSTLESS_BUG is an obsolete "//&
+                   "parameter and should be removed.")
+  elseif (explicit_fix) then
+    call MOM_error(WARNING, "FIX_USTAR_GUSTLESS_BUG is an obsolete parameter.  "//&
+                   "Use USTAR_GUSTLESS_BUG instead (noting that it has the opposite sense).")
+    CS%ustar_gustless_bug = .not.fix_ustar_gustless_bug
+  endif
+  call log_param(param_file, mdl, "USTAR_GUSTLESS_BUG", CS%ustar_gustless_bug, &
+                 "If true include a bug in the time-averaging of the gustless wind friction velocity", &
+                 default=.false.)
 
 ! See whether sufficiently thick sea ice should be treated as rigid.
   call get_param(param_file, mdl, "USE_RIGID_SEA_ICE", CS%rigid_sea_ice, &
@@ -1395,7 +1415,7 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, restore_salt,
 
   if (present(restore_salt)) then ; if (restore_salt) then
     salt_file = trim(CS%inputdir) // trim(CS%salt_restore_file)
-    CS%id_srestore = init_external_field(salt_file, CS%salt_restore_var_name, domain=G%Domain%mpp_domain)
+    CS%srestore_handle = init_external_field(salt_file, CS%salt_restore_var_name, domain=G%Domain%mpp_domain)
     call safe_alloc_ptr(CS%srestore_mask,isd,ied,jsd,jed); CS%srestore_mask(:,:) = 1.0
     if (CS%mask_srestore) then ! read a 2-d file containing a mask for restoring fluxes
       flnam = trim(CS%inputdir) // 'salt_restore_mask.nc'
@@ -1405,36 +1425,13 @@ subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, restore_salt,
 
   if (present(restore_temp)) then ; if (restore_temp) then
     temp_file = trim(CS%inputdir) // trim(CS%temp_restore_file)
-    CS%id_trestore = init_external_field(temp_file, CS%temp_restore_var_name, domain=G%Domain%mpp_domain)
+    CS%trestore_handle = init_external_field(temp_file, CS%temp_restore_var_name, domain=G%Domain%mpp_domain)
     call safe_alloc_ptr(CS%trestore_mask,isd,ied,jsd,jed); CS%trestore_mask(:,:) = 1.0
     if (CS%mask_trestore) then  ! read a 2-d file containing a mask for restoring fluxes
       flnam = trim(CS%inputdir) // 'temp_restore_mask.nc'
       call MOM_read_data(flnam, 'mask', CS%trestore_mask, G%domain, timelevel=1)
     endif
   endif ; endif
-
-  ! Do not log these params here since they are logged in the CFC cap module
-  if (CS%use_CFC) then
-    call get_param(param_file, mdl, "CFC_BC_FILE", CS%CFC_BC_file, &
-                   "The file in which the CFC-11 and CFC-12 atm concentrations can be "//&
-                   "found (units must be parts per trillion), or an empty string for "//&
-                   "internal BC generation (TODO).", default=" ", do_not_log=.true.)
-    if ((len_trim(CS%CFC_BC_file) > 0) .and. (scan(CS%CFC_BC_file,'/') == 0)) then
-      ! Add the directory if CFC_BC_file is not already a complete path.
-      CS%CFC_BC_file = trim(CS%inputdir) // trim(CS%CFC_BC_file)
-    endif
-    if (len_trim(CS%CFC_BC_file) > 0) then
-      call get_param(param_file, mdl, "CFC11_VARIABLE", CS%cfc11_var_name, &
-                   "The name of the variable representing CFC-11 in  "//&
-                   "CFC_BC_FILE.", default="CFC_11", do_not_log=.true.)
-      call get_param(param_file, mdl, "CFC12_VARIABLE", CS%cfc12_var_name, &
-                   "The name of the variable representing CFC-12 in  "//&
-                   "CFC_BC_FILE.", default="CFC_12", do_not_log=.true.)
-
-      CS%id_cfc11_atm = init_external_field(CS%CFC_BC_file, CS%cfc11_var_name, domain=G%Domain%mpp_domain)
-      CS%id_cfc12_atm = init_external_field(CS%CFC_BC_file, CS%cfc12_var_name, domain=G%Domain%mpp_domain)
-    endif
-  endif
 
   ! Set up any restart fields associated with the forcing.
   call restart_init(param_file, CS%restart_CSp, "MOM_forcing.res")

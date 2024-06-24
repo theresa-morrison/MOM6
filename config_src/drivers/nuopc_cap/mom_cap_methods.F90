@@ -1,4 +1,4 @@
-!> Contains import/export methods for both NEMS and CMEPS.
+!> Contains import/export methods for CMEPS.
 module MOM_cap_methods
 
 use ESMF,                      only: ESMF_Clock, ESMF_ClockGet, ESMF_time, ESMF_TimeGet
@@ -72,12 +72,11 @@ end subroutine mom_set_geomtype
 !> This function has a few purposes:
 !! (1) it imports surface fluxes using data from the mediator; and
 !! (2) it can apply restoring in SST and SSS.
-subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary, cesm_coupled, rc)
+subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary, rc)
   type(ocean_public_type)       , intent(in)    :: ocean_public       !< Ocean surface state
   type(ocean_grid_type)         , intent(in)    :: ocean_grid         !< Ocean model grid
   type(ESMF_State)              , intent(inout) :: importState        !< incoming data from mediator
   type(ice_ocean_boundary_type) , intent(inout) :: ice_ocean_boundary !< Ocean boundary forcing
-  logical                       , intent(in)    :: cesm_coupled       !< Flag to check if coupled with cesm
   integer                       , intent(inout) :: rc                 !< Return code
 
   ! Local Variables
@@ -87,8 +86,6 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   character(len=128)              :: fldname
   real(ESMF_KIND_R8), allocatable :: taux(:,:)
   real(ESMF_KIND_R8), allocatable :: tauy(:,:)
-  real(ESMF_KIND_R8), allocatable :: stkx1(:,:),stkx2(:,:),stkx3(:,:)
-  real(ESMF_KIND_R8), allocatable :: stky1(:,:),stky2(:,:),stky3(:,:)
   real(ESMF_KIND_R8), allocatable :: stkx(:,:,:)
   real(ESMF_KIND_R8), allocatable :: stky(:,:,:)
   character(len=*)  , parameter   :: subname = '(mom_import)'
@@ -105,43 +102,42 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   !----
   ! surface height pressure
   !----
-  call state_getimport(importState, 'inst_pres_height_surface', &
-       isc, iec, jsc, jec, ice_ocean_boundary%p, rc=rc)
+  call state_getimport(importState, 'Sa_pslv', isc, iec, jsc, jec, ice_ocean_boundary%p, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! near-IR, direct shortwave  (W/m2)
   !----
-  call state_getimport(importState, 'mean_net_sw_ir_dir_flx', &
-       isc, iec, jsc, jec, ice_ocean_boundary%sw_flux_nir_dir, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_swnet_idr', isc, iec, jsc, jec, &
+       ice_ocean_boundary%sw_flux_nir_dir, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! near-IR, diffuse shortwave  (W/m2)
   !----
-  call state_getimport(importState, 'mean_net_sw_ir_dif_flx', &
-       isc, iec, jsc, jec, ice_ocean_boundary%sw_flux_nir_dif, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_swnet_idf', isc, iec, jsc, jec, &
+       ice_ocean_boundary%sw_flux_nir_dif, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! visible, direct shortwave  (W/m2)
   !----
-  call state_getimport(importState, 'mean_net_sw_vis_dir_flx', &
-       isc, iec, jsc, jec, ice_ocean_boundary%sw_flux_vis_dir, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_swnet_vdr', isc, iec, jsc, jec, &
+       ice_ocean_boundary%sw_flux_vis_dir, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! visible, diffuse shortwave (W/m2)
   !----
-  call state_getimport(importState, 'mean_net_sw_vis_dif_flx', &
-       isc, iec, jsc, jec, ice_ocean_boundary%sw_flux_vis_dif, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_swnet_vdf', isc, iec, jsc, jec, &
+       ice_ocean_boundary%sw_flux_vis_dif, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   ! -------
   ! Net longwave radiation (W/m2)
   ! -------
-  call state_getimport(importState, 'mean_net_lw_flx',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%lw_flux, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_lwnet', isc, iec, jsc, jec, &
+       ice_ocean_boundary%lw_flux, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
@@ -150,10 +146,10 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   allocate (taux(isc:iec,jsc:jec))
   allocate (tauy(isc:iec,jsc:jec))
 
-  call state_getimport(importState, 'mean_zonal_moment_flx', isc, iec, jsc, jec, taux, &
+  call state_getimport(importState, 'Foxx_taux', isc, iec, jsc, jec, taux, &
        areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
-  call state_getimport(importState, 'mean_merid_moment_flx', isc, iec, jsc, jec, tauy, &
+  call state_getimport(importState, 'Foxx_tauy', isc, iec, jsc, jec, tauy, &
        areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -174,29 +170,29 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   !----
   ! sensible heat flux (W/m2)
   !----
-  call state_getimport(importState, 'mean_sensi_heat_flx', &
-       isc, iec, jsc, jec, ice_ocean_boundary%t_flux, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_sen', isc, iec, jsc, jec, &
+       ice_ocean_boundary%t_flux, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! evaporation flux (W/m2)
   !----
-  call state_getimport(importState, 'mean_evap_rate', &
-       isc, iec, jsc, jec, ice_ocean_boundary%q_flux, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Foxx_evap', isc, iec, jsc, jec, &
+       ice_ocean_boundary%q_flux, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! liquid precipitation (rain)
   !----
-  call state_getimport(importState, 'mean_prec_rate', &
-       isc, iec, jsc, jec, ice_ocean_boundary%lprec, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Faxa_rain', isc, iec, jsc, jec, &
+       ice_ocean_boundary%lprec, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! frozen precipitation (snow)
   !----
-  call state_getimport(importState, 'mean_fprec_rate', &
-       isc, iec, jsc, jec, ice_ocean_boundary%fprec, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Faxa_snow', isc, iec, jsc, jec, &
+       ice_ocean_boundary%fprec, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
@@ -218,75 +214,85 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
-  ! Enthalpy terms (only in CESM)
+  ! Enthalpy terms
   !----
-  if (cesm_coupled) then
-    !----
-    ! enthalpy from liquid precipitation (hrain)
-    !----
-    call state_getimport(importState, 'heat_content_lprec', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hrain, areacor=med2mod_areacor, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-    !----
-    ! enthalpy from frozen precipitation (hsnow)
-    !----
-    call state_getimport(importState, 'heat_content_fprec', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hsnow, areacor=med2mod_areacor, rc=rc)
+  !----
+  ! enthalpy from liquid precipitation (hrain)
+  !----
+  if ( associated(ice_ocean_boundary%hrain) ) then
+    call state_getimport(importState, 'Foxx_hrain', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hrain, areacor=med2mod_areacor, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  end if
 
-    !----
-    ! enthalpy from liquid runoff (hrofl)
-    !----
-    call state_getimport(importState, 'heat_content_rofl', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hrofl, areacor=med2mod_areacor, rc=rc)
+  !----
+  ! enthalpy from frozen precipitation (hsnow)
+  !----
+  if ( associated(ice_ocean_boundary%hsnow) ) then
+    call state_getimport(importState, 'Foxx_hsnow', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hsnow, areacor=med2mod_areacor, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  end if
 
-    !----
-    ! enthalpy from frozen runoff (hrofi)
-    !----
-    call state_getimport(importState, 'heat_content_rofi', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hrofi, areacor=med2mod_areacor, rc=rc)
+  !----
+  ! enthalpy from liquid runoff (hrofl)
+  !----
+  if ( associated(ice_ocean_boundary%hrofl) ) then
+    call state_getimport(importState, 'Foxx_hrofl', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hrofl, areacor=med2mod_areacor, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  end if
 
-    !----
-    ! enthalpy from evaporation (hevap)
-    !----
-    call state_getimport(importState, 'heat_content_evap', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hevap, areacor=med2mod_areacor, rc=rc)
+  !----
+  ! enthalpy from frozen runoff (hrofi)
+  !----
+  if ( associated(ice_ocean_boundary%hrofi) ) then
+    call state_getimport(importState, 'Foxx_hrofi', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hrofi, areacor=med2mod_areacor, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  end if
 
-    !----
-    ! enthalpy from condensation (hcond)
-    !----
-    call state_getimport(importState, 'heat_content_cond', &
-         isc, iec, jsc, jec, ice_ocean_boundary%hcond, areacor=med2mod_areacor, rc=rc)
+  !----
+  ! enthalpy from evaporation (hevap)
+  !----
+  if ( associated(ice_ocean_boundary%hevap) ) then
+    call state_getimport(importState, 'Foxx_hevap', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hevap, areacor=med2mod_areacor, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  end if
 
+  !----
+  ! enthalpy from condensation (hcond)
+  !----
+  if ( associated(ice_ocean_boundary%hcond) ) then
+    call state_getimport(importState, 'Foxx_hcond', isc, iec, jsc, jec, &
+         ice_ocean_boundary%hcond, areacor=med2mod_areacor, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
   endif
 
   !----
   ! salt flux from ice
   !----
   ice_ocean_boundary%salt_flux(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'mean_salt_rate',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%salt_flux, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Fioi_salt', isc, iec, jsc, jec, &
+       ice_ocean_boundary%salt_flux, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! snow&ice melt heat flux  (W/m^2)
   !----
   ice_ocean_boundary%seaice_melt_heat(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'net_heat_flx_to_ocn',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%seaice_melt_heat, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Fioi_melth', isc, iec, jsc, jec, &
+       ice_ocean_boundary%seaice_melt_heat, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! snow&ice melt water flux  (W/m^2)
   !----
   ice_ocean_boundary%seaice_melt(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'mean_fresh_water_to_ocean_rate',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%seaice_melt, areacor=med2mod_areacor, rc=rc)
+  call state_getimport(importState, 'Fioi_meltw', isc, iec, jsc, jec, &
+       ice_ocean_boundary%seaice_melt, areacor=med2mod_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
@@ -295,24 +301,24 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   ! Note - preset values to 0, if field does not exist in importState, then will simply return
   ! and preset value will be used
   ice_ocean_boundary%mi(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'mass_of_overlying_ice',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%mi,rc=rc)
+  call state_getimport(importState, 'mass_of_overlying_ice', isc, iec, jsc, jec, &
+       ice_ocean_boundary%mi,rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! sea-ice fraction
   !----
   ice_ocean_boundary%ice_fraction(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'Si_ifrac',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%ice_fraction, rc=rc)
+  call state_getimport(importState, 'Si_ifrac', isc, iec, jsc, jec, &
+       ice_ocean_boundary%ice_fraction, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
   ! 10m wind squared
   !----
   ice_ocean_boundary%u10_sqr(:,:) = 0._ESMF_KIND_R8
-  call state_getimport(importState, 'So_duu10n',  &
-       isc, iec, jsc, jec, ice_ocean_boundary%u10_sqr, rc=rc)
+  call state_getimport(importState, 'So_duu10n', isc, iec, jsc, jec, &
+       ice_ocean_boundary%u10_sqr, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   !----
@@ -320,8 +326,8 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   !----
   if ( associated(ice_ocean_boundary%lamult) ) then
     ice_ocean_boundary%lamult (:,:) = 0._ESMF_KIND_R8
-    call state_getimport(importState, 'Sw_lamult',  &
-         isc, iec, jsc, jec, ice_ocean_boundary%lamult, rc=rc)
+    call state_getimport(importState, 'Sw_lamult', isc, iec, jsc, jec, &
+         ice_ocean_boundary%lamult, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
   endif
 
@@ -329,8 +335,6 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
   ! Partitioned Stokes Drift Components
   !----
   if ( associated(ice_ocean_boundary%ustkb) ) then
-
-    if (cesm_coupled) then
       nsc = Ice_ocean_boundary%num_stk_bands
       allocate(stkx(isc:iec,jsc:jec,1:nsc))
       allocate(stky(isc:iec,jsc:jec,1:nsc))
@@ -358,52 +362,6 @@ subroutine mom_import(ocean_public, ocean_grid, importState, ice_ocean_boundary,
         enddo
       enddo
       deallocate(stkx,stky)
-
-    else ! below is the old approach of importing partitioned stokes drift components. after the planned ww3 nuopc
-         ! cap unification, this else block should be removed in favor of the more flexible import approach above.
-      allocate(stkx1(isc:iec,jsc:jec))
-      allocate(stky1(isc:iec,jsc:jec))
-      allocate(stkx2(isc:iec,jsc:jec))
-      allocate(stky2(isc:iec,jsc:jec))
-      allocate(stkx3(isc:iec,jsc:jec))
-      allocate(stky3(isc:iec,jsc:jec))
-
-      call state_getimport(importState,'eastward_partitioned_stokes_drift_1' , isc, iec, jsc, jec, stkx1,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      call state_getimport(importState,'northward_partitioned_stokes_drift_1', isc, iec, jsc, jec, stky1,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      call state_getimport(importState,'eastward_partitioned_stokes_drift_2' , isc, iec, jsc, jec, stkx2,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      call state_getimport(importState,'northward_partitioned_stokes_drift_2', isc, iec, jsc, jec, stky2,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      call state_getimport(importState,'eastward_partitioned_stokes_drift_3' , isc, iec, jsc, jec, stkx3,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      call state_getimport(importState,'northward_partitioned_stokes_drift_3', isc, iec, jsc, jec, stky3,rc=rc)
-      if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-      ! rotate from true zonal/meridional to local coordinates
-      do j = jsc, jec
-        jg = j + ocean_grid%jsc - jsc
-        do i = isc, iec
-          ig = i + ocean_grid%isc - isc
-          ice_ocean_boundary%ustkb(i,j,1) = ocean_grid%cos_rot(ig,jg)*stkx1(i,j) &
-               - ocean_grid%sin_rot(ig,jg)*stky1(i,j)
-          ice_ocean_boundary%vstkb(i,j,1) = ocean_grid%cos_rot(ig,jg)*stky1(i,j) &
-               + ocean_grid%sin_rot(ig,jg)*stkx1(i,j)
-
-          ice_ocean_boundary%ustkb(i,j,2) = ocean_grid%cos_rot(ig,jg)*stkx2(i,j) &
-               - ocean_grid%sin_rot(ig,jg)*stky2(i,j)
-          ice_ocean_boundary%vstkb(i,j,2) = ocean_grid%cos_rot(ig,jg)*stky2(i,j) &
-               + ocean_grid%sin_rot(ig,jg)*stkx2(i,j)
-
-          ice_ocean_boundary%ustkb(i,j,3) = ocean_grid%cos_rot(ig,jg)*stkx3(i,j) &
-               - ocean_grid%sin_rot(ig,jg)*stky3(i,j)
-          ice_ocean_boundary%vstkb(i,j,3) = ocean_grid%cos_rot(ig,jg)*stky3(i,j) &
-               + ocean_grid%sin_rot(ig,jg)*stkx3(i,j)
-        enddo
-      enddo
-      deallocate(stkx1,stkx2,stkx3,stky1,stky2,stky3)
-    endif
   endif
 
 end subroutine mom_import
@@ -474,8 +432,7 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
     enddo
   enddo
 
-  call State_SetExport(exportState, 'ocean_mask', &
-       isc, iec, jsc, jec, omask, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_omask', isc, iec, jsc, jec, omask, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   deallocate(omask)
@@ -483,15 +440,13 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
   ! -------
   ! Sea surface temperature
   ! -------
-  call State_SetExport(exportState, 'sea_surface_temperature', &
-       isc, iec, jsc, jec, ocean_public%t_surf, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_t', isc, iec, jsc, jec, ocean_public%t_surf, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   ! -------
   ! Sea surface salinity
   ! -------
-  call State_SetExport(exportState, 's_surf', &
-       isc, iec, jsc, jec, ocean_public%s_surf, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_s', isc, iec, jsc, jec, ocean_public%s_surf, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   ! -------
@@ -517,12 +472,10 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
     enddo
   enddo
 
-  call State_SetExport(exportState, 'ocn_current_zonal', &
-       isc, iec, jsc, jec, ocz_rot, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_u', isc, iec, jsc, jec, ocz_rot, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-  call State_SetExport(exportState, 'ocn_current_merid', &
-       isc, iec, jsc, jec, ocm_rot, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_v', isc, iec, jsc, jec, ocm_rot, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   deallocate(ocz, ocm, ocz_rot, ocm_rot)
@@ -532,8 +485,8 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
   ! -------
   call ESMF_StateGet(exportState, 'So_bldepth', itemFlag, rc=rc)
   if (itemFlag /= ESMF_STATEITEM_NOTFOUND) then
-    call State_SetExport(exportState, 'So_bldepth', &
-         isc, iec, jsc, jec, ocean_public%obld, ocean_grid, rc=rc)
+    call State_SetExport(exportState, 'So_bldepth', isc, iec, jsc, jec, &
+         ocean_public%obld, ocean_grid, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
   endif
 
@@ -556,8 +509,8 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
     enddo
   enddo
 
-  call State_SetExport(exportState, 'freezing_melting_potential', &
-       isc, iec, jsc, jec, melt_potential, ocean_grid, areacor=mod2med_areacor, rc=rc)
+  call State_SetExport(exportState, 'Fioo_q', isc, iec, jsc, jec, &
+       melt_potential, ocean_grid, areacor=mod2med_areacor, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   deallocate(melt_potential)
@@ -670,12 +623,10 @@ subroutine mom_export(ocean_public, ocean_grid, ocean_state, exportState, clock,
     enddo
   enddo
 
-  call State_SetExport(exportState, 'sea_surface_slope_zonal', &
-       isc, iec, jsc, jec, dhdx_rot, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_dhdx', isc, iec, jsc, jec, dhdx_rot, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-  call State_SetExport(exportState, 'sea_surface_slope_merid', &
-       isc, iec, jsc, jec, dhdy_rot, ocean_grid, rc=rc)
+  call State_SetExport(exportState, 'So_dhdy', isc, iec, jsc, jec, dhdy_rot, ocean_grid, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
   deallocate(ssh, dhdx, dhdy, dhdx_rot, dhdy_rot)
@@ -902,7 +853,7 @@ subroutine State_SetExport(state, fldname, isc, iec, jsc, jec, input, ocean_grid
 
   ! local variables
   type(ESMF_StateItem_Flag)     :: itemFlag
-  integer                       :: n, i, j, i1, j1, ig,jg
+  integer                       :: n, i, j, k, i1, j1, ig,jg
   integer                       :: lbnd1,lbnd2
   real(ESMF_KIND_R8), pointer   :: dataPtr1d(:)
   real(ESMF_KIND_R8), pointer   :: dataPtr2d(:,:)
@@ -937,6 +888,13 @@ subroutine State_SetExport(state, fldname, isc, iec, jsc, jec, input, ocean_grid
           dataPtr1d(n) = dataPtr1d(n) * areacor(n)
         enddo
       end if
+
+      ! if a maskmap is provided, set exports of all eliminated cells to zero.
+      if (associated(ocean_grid%Domain%maskmap)) then
+        do k = n+1, size(dataPtr1d)
+          dataPtr1d(k) = 0.0
+        enddo
+      endif
 
     else if (geomtype == ESMF_GEOMTYPE_GRID) then
 

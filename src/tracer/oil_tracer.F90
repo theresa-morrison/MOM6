@@ -42,18 +42,18 @@ type, public :: oil_tracer_CS ; private
   character(len=200) :: IC_file !< The file in which the age-tracer initial values
                                 !! can be found, or an empty string for internal initialization.
   logical :: Z_IC_file         !< If true, the IC_file is in Z-space.  The default is false.
-  real :: oil_source_longitude !< Latitude of source location (geographic)
-  real :: oil_source_latitude  !< Longitude of source location (geographic)
-  integer :: oil_source_i=-999 !< Local i of source location (computational)
-  integer :: oil_source_j=-999 !< Local j of source location (computational)
+  real :: oil_source_longitude !< Latitude of source location (geographic) [degrees_N]
+  real :: oil_source_latitude  !< Longitude of source location (geographic) [degrees_E]
+  integer :: oil_source_i=-999 !< Local i of source location (computational index location)
+  integer :: oil_source_j=-999 !< Local j of source location (computational index location)
   real :: oil_source_rate     !< Rate of oil injection [kg T-1 ~> kg s-1]
   real :: oil_start_year      !< The time at which the oil source starts [years]
   real :: oil_end_year        !< The time at which the oil source ends [years]
   type(time_type), pointer :: Time => NULL() !< A pointer to the ocean model's clock.
   type(tracer_registry_type), pointer :: tr_Reg => NULL() !< A pointer to the MOM tracer registry
-  real, pointer :: tr(:,:,:,:) => NULL() !< The array of tracers used in this subroutine, in g m-3?
-  real, dimension(NTR_MAX) :: IC_val = 0.0    !< The (uniform) initial condition value.
-  real, dimension(NTR_MAX) :: land_val = -1.0 !< The value of tr used where land is masked out.
+  real, pointer :: tr(:,:,:,:) => NULL() !< The array of tracers used in this subroutine, [kg m-3]
+  real, dimension(NTR_MAX) :: IC_val = 0.0    !< The (uniform) initial condition value [kg m-3]
+  real, dimension(NTR_MAX) :: land_val = -1.0 !< The value of tr used where land is masked out [kg m-3]
   real, dimension(NTR_MAX) :: oil_decay_rate  !< Decay rate of oil [T-1 ~> s-1] calculated from oil_decay_days
   integer, dimension(NTR_MAX) :: oil_source_k !< Layer of source
   logical :: oil_may_reinit  !< If true, oil tracers may be reset by the initialization code
@@ -92,7 +92,7 @@ function register_oil_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
   character(len=3)   :: name_tag ! String for creating identifying oils
   character(len=48) :: flux_units ! The units for tracer fluxes, here
                             ! kg(oil) s-1 or kg(oil) m-3 kg(water) s-1.
-  real, pointer :: tr_ptr(:,:,:) => NULL()
+  real, pointer :: tr_ptr(:,:,:) => NULL() ! The tracer concentration [kg m-3]
   logical :: register_oil_tracer
   integer :: isd, ied, jsd, jed, nz, m
   isd = HI%isd ; ied = HI%ied ; jsd = HI%jsd ; jed = HI%jed ; nz = GV%ke
@@ -113,7 +113,7 @@ function register_oil_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
     ! Add the directory if CS%IC_file is not already a complete path.
     call get_param(param_file, mdl, "INPUTDIR", inputdir, default=".")
     CS%IC_file = trim(slasher(inputdir))//trim(CS%IC_file)
-    call log_param(param_file, mdl, "INPUTDIR/CFC_IC_FILE", CS%IC_file)
+    call log_param(param_file, mdl, "INPUTDIR/OIL_IC_FILE", CS%IC_file)
   endif
   call get_param(param_file, mdl, "OIL_IC_FILE_IS_Z", CS%Z_IC_file, &
                  "If true, OIL_IC_FILE is in depth space, not layer space", &
@@ -165,7 +165,8 @@ function register_oil_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
       endif
     endif
   enddo
-  call log_param(param_file, mdl, "OIL_DECAY_RATE", US%s_to_T*CS%oil_decay_rate(1:CS%ntr), units="s-1")
+  call log_param(param_file, mdl, "OIL_DECAY_RATE", CS%oil_decay_rate(1:CS%ntr), &
+                 units="s-1", unscale=US%s_to_T)
 
   ! This needs to be changed if the units of tracer are changed above.
   if (GV%Boussinesq) then ; flux_units = "kg s-1"
@@ -362,7 +363,7 @@ subroutine oil_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, G, GV, US
         CS%tr(i,j,k,m) = G%mask2dT(i,j)*max(1. - dt*CS%oil_decay_rate(m),0.)*CS%tr(i,j,k,m) ! Safest
       elseif (CS%oil_decay_rate(m)<0.) then
         decay_timescale = (12.0 * (3.0**(-(tv%T(i,j,k)-20.0*US%degC_to_C)/10.0*US%degC_to_C))) * &
-                          (86400.0*US%s_to_T) ! Timescale [s ~> T]
+                          (86400.0*US%s_to_T) ! Timescale [T ~> s]
         ldecay = 1. / decay_timescale ! Rate [T-1 ~> s-1]
         CS%tr(i,j,k,m) = G%mask2dT(i,j)*max(1. - dt*ldecay,0.)*CS%tr(i,j,k,m)
       endif
@@ -372,21 +373,21 @@ subroutine oil_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, G, GV, US
   ! Add oil at the source location
   if (year>=CS%oil_start_year .and. year<=CS%oil_end_year .and. &
       CS%oil_source_i>-999 .and. CS%oil_source_j>-999) then
-    i=CS%oil_source_i ; j=CS%oil_source_j
-    k_max=nz ; h_total=0.
+    i = CS%oil_source_i ; j = CS%oil_source_j
+    k_max = nz ; h_total = 0.
     vol_scale = GV%H_to_m * US%L_to_m**2
     do k=nz, 2, -1
       h_total = h_total + h_new(i,j,k)
-      if (h_total<10.) k_max=k-1 ! Find bottom most interface that is 10 m above bottom
+      if (h_total < 10.*GV%m_to_H) k_max=k-1 ! Find bottom most interface that is 10 m above bottom
     enddo
     do m=1,CS%ntr
-      k=CS%oil_source_k(m)
+      k = CS%oil_source_k(m)
       if (k>0) then
-        k=min(k,k_max) ! Only insert k or first layer with interface 10 m above bottom
+        k = min(k,k_max) ! Only insert k or first layer with interface 10 m above bottom
         CS%tr(i,j,k,m) = CS%tr(i,j,k,m) + CS%oil_source_rate*dt / &
                 (vol_scale * (h_new(i,j,k)+GV%H_subroundoff) * G%areaT(i,j) )
       elseif (k<0) then
-        h_total=GV%H_subroundoff
+        h_total = GV%H_subroundoff
         do k=1, nz
           h_total = h_total + h_new(i,j,k)
         enddo
@@ -465,7 +466,7 @@ subroutine oil_tracer_surface_state(sfc_state, h, G, GV, CS)
       !   This call loads the surface values into the appropriate array in the
       ! coupler-type structure.
       call set_coupler_type_data(CS%tr(:,:,1,m), CS%ind_tr(m), sfc_state%tr_fields, &
-                   idim=(/isd, is, ie, ied/), jdim=(/jsd, js, je, jed/) )
+                   idim=(/isd, is, ie, ied/), jdim=(/jsd, js, je, jed/), turns=G%HI%turns)
     enddo
   endif
 

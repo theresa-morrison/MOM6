@@ -83,7 +83,8 @@ subroutine write_u_accel(I, j, um, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   real,                        intent(in) :: vel_rpt !< The velocity magnitude that triggers a report [L T-1 ~> m s-1]
   real, optional,              intent(in) :: str !< The surface wind stress [R L Z T-2 ~> Pa]
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)+1), &
-                     optional, intent(in) :: a   !< The layer coupling coefficients from vertvisc [Z T-1 ~> m s-1].
+                     optional, intent(in) :: a   !< The layer coupling coefficients from vertvisc
+                                                 !! [H T-1 ~> m s-1 or Pa s m-1]
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
                      optional, intent(in) :: hv  !< The layer thicknesses at velocity grid points,
                                                  !! from vertvisc [H ~> m or kg m-2].
@@ -94,9 +95,10 @@ subroutine write_u_accel(I, j, um, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   real    :: du               ! A velocity change [L T-1 ~> m s-1]
   real    :: Inorm(SZK_(GV))  ! The inverse of the normalized velocity change [L T-1 ~> m s-1]
   real    :: e(SZK_(GV)+1)    ! Simple estimates of interface heights based on the sum of thicknesses [m]
-  real    :: h_scale          ! A scaling factor for thicknesses [m H-1 ~> 1 or m3 kg-1]
+  real    :: h_scale          ! A scaling factor for thicknesses [m H-1 ~> 1] or [kg m-2 H-1 ~> 1]
   real    :: vel_scale        ! A scaling factor for velocities [m T s-1 L-1 ~> 1]
-  real    :: uh_scale         ! A scaling factor for transport per unit length [m2 T s-1 L-1 H-1 ~> 1 or m3 kg-1]
+  real    :: uh_scale         ! A scaling factor for transport per unit length [m2 T s-1 L-1 H-1 ~> 1]
+                              ! or [kg T m-1 s-1 L-1 H-1 ~> 1]
   real    :: temp_scale       ! A scaling factor for temperatures [degC C-1 ~> 1]
   real    :: saln_scale       ! A scaling factor for salinities [ppt S-1 ~> 1]
   integer :: yr, mo, day, hr, minute, sec, yearday
@@ -107,7 +109,7 @@ subroutine write_u_accel(I, j, um, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   integer :: file
 
   Angstrom = GV%Angstrom_H + GV%H_subroundoff
-  h_scale = GV%H_to_m ; vel_scale = US%L_T_to_m_s ; uh_scale = GV%H_to_m*US%L_T_to_m_s
+  h_scale = GV%H_to_mks ; vel_scale = US%L_T_to_m_s ; uh_scale = h_scale*vel_scale
   temp_scale = US%C_to_degC ; saln_scale = US%S_to_ppt
 
 !  if (.not.associated(CS)) return
@@ -223,15 +225,15 @@ subroutine write_u_accel(I, j, um, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
                                       (vel_scale*ADp%du_other(I,j,k)) ; enddo
     endif
     if (present(a)) then
-      write(file,'(/,"a:     ",ES10.3," ")', advance='no') US%Z_to_m*a(I,j,ks)*dt
-      do K=ks+1,ke+1 ; if (do_k(k-1)) write(file,'(ES10.3," ")', advance='no') (US%Z_to_m*a(I,j,K)*dt) ; enddo
+      write(file,'(/,"a:     ",ES10.3," ")', advance='no') h_scale*a(I,j,ks)*dt
+      do K=ks+1,ke+1 ; if (do_k(k-1)) write(file,'(ES10.3," ")', advance='no') (h_scale*a(I,j,K)*dt) ; enddo
     endif
     if (present(hv)) then
       write(file,'(/,"hvel:  ")', advance='no')
       do k=ks,ke ; if (do_k(k)) write(file,'(ES10.3," ")', advance='no') h_scale*hv(I,j,k) ; enddo
     endif
     if (present(str)) then
-      write(file,'(/,"Stress:  ",ES10.3)', advance='no') vel_scale*US%Z_to_m * (str*dt / GV%Rho0)
+      write(file,'(/,"Stress:  ",ES10.3)', advance='no') (uh_scale*GV%RZ_to_H) * (str*dt)
     endif
 
     if (associated(CS%u_accel_bt)) then
@@ -422,7 +424,8 @@ subroutine write_v_accel(i, J, vm, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   real,                        intent(in) :: vel_rpt !< The velocity magnitude that triggers a report [L T-1 ~> m s-1]
   real, optional,              intent(in) :: str !< The surface wind stress [R L Z T-2 ~> Pa]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)+1), &
-                     optional, intent(in) :: a   !< The layer coupling coefficients from vertvisc [Z T-1 ~> m s-1].
+                     optional, intent(in) :: a   !< The layer coupling coefficients from vertvisc
+                                                 !! [H T-1 ~> m s-1 or Pa s m-1]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), &
                      optional, intent(in) :: hv  !< The layer thicknesses at velocity grid points,
                                                  !! from vertvisc [H ~> m or kg m-2].
@@ -433,9 +436,10 @@ subroutine write_v_accel(i, J, vm, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   real    :: dv               ! A velocity change [L T-1 ~> m s-1]
   real    :: Inorm(SZK_(GV))  ! The inverse of the normalized velocity change [L T-1 ~> m s-1]
   real    :: e(SZK_(GV)+1)    ! Simple estimates of interface heights based on the sum of thicknesses [m]
-  real    :: h_scale          ! A scaling factor for thicknesses [m H-1 ~> 1 or m3 kg-1]
+  real    :: h_scale          ! A scaling factor for thicknesses [m H-1 ~> 1] or [kg m-2 H-1 ~> 1]
   real    :: vel_scale        ! A scaling factor for velocities [m T s-1 L-1 ~> 1]
-  real    :: uh_scale         ! A scaling factor for transport per unit length [m2 T s-1 L-1 H-1 ~> 1 or m3 kg-1]
+  real    :: uh_scale         ! A scaling factor for transport per unit length [m2 T s-1 L-1 H-1 ~> 1]
+                              ! or [kg T m-1 s-1 L-1 H-1 ~> 1]
   real    :: temp_scale       ! A scaling factor for temperatures [degC C-1 ~> 1]
   real    :: saln_scale       ! A scaling factor for salinities [ppt S-1 ~> 1]
   integer :: yr, mo, day, hr, minute, sec, yearday
@@ -446,7 +450,7 @@ subroutine write_v_accel(i, J, vm, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
   integer :: file
 
   Angstrom = GV%Angstrom_H + GV%H_subroundoff
-  h_scale = GV%H_to_m ; vel_scale = US%L_T_to_m_s ; uh_scale = GV%H_to_m*US%L_T_to_m_s
+  h_scale = GV%H_to_mks ; vel_scale = US%L_T_to_m_s ; uh_scale = h_scale*vel_scale
   temp_scale = US%C_to_degC ; saln_scale = US%S_to_ppt
 
 !  if (.not.associated(CS)) return
@@ -566,15 +570,15 @@ subroutine write_v_accel(i, J, vm, hin, ADp, CDp, dt, G, GV, US, CS, vel_rpt, st
                                       (vel_scale*ADp%dv_other(i,J,k)) ; enddo
     endif
     if (present(a)) then
-      write(file,'(/,"a:     ",ES10.3," ")', advance='no') US%Z_to_m*a(i,J,ks)*dt
-      do K=ks+1,ke+1 ; if (do_k(k-1)) write(file,'(ES10.3," ")', advance='no') (US%Z_to_m*a(i,J,K)*dt) ; enddo
+      write(file,'(/,"a:     ",ES10.3," ")', advance='no') h_scale*a(i,J,ks)*dt
+      do K=ks+1,ke+1 ; if (do_k(k-1)) write(file,'(ES10.3," ")', advance='no') (h_scale*a(i,J,K)*dt) ; enddo
     endif
     if (present(hv)) then
       write(file,'(/,"hvel:  ")', advance='no')
       do k=ks,ke ; if (do_k(k)) write(file,'(ES10.3," ")', advance='no') h_scale*hv(i,J,k) ; enddo
     endif
     if (present(str)) then
-      write(file,'(/,"Stress:  ",ES10.3)', advance='no') vel_scale*US%Z_to_m * (str*dt / GV%Rho0)
+      write(file,'(/,"Stress:  ",ES10.3)', advance='no') (uh_scale*GV%RZ_to_H) * (str*dt)
     endif
 
     if (associated(CS%v_accel_bt)) then

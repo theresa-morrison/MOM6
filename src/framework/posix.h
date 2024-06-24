@@ -1,6 +1,12 @@
 #ifndef MOM6_POSIX_H_
 #define MOM6_POSIX_H_
 
+! STAT_BUF_SIZE should be set to sizeof(stat).
+! The default value is based on glibc 2.28.
+#ifndef SIZEOF_STAT_BUF
+#define SIZEOF_STAT_BUF 144
+#endif
+
 ! JMP_BUF_SIZE should be set to sizeof(jmp_buf).
 ! If unset, then use a typical glibc value (25 long ints)
 #ifndef SIZEOF_JMP_BUF
@@ -12,12 +18,24 @@
 #define SIZEOF_SIGJMP_BUF SIZEOF_JMP_BUF
 #endif
 
-! glibc defines sigsetjmp as __sigsetjmp via macro readable from <setjmp.h>.
+! Wrappers to <setjmp.h> are disabled on default.
+#ifndef SETJMP_NAME
+#define SETJMP_NAME "setjmp_missing"
+#endif
+
+#ifndef LONGJMP_NAME
+#define LONGJMP_NAME "longjmp_missing"
+#endif
+
 #ifndef SIGSETJMP_NAME
 #define SIGSETJMP_NAME "sigsetjmp_missing"
 #endif
 
-! This should be defined by /usr/include/signal.h
+#ifndef SIGLONGJMP_NAME
+#define SIGLONGJMP_NAME "siglongjmp_missing"
+#endif
+
+! This should be defined by <signal.h>;
 ! If unset, we use the most common (x86) value
 #ifndef POSIX_SIGUSR1
 #define POSIX_SIGUSR1 10

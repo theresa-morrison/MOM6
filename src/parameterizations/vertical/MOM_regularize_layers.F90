@@ -142,7 +142,7 @@ subroutine regularize_surface(h, tv, dt, ea, eb, G, GV, US, CS)
     S_2d, &     !   A 2-d version of tv%S [S ~> ppt].
     Rcv, &      !   A 2-d version of the coordinate density [R ~> kg m-3].
     h_2d_init, &  ! The initial value of h_2d [H ~> m or kg m-2].
-    T_2d_init, &  ! THe initial value of T_2d [C ~> degC].
+    T_2d_init, &  ! The initial value of T_2d [C ~> degC].
     S_2d_init, &  ! The initial value of S_2d [S ~> ppt].
     d_eb, &     !   The downward increase across a layer in the entrainment from
                 ! below [H ~> m or kg m-2].  The sign convention is that positive values of
@@ -176,8 +176,8 @@ subroutine regularize_surface(h, tv, dt, ea, eb, G, GV, US, CS)
   real :: h_add     ! The thickness to add to the layers above an interface [H ~> m or kg m-2]
   real :: h_det_tot ! The total thickness detrained by the mixed layers [H ~> m or kg m-2]
   real :: max_def_rat  ! The maximum value of the ratio of the thickness deficit to the minimum depth [nondim]
-  real :: Rcv_min_det  ! The lightest (min) and densest (max) coordinate density
-  real :: Rcv_max_det  ! that can detrain into a layer [R ~> kg m-3].
+  real :: Rcv_min_det  ! The lightest coordinate density that can detrain into a layer [R ~> kg m-3]
+  real :: Rcv_max_det  ! The densest coordinate density that can detrain into a layer [R ~> kg m-3]
 
   real :: int_top, int_bot ! The interface depths above and below a layer [H ~> m or kg m-2], positive upward.
   real :: h_predicted  ! An updated thickness [H ~> m or kg m-2]
@@ -576,14 +576,14 @@ subroutine regularize_surface(h, tv, dt, ea, eb, G, GV, US, CS)
                           trim(mesg), .true.)
           fatal_error = .true.
         endif
-        if (abs(Th_tot1(i) - Th_tot2(i)) > 1e-12*(Th_tot1(i)+10.0*h_tot1(i))) then
+        if (abs(Th_tot1(i) - Th_tot2(i)) > 1e-12*abs(Th_tot1(i) + 10.0*US%degC_to_C*h_tot1(i))) then
           write(mesg,'(ES11.4," became ",ES11.4," diff ",ES11.4," int diff ",ES11.4)') &
                 Th_tot1(i), Th_tot2(i), (Th_tot1(i) - Th_tot2(i)), (Th_tot1(i) - Th_tot3(i))
           call MOM_error(WARNING, "regularize_surface: Heat non-conservation."//&
                           trim(mesg), .true.)
           fatal_error = .true.
         endif
-        if (abs(Sh_tot1(i) - Sh_tot2(i)) > 1e-12*(Sh_tot1(i)+10.0*h_tot1(i))) then
+        if (abs(Sh_tot1(i) - Sh_tot2(i)) > 1e-12*abs(Sh_tot1(i) + 10.0*US%ppt_to_S*h_tot1(i))) then
           write(mesg,'(ES11.4," became ",ES11.4," diff ",ES11.4," int diff ",ES11.4)') &
                 Sh_tot1(i), Sh_tot2(i), (Sh_tot1(i) - Sh_tot2(i)), (Sh_tot1(i) - Sh_tot3(i))
           call MOM_error(WARNING, "regularize_surface: Salinity non-conservation."//&
@@ -719,10 +719,6 @@ subroutine regularize_layers_init(Time, G, GV, param_file, diag, CS)
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_regularize_layers"  ! This module's name.
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags
-  logical :: default_2018_answers ! The default setting for the various 2018_ANSWERS flags
-  logical :: answers_2018  ! If true, use the order of arithmetic and expressions that recover the
-                           ! answers from the end of 2018.  Otherwise, use updated and more robust
-                           ! forms of the same expressions.
   logical :: just_read
   integer :: isd, ied, jsd, jed
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -760,23 +756,13 @@ subroutine regularize_layers_init(Time, G, GV, param_file, diag, CS)
     call get_param(param_file, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
                  "This sets the default value for the various _ANSWER_DATE parameters.", &
                  default=99991231, do_not_log=just_read)
-    call get_param(param_file, mdl, "DEFAULT_2018_ANSWERS", default_2018_answers, &
-                 "This sets the default value for the various _2018_ANSWERS parameters.", &
-                 default=(default_answer_date<20190101), do_not_log=just_read)
-    call get_param(param_file, mdl, "REGULARIZE_LAYERS_2018_ANSWERS", answers_2018, &
-                 "If true, use the order of arithmetic and expressions that recover the answers "//&
-                 "from the end of 2018.  Otherwise, use updated and more robust forms of the "//&
-                 "same expressions.", default=default_2018_answers, do_not_log=just_read)
-    ! Revise inconsistent default answer dates.
-    if (answers_2018 .and. (default_answer_date >= 20190101)) default_answer_date = 20181231
-    if (.not.answers_2018 .and. (default_answer_date < 20190101)) default_answer_date = 20190101
     call get_param(param_file, mdl, "REGULARIZE_LAYERS_ANSWER_DATE", CS%answer_date, &
                  "The vintage of the order of arithmetic and expressions in the regularize "//&
                  "layers calculations.  Values below 20190101 recover the answers from the "//&
                  "end of 2018, while higher values use updated and more robust forms of the "//&
-                 "same expressions.  If both REGULARIZE_LAYERS_2018_ANSWERS and "//&
-                 "REGULARIZE_LAYERS_ANSWER_DATE are specified, the latter takes precedence.", &
-                 default=default_answer_date)
+                 "same expressions.", &
+                 default=default_answer_date, do_not_log=.not.GV%Boussinesq)
+    if (.not.GV%Boussinesq) CS%answer_date = max(CS%answer_date, 20230701)
   endif
 
   call get_param(param_file, mdl, "HMIX_MIN", CS%Hmix_min, &

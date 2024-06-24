@@ -3,32 +3,32 @@ module MOM_tracer_hor_diff
 
 ! This file is part of MOM6. See LICENSE.md for the license.
 
-use MOM_cpu_clock,             only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
-use MOM_cpu_clock,             only : CLOCK_MODULE, CLOCK_ROUTINE
-use MOM_diag_mediator,         only : post_data, diag_ctrl
-use MOM_diag_mediator,         only : register_diag_field, safe_alloc_ptr, time_type
-use MOM_domains,               only : sum_across_PEs, max_across_PEs
-use MOM_domains,               only : create_group_pass, do_group_pass, group_pass_type
-use MOM_domains,               only : pass_vector
-use MOM_debugging,             only : hchksum, uvchksum
-use MOM_diabatic_driver,       only : diabatic_CS
-use MOM_EOS,                   only : calculate_density, EOS_type, EOS_domain
-use MOM_error_handler,         only : MOM_error, FATAL, WARNING, MOM_mesg, is_root_pe
-use MOM_error_handler,         only : MOM_set_verbosity, callTree_showQuery
-use MOM_error_handler,         only : callTree_enter, callTree_leave, callTree_waypoint
-use MOM_file_parser,           only : get_param, log_version, param_file_type
-use MOM_grid,                  only : ocean_grid_type
-use MOM_lateral_mixing_coeffs, only : VarMix_CS
-use MOM_MEKE_types,            only : MEKE_type
-use MOM_neutral_diffusion,     only : neutral_diffusion_init, neutral_diffusion_end
-use MOM_neutral_diffusion,     only : neutral_diffusion_CS
-use MOM_neutral_diffusion,     only : neutral_diffusion_calc_coeffs, neutral_diffusion
-use MOM_lateral_boundary_diffusion, only : lbd_CS, lateral_boundary_diffusion_init
-use MOM_lateral_boundary_diffusion, only : lateral_boundary_diffusion
-use MOM_tracer_registry,       only : tracer_registry_type, tracer_type, MOM_tracer_chksum
-use MOM_unit_scaling,          only : unit_scale_type
-use MOM_variables,             only : thermo_var_ptrs
-use MOM_verticalGrid,          only : verticalGrid_type
+use MOM_cpu_clock,                only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
+use MOM_cpu_clock,                only : CLOCK_MODULE, CLOCK_ROUTINE
+use MOM_diag_mediator,            only : post_data, diag_ctrl
+use MOM_diag_mediator,            only : register_diag_field, safe_alloc_ptr, time_type
+use MOM_domains,                  only : sum_across_PEs, max_across_PEs
+use MOM_domains,                  only : create_group_pass, do_group_pass, group_pass_type
+use MOM_domains,                  only : pass_vector
+use MOM_debugging,                only : hchksum, uvchksum
+use MOM_diabatic_driver,          only : diabatic_CS
+use MOM_EOS,                      only : calculate_density, EOS_type, EOS_domain
+use MOM_error_handler,            only : MOM_error, FATAL, WARNING, MOM_mesg, is_root_pe
+use MOM_error_handler,            only : MOM_set_verbosity, callTree_showQuery
+use MOM_error_handler,            only : callTree_enter, callTree_leave, callTree_waypoint
+use MOM_file_parser,              only : get_param, log_version, param_file_type
+use MOM_grid,                     only : ocean_grid_type
+use MOM_lateral_mixing_coeffs,    only : VarMix_CS
+use MOM_MEKE_types,               only : MEKE_type
+use MOM_neutral_diffusion,        only : neutral_diffusion_init, neutral_diffusion_end
+use MOM_neutral_diffusion,        only : neutral_diffusion_CS
+use MOM_neutral_diffusion,        only : neutral_diffusion_calc_coeffs, neutral_diffusion
+use MOM_hor_bnd_diffusion,        only : hbd_CS, hor_bnd_diffusion_init
+use MOM_hor_bnd_diffusion,        only : hor_bnd_diffusion, hor_bnd_diffusion_end
+use MOM_tracer_registry,          only : tracer_registry_type, tracer_type, MOM_tracer_chksum
+use MOM_unit_scaling,             only : unit_scale_type
+use MOM_variables,                only : thermo_var_ptrs, vertvisc_type
+use MOM_verticalGrid,             only : verticalGrid_type
 
 implicit none ; private
 
@@ -52,6 +52,8 @@ type, public :: tracer_hor_diff_CS ; private
   real    :: max_diff_CFL         !< If positive, locally limit the along-isopycnal
                                   !! tracer diffusivity to keep the diffusive CFL
                                   !! locally at or below this value [nondim].
+  logical :: KhTh_use_ebt_struct  !< If true, uses the equivalent barotropic structure
+                                  !! as the vertical structure of tracer diffusivity.
   logical :: Diffuse_ML_interior  !< If true, diffuse along isopycnals between
                                   !! the mixed layer and the interior.
   logical :: check_diffusive_CFL  !< If true, automatically iterate the diffusion
@@ -59,13 +61,21 @@ type, public :: tracer_hor_diff_CS ; private
                                   !! the CFL limit is not violated.
   logical :: use_neutral_diffusion !< If true, use the neutral_diffusion module from within
                                    !! tracer_hor_diff.
-  logical :: use_lateral_boundary_diffusion !< If true, use the lateral_boundary_diffusion module from within
+  logical :: use_hor_bnd_diffusion !< If true, use the hor_bnd_diffusion module from within
                                    !! tracer_hor_diff.
   logical :: recalc_neutral_surf   !< If true, recalculate the neutral surfaces if CFL has been
                                    !! exceeded
+  logical :: limit_bug             !< If true and the answer date is 20240330 or below, use a
+                                   !! rotational symmetry breaking bug when limiting the tracer
+                                   !! properties in tracer_epipycnal_ML_diff.
+  integer :: answer_date           !< The vintage of the order of arithmetic to use for the tracer
+                                   !! diffusion.  Values of 20240330 or below recover the answers
+                                   !! from the original form of this code, while higher values use
+                                   !! mathematically equivalent expressions that recover rotational symmetry
+                                   !! when DIFFUSE_ML_TO_INTERIOR is true.
   type(neutral_diffusion_CS), pointer :: neutral_diffusion_CSp => NULL() !< Control structure for neutral diffusion.
-  type(lbd_CS), pointer :: lateral_boundary_diffusion_CSp => NULL() !< Control structure for
-                                                                                     !! lateral boundary mixing.
+  type(hbd_CS), pointer    :: hor_bnd_diffusion_CSp => NULL() !< Control structure for
+                                                              !! horizontal boundary diffusion.
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                                    !! regulate the timing of diagnostic output.
   logical :: debug                 !< If true, write verbose checksums for debugging purposes.
@@ -103,7 +113,7 @@ contains
 !! using the diffusivity in CS%KhTr, or using space-dependent diffusivity.
 !! Multiple iterations are used (if necessary) so that there is no limit
 !! on the acceptable time increment.
-subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online_flag, read_khdt_x, read_khdt_y)
+subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_online_flag, read_khdt_x, read_khdt_y)
   type(ocean_grid_type),      intent(inout) :: G       !< Grid type
   type(verticalGrid_type),    intent(in)    :: GV      !< ocean vertical grid structure
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
@@ -111,6 +121,8 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
   real,                       intent(in)    :: dt      !< time step [T ~> s]
   type(MEKE_type),            intent(in)    :: MEKE    !< MEKE fields
   type(VarMix_CS),            intent(in)    :: VarMix  !< Variable mixing type
+  type(vertvisc_type),        intent(in)    :: visc    !< Structure with vertical viscosities,
+                                                       !! boundary layer properties and related fields
   type(unit_scale_type),      intent(in)    :: US      !< A dimensional unit scaling type
   type(tracer_hor_diff_CS),   pointer       :: CS      !< module control structure
   type(tracer_registry_type), pointer       :: Reg     !< registered tracers
@@ -135,19 +147,22 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
   real, dimension(SZI_(G),SZJ_(G)) :: &
     Ihdxdy, &     ! The inverse of the volume or mass of fluid in a layer in a
                   ! grid cell [H-1 L-2 ~> m-3 or kg-1].
-    Kh_h, &       ! The tracer diffusivity averaged to tracer points [L2 T-1 ~> m2 s-1].
     CFL, &        ! A diffusive CFL number for each cell [nondim].
     dTr           ! The change in a tracer's concentration, in units of concentration [Conc].
 
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1)  :: Kh_h
+                  ! The tracer diffusivity averaged to tracer points [L2 T-1 ~> m2 s-1].
   real, dimension(SZIB_(G),SZJ_(G)) :: &
-    khdt_x, &     ! The value of Khtr*dt times the open face width divided by
+    khdt_x        ! The value of Khtr*dt times the open face width divided by
                   ! the distance between adjacent tracer points [L2 ~> m2].
+  real, dimension(SZI_(G),SZJB_(G)) :: &
+    khdt_y        ! The value of Khtr*dt times the open face width divided by
+                  ! the distance between adjacent tracer points [L2 ~> m2].
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)+1) :: &
     Coef_x, &     ! The coefficients relating zonal tracer differences to time-integrated
                   ! fluxes, in [L2 ~> m2] for some schemes and [H L2 ~> m3 or kg] for others.
     Kh_u          ! Tracer mixing coefficient at u-points [L2 T-1 ~> m2 s-1].
-  real, dimension(SZI_(G),SZJB_(G)) :: &
-    khdt_y, &     ! The value of Khtr*dt times the open face width divided by
-                  ! the distance between adjacent tracer points [L2 ~> m2].
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)+1) :: &
     Coef_y, &     ! The coefficients relating meridional tracer differences to time-integrated
                   ! fluxes, in [L2 ~> m2] for some schemes and [H L2 ~> m3 or kg] for others.
     Kh_v          ! Tracer mixing coefficient at u-points [L2 T-1 ~> m2 s-1].
@@ -224,12 +239,12 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
         if (CS%KhTr_max > 0.) Kh_loc = min(Kh_loc, CS%KhTr_max)
         if (Resoln_scaled) &
           Kh_loc = Kh_loc * 0.5*(VarMix%Res_fn_h(i,j) + VarMix%Res_fn_h(i+1,j))
-        Kh_u(I,j) = max(Kh_loc, CS%KhTr_min)
+        Kh_u(I,j,1) = max(Kh_loc, CS%KhTr_min)
         if (CS%KhTr_passivity_coeff>0.) then ! Apply passivity
           Rd_dx=0.5*( VarMix%Rd_dx_h(i,j)+VarMix%Rd_dx_h(i+1,j) ) ! Rd/dx at u-points
-          Kh_loc = Kh_u(I,j)*max( CS%KhTr_passivity_min, CS%KhTr_passivity_coeff*Rd_dx )
+          Kh_loc = Kh_u(I,j,1)*max( CS%KhTr_passivity_min, CS%KhTr_passivity_coeff*Rd_dx )
           if (CS%KhTr_max > 0.) Kh_loc = min(Kh_loc, CS%KhTr_max) ! Re-apply max
-          Kh_u(I,j) = max(Kh_loc, CS%KhTr_min) ! Re-apply min
+          Kh_u(I,j,1) = max(Kh_loc, CS%KhTr_min) ! Re-apply min
         endif
       enddo ; enddo
       !$OMP parallel do default(shared) private(Kh_loc,Rd_dx)
@@ -241,41 +256,41 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
         if (CS%KhTr_max > 0.) Kh_loc = min(Kh_loc, CS%KhTr_max)
         if (Resoln_scaled) &
           Kh_loc = Kh_loc * 0.5*(VarMix%Res_fn_h(i,j) + VarMix%Res_fn_h(i,j+1))
-        Kh_v(i,J) = max(Kh_loc, CS%KhTr_min)
+        Kh_v(i,J,1) = max(Kh_loc, CS%KhTr_min)
         if (CS%KhTr_passivity_coeff>0.) then ! Apply passivity
           Rd_dx = 0.5*( VarMix%Rd_dx_h(i,j)+VarMix%Rd_dx_h(i,j+1) ) ! Rd/dx at v-points
-          Kh_loc = Kh_v(i,J)*max( CS%KhTr_passivity_min, CS%KhTr_passivity_coeff*Rd_dx )
+          Kh_loc = Kh_v(i,J,1)*max( CS%KhTr_passivity_min, CS%KhTr_passivity_coeff*Rd_dx )
           if (CS%KhTr_max > 0.) Kh_loc = min(Kh_loc, CS%KhTr_max) ! Re-apply max
-          Kh_v(i,J) = max(Kh_loc, CS%KhTr_min) ! Re-apply min
+          Kh_v(i,J,1) = max(Kh_loc, CS%KhTr_min) ! Re-apply min
         endif
       enddo ; enddo
 
       !$OMP parallel do default(shared)
       do j=js,je ; do I=is-1,ie
-        khdt_x(I,j) = dt*(Kh_u(I,j)*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
+        khdt_x(I,j) = dt*(Kh_u(I,j,1)*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
       enddo ; enddo
       !$OMP parallel do default(shared)
       do J=js-1,je ; do i=is,ie
-        khdt_y(i,J) = dt*(Kh_v(i,J)*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
+        khdt_y(i,J) = dt*(Kh_v(i,J,1)*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
       enddo ; enddo
     elseif (Resoln_scaled) then
       !$OMP parallel do default(shared) private(Res_fn)
       do j=js,je ; do I=is-1,ie
         Res_fn = 0.5 * (VarMix%Res_fn_h(i,j) + VarMix%Res_fn_h(i+1,j))
-        Kh_u(I,j) = max(CS%KhTr * Res_fn, CS%KhTr_min)
+        Kh_u(I,j,1) = max(CS%KhTr * Res_fn, CS%KhTr_min)
         khdt_x(I,j) = dt*(CS%KhTr*(G%dy_Cu(I,j)*G%IdxCu(I,j))) * Res_fn
       enddo ; enddo
       !$OMP parallel do default(shared) private(Res_fn)
       do J=js-1,je ;  do i=is,ie
         Res_fn = 0.5*(VarMix%Res_fn_h(i,j) + VarMix%Res_fn_h(i,j+1))
-        Kh_v(i,J) = max(CS%KhTr * Res_fn, CS%KhTr_min)
+        Kh_v(i,J,1) = max(CS%KhTr * Res_fn, CS%KhTr_min)
         khdt_y(i,J) = dt*(CS%KhTr*(G%dx_Cv(i,J)*G%IdyCv(i,J))) * Res_fn
       enddo ; enddo
     else  ! Use a simple constant diffusivity.
       if (CS%id_KhTr_u > 0) then
         !$OMP parallel do default(shared)
         do j=js,je ; do I=is-1,ie
-          Kh_u(I,j) = CS%KhTr
+          Kh_u(I,j,1) = CS%KhTr
           khdt_x(I,j) = dt*(CS%KhTr*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
         enddo ; enddo
       else
@@ -287,7 +302,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
       if (CS%id_KhTr_v > 0) then
         !$OMP parallel do default(shared)
         do J=js-1,je ;  do i=is,ie
-          Kh_v(i,J) = CS%KhTr
+          Kh_v(i,J,1) = CS%KhTr
           khdt_y(i,J) = dt*(CS%KhTr*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
         enddo ; enddo
       else
@@ -306,7 +321,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
           if (khdt_x(I,j) > khdt_max) then
             khdt_x(I,j) = khdt_max
             if (dt*(G%dy_Cu(I,j)*G%IdxCu(I,j)) > 0.0) &
-              Kh_u(I,j) = khdt_x(I,j) / (dt*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
+              Kh_u(I,j,1) = khdt_x(I,j) / (dt*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
           endif
         enddo ; enddo
       else
@@ -323,7 +338,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
           if (khdt_y(i,J) > khdt_max) then
             khdt_y(i,J) = khdt_max
             if (dt*(G%dx_Cv(i,J)*G%IdyCv(i,J)) > 0.0) &
-              Kh_v(i,J) = khdt_y(i,J) / (dt*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
+              Kh_v(i,J,1) = khdt_y(i,J) / (dt*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
           endif
         enddo ; enddo
       else
@@ -387,28 +402,50 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
     endif
   enddo
 
-  if (CS%use_lateral_boundary_diffusion) then
+  if (CS%use_hor_bnd_diffusion) then
 
-    if (CS%show_call_tree) call callTree_waypoint("Calling lateral boundary mixing (tracer_hordiff)")
+    if (CS%show_call_tree) call callTree_waypoint("Calling horizontal boundary diffusion (tracer_hordiff)")
 
     call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
 
-    do J=js-1,je ; do i=is,ie
-      Coef_y(i,J) = I_numitts * khdt_y(i,J)
-    enddo ; enddo
-    do j=js,je
-      do I=is-1,ie
-        Coef_x(I,j) = I_numitts * khdt_x(I,j)
+    do k=1,nz+1
+      do J=js-1,je
+        do i=is,ie
+          Coef_y(i,J,K) = I_numitts * khdt_y(i,J)
+        enddo
       enddo
     enddo
+    do k=1,nz+1
+      do j=js,je
+        do I=is-1,ie
+          Coef_x(I,j,K) = I_numitts * khdt_x(I,j)
+        enddo
+      enddo
+    enddo
+    if (CS%KhTh_use_ebt_struct) then
+      do K=2,nz+1
+        do J=js-1,je
+          do i=is,ie
+            Coef_y(i,J,K) = Coef_y(i,J,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i,j+1,k-1) )
+          enddo
+        enddo
+      enddo
+      do k=2,nz+1
+        do j=js,je
+          do I=is-1,ie
+            Coef_x(I,j,K) = Coef_x(I,j,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i+1,j,k-1) )
+          enddo
+        enddo
+      enddo
+    endif
 
     do itt=1,num_itts
-      if (CS%show_call_tree) call callTree_waypoint("Calling lateral boundary diffusion (tracer_hordiff)",itt)
+      if (CS%show_call_tree) call callTree_waypoint("Calling horizontal boundary diffusion (tracer_hordiff)",itt)
       if (itt>1) then ! Update halos for subsequent iterations
         call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
       endif
-      call lateral_boundary_diffusion(G, GV, US, h, Coef_x, Coef_y, I_numitts*dt, Reg, &
-                                     CS%lateral_boundary_diffusion_CSp)
+      call hor_bnd_diffusion(G, GV, US, h, Coef_x, Coef_y, I_numitts*dt, Reg, visc, &
+                             CS%hor_bnd_diffusion_CSp)
     enddo ! itt
   endif
 
@@ -418,22 +455,45 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
 
     call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
     ! We are assuming that neutral surfaces do not evolve (much) as a result of multiple
-    ! lateral diffusion iterations. Otherwise the call to neutral_diffusion_calc_coeffs()
+    !horizontal diffusion iterations. Otherwise the call to neutral_diffusion_calc_coeffs()
     ! would be inside the itt-loop. -AJA
 
     if (associated(tv%p_surf)) then
-      call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, CS%neutral_diffusion_CSp, p_surf=tv%p_surf)
+      call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp, p_surf=tv%p_surf)
     else
-      call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, CS%neutral_diffusion_CSp)
+      call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp)
     endif
-    do J=js-1,je ; do i=is,ie
-      Coef_y(i,J) = I_numitts * khdt_y(i,J)
-    enddo ; enddo
-    do j=js,je
-      do I=is-1,ie
-        Coef_x(I,j) = I_numitts * khdt_x(I,j)
+
+    do k=1,nz+1
+      do J=js-1,je
+        do i=is,ie
+          Coef_y(i,J,K) = I_numitts * khdt_y(i,J)
+        enddo
       enddo
     enddo
+    do k=1,nz+1
+      do j=js,je
+        do I=is-1,ie
+          Coef_x(I,j,K) = I_numitts * khdt_x(I,j)
+        enddo
+      enddo
+    enddo
+    if (CS%KhTh_use_ebt_struct) then
+      do K=2,nz+1
+        do J=js-1,je
+          do i=is,ie
+            Coef_y(i,J,K) = Coef_y(i,J,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i,j+1,k-1) )
+          enddo
+        enddo
+      enddo
+      do k=2,nz+1
+        do j=js,je
+          do I=is-1,ie
+            Coef_x(I,j,K) = Coef_x(I,j,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i+1,j,k-1) )
+          enddo
+        enddo
+      enddo
+    endif
 
     do itt=1,num_itts
       if (CS%show_call_tree) call callTree_waypoint("Calling neutral diffusion (tracer_hordiff)",itt)
@@ -441,9 +501,10 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
         call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
         if (CS%recalc_neutral_surf) then
           if (associated(tv%p_surf)) then
-            call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, CS%neutral_diffusion_CSp, p_surf=tv%p_surf)
+            call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp, &
+                                               p_surf=tv%p_surf)
           else
-            call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, CS%neutral_diffusion_CSp)
+            call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp)
           endif
         endif
       endif
@@ -467,13 +528,13 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
         endif
 
         do J=js-1,je ; do i=is,ie
-          Coef_y(i,J) = ((scale * khdt_y(i,J))*2.0*(h(i,j,k)*h(i,j+1,k))) / &
+          Coef_y(i,J,1) = ((scale * khdt_y(i,J))*2.0*(h(i,j,k)*h(i,j+1,k))) / &
                                                    (h(i,j,k)+h(i,j+1,k)+h_neglect)
         enddo ; enddo
 
         do j=js,je
           do I=is-1,ie
-            Coef_x(I,j) = ((scale * khdt_x(I,j))*2.0*(h(i,j,k)*h(i+1,j,k))) / &
+            Coef_x(I,j,1) = ((scale * khdt_x(I,j))*2.0*(h(i,j,k)*h(i+1,j,k))) / &
                                                      (h(i,j,k)+h(i+1,j,k)+h_neglect)
           enddo
 
@@ -485,25 +546,25 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
         do m=1,ntr
           do j=js,je ; do i=is,ie
             dTr(i,j) = Ihdxdy(i,j) * &
-              ((Coef_x(I-1,j) * (Reg%Tr(m)%t(i-1,j,k) - Reg%Tr(m)%t(i,j,k)) - &
-                Coef_x(I,j) * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i+1,j,k))) + &
-               (Coef_y(i,J-1) * (Reg%Tr(m)%t(i,j-1,k) - Reg%Tr(m)%t(i,j,k)) - &
-                Coef_y(i,J) * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i,j+1,k))))
+              ((Coef_x(I-1,j,1) * (Reg%Tr(m)%t(i-1,j,k) - Reg%Tr(m)%t(i,j,k)) - &
+                Coef_x(I,j,1) * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i+1,j,k))) + &
+               (Coef_y(i,J-1,1) * (Reg%Tr(m)%t(i,j-1,k) - Reg%Tr(m)%t(i,j,k)) - &
+                Coef_y(i,J,1) * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i,j+1,k))))
           enddo ; enddo
           if (associated(Reg%Tr(m)%df_x)) then ; do j=js,je ; do I=G%IscB,G%IecB
-            Reg%Tr(m)%df_x(I,j,k) = Reg%Tr(m)%df_x(I,j,k) + Coef_x(I,j) &
+            Reg%Tr(m)%df_x(I,j,k) = Reg%Tr(m)%df_x(I,j,k) + Coef_x(I,j,1) &
                 * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i+1,j,k)) * Idt
           enddo ; enddo ; endif
           if (associated(Reg%Tr(m)%df_y)) then ; do J=G%JscB,G%JecB ; do i=is,ie
-            Reg%Tr(m)%df_y(i,J,k) = Reg%Tr(m)%df_y(i,J,k) + Coef_y(i,J) &
+            Reg%Tr(m)%df_y(i,J,k) = Reg%Tr(m)%df_y(i,J,k) + Coef_y(i,J,1) &
                 * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i,j+1,k)) * Idt
           enddo ; enddo ; endif
           if (associated(Reg%Tr(m)%df2d_x)) then ; do j=js,je ; do I=G%IscB,G%IecB
-            Reg%Tr(m)%df2d_x(I,j) = Reg%Tr(m)%df2d_x(I,j) + Coef_x(I,j) &
+            Reg%Tr(m)%df2d_x(I,j) = Reg%Tr(m)%df2d_x(I,j) + Coef_x(I,j,1) &
                 * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i+1,j,k)) * Idt
           enddo ; enddo ; endif
           if (associated(Reg%Tr(m)%df2d_y)) then ; do J=G%JscB,G%JecB ; do i=is,ie
-            Reg%Tr(m)%df2d_y(i,J) = Reg%Tr(m)%df2d_y(i,J) + Coef_y(i,J) &
+            Reg%Tr(m)%df2d_y(i,J) = Reg%Tr(m)%df2d_y(i,J) + Coef_y(i,J,1) &
                 * (Reg%Tr(m)%t(i,j,k) - Reg%Tr(m)%t(i,j+1,k)) * Idt
           enddo ; enddo ; endif
           do j=js,je ; do i=is,ie
@@ -542,43 +603,65 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, G, GV, US, CS, Reg, tv, do_online
   ! post diagnostics for 2d tracer diffusivity
   if (CS%id_KhTr_u > 0) then
     do j=js,je ; do I=is-1,ie
-      Kh_u(I,j) = G%mask2dCu(I,j)*Kh_u(I,j)
+      Kh_u(I,j,:) = G%mask2dCu(I,j)*Kh_u(I,j,1)
     enddo ; enddo
-    call post_data(CS%id_KhTr_u, Kh_u, CS%diag, mask=G%mask2dCu)
+    if (CS%KhTh_use_ebt_struct) then
+      do K=2,nz+1
+        do j=js,je
+          do I=is-1,ie
+            Kh_u(I,j,K) = Kh_u(I,j,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i+1,j,k-1) )
+          enddo
+        enddo
+      enddo
+    endif
+    !call post_data(CS%id_KhTr_u, Kh_u, CS%diag, is_static=.false., mask=G%mask2dCu)
+    call post_data(CS%id_KhTr_u, Kh_u, CS%diag)
   endif
   if (CS%id_KhTr_v > 0) then
     do J=js-1,je ; do i=is,ie
-      Kh_v(i,J) = G%mask2dCv(i,J)*Kh_v(i,J)
+      Kh_v(i,J,:) = G%mask2dCv(i,J)*Kh_v(i,J,1)
     enddo ; enddo
-    call post_data(CS%id_KhTr_v, Kh_v, CS%diag, mask=G%mask2dCv)
+    if (CS%KhTh_use_ebt_struct) then
+      do K=2,nz+1
+        do J=js-1,je
+          do i=is,ie
+            Kh_v(i,J,K) = Kh_v(i,J,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i,j+1,k-1) )
+          enddo
+        enddo
+      enddo
+    endif
+    !call post_data(CS%id_KhTr_v, Kh_v, CS%diag, is_static=.false., mask=G%mask2dCv)
+    call post_data(CS%id_KhTr_v, Kh_v, CS%diag)
   endif
   if (CS%id_KhTr_h > 0) then
-    Kh_h(:,:) = 0.0
+    Kh_h(:,:,:) = 0.0
     do j=js,je ; do I=is-1,ie
-      Kh_u(I,j) = G%mask2dCu(I,j)*Kh_u(I,j)
+      Kh_u(I,j,1) = G%mask2dCu(I,j)*Kh_u(I,j,1)
     enddo ; enddo
     do J=js-1,je ; do i=is,ie
-      Kh_v(i,J) = G%mask2dCv(i,J)*Kh_v(i,J)
+      Kh_v(i,J,1) = G%mask2dCv(i,J)*Kh_v(i,J,1)
     enddo ; enddo
+
     do j=js,je ; do i=is,ie
       normalize = 1.0 / ((G%mask2dCu(I-1,j)+G%mask2dCu(I,j)) + &
                          (G%mask2dCv(i,J-1)+G%mask2dCv(i,J)) + 1.0e-37)
-      Kh_h(i,j) = normalize*G%mask2dT(i,j)*((Kh_u(I-1,j)+Kh_u(I,j)) + &
-                                            (Kh_v(i,J-1)+Kh_v(i,J)))
+      Kh_h(i,j,:) = normalize*G%mask2dT(i,j)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
+                                             (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
+      if (CS%KhTh_use_ebt_struct) then
+        do K=2,nz+1
+          Kh_h(i,j,K) = normalize*G%mask2dT(i,j)*VarMix%ebt_struct(i,j,k-1)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
+                                                                            (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
+        enddo
+      endif
     enddo ; enddo
-    call post_data(CS%id_KhTr_h, Kh_h, CS%diag, mask=G%mask2dT)
+    !call post_data(CS%id_KhTr_h, Kh_h, CS%diag, is_static=.false., mask=G%mask2dT)
+    call post_data(CS%id_KhTr_h, Kh_h, CS%diag)
   endif
-
 
   if (CS%debug) then
     call uvchksum("After tracer diffusion khdt_[xy]", khdt_x, khdt_y, &
                   G%HI, haloshift=0, symmetric=.true., scale=US%L_to_m**2, &
                   scalar_pair=.true.)
-    if (CS%use_neutral_diffusion) then
-      call uvchksum("After tracer diffusion Coef_[xy]", Coef_x, Coef_y, &
-                    G%HI, haloshift=0, symmetric=.true., scale=US%L_to_m**2, &
-                    scalar_pair=.true.)
-    endif
   endif
 
   if (CS%id_khdt_x > 0) call post_data(CS%id_khdt_x, khdt_x, CS%diag)
@@ -606,7 +689,7 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
   real, dimension(SZI_(G),SZJB_(G)),        intent(in)    :: khdt_epi_y !< Meridional epipycnal diffusivity times
                                                            !! a time step and the ratio of the open face width over
                                                            !! the distance between adjacent tracer points [L2 ~> m2]
-  type(unit_scale_type),                    intent(in)    :: US !< A dimensional unit scaling type
+  type(unit_scale_type),                    intent(in)    :: US         !< A dimensional unit scaling type
   type(tracer_hor_diff_CS),                 intent(inout) :: CS         !< module control structure
   type(thermo_var_ptrs),                    intent(in)    :: tv         !< thermodynamic structure
   integer,                                  intent(in)    :: num_itts   !< number of iterations (usually=1)
@@ -634,13 +717,16 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
     k0b_Lv, k0a_Lv, &  ! The original k-indices of the layers that participate
     k0b_Rv, k0a_Rv     ! in each pair of mixing at v-faces.
 
-  !### Accumulating the converge into this array one face at a time may lead to a lack of rotational symmetry.
-  real, dimension(SZI_(G), SZJ_(G), SZK_(GV)) :: &
-    tr_flux_conv  ! The flux convergence of tracers [conc H L2 ~> conc m3 or conc kg]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+    tr_flux_N, &      ! The tracer flux through the northern face [conc H L2 ~> conc m3 or conc kg]
+    tr_flux_S, &      ! The tracer flux through the southern face [conc H L2 ~> conc m3 or conc kg]
+    tr_flux_E, &      ! The tracer flux through the eastern face [conc H L2 ~> conc m3 or conc kg]
+    tr_flux_W, &      ! The tracer flux through the western face [conc H L2 ~> conc m3 or conc kg]
+    tr_flux_conv      ! The flux convergence of tracers [conc H L2 ~> conc m3 or conc kg]
 
   ! The following 3-d arrays were created in 2014 in MOM6 PR#12 to facilitate openMP threading
-  ! on an i-loop, which might have been ill advised.  The k-size extents here might also be problematic.
-  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: &
+  ! on an i-loop, which might have been ill advised.
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)*2) :: &
     Tr_flux_3d, &     ! The tracer flux through pairings at meridional faces [conc H L2 ~> conc m3 or conc kg]
     Tr_adj_vert_L, &  ! Vertical adjustments to which layer the fluxes go into in the southern
                       ! columns at meridional face [conc H L2 ~> conc m3 or conc kg]
@@ -743,6 +829,7 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
   do k=2,nkmb ; do j=js-2,je+2 ; do i=is-2,ie+2
     if (Rml_max(i,j) < rho_coord(i,j,k)) Rml_max(i,j) = rho_coord(i,j,k)
   enddo ; enddo ; enddo
+
   !   Use bracketing and bisection to find the k-level that the densest of the
   ! mixed and buffer layer corresponds to, such that:
   !     GV%Rlay(max_kRho-1) < Rml_max <= GV%Rlay(max_kRho)
@@ -1119,12 +1206,7 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
 
   endif ; enddo ; enddo ! i- & j- loops over meridional faces.
 
-! The tracer-specific calculations start here.
-
-  ! Zero out tracer tendencies.
-  do k=1,PEmax_kRho ; do j=js-1,je+1 ; do i=is-1,ie+1
-    tr_flux_conv(i,j,k) = 0.0
-  enddo ; enddo ; enddo
+  ! The tracer-specific calculations start here.
 
   do itt=1,max_itt
 
@@ -1133,12 +1215,19 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
     endif
 
     do m=1,ntr
-!$OMP parallel do default(none) shared(is,ie,js,je,G,Tr,nkmb,nPu,m,max_kRho,nz,h,h_exclude, &
-!$OMP                                  k0b_Lu,k0b_Ru,deep_wt_Lu,k0a_Lu,deep_wt_Ru,k0a_Ru,   &
-!$OMP                                  hP_Lu,hP_Ru,I_maxitt,khdt_epi_x,tr_flux_conv,Idt) &
-!$OMP                          private(Tr_min_face,Tr_max_face,kLa,kLb,kRa,kRb,Tr_La, &
-!$OMP                                     Tr_Lb,Tr_Ra,Tr_Rb,Tr_av_L,wt_b,Tr_av_R,h_L,h_R, &
-!$OMP                                     Tr_flux,Tr_adj_vert,wt_a,vol)
+      ! Zero out tracer tendencies.
+      if (CS%answer_date <= 20240330) then
+        tr_flux_conv(:,:,:) = 0.0
+      else
+        tr_flux_N(:,:,:) = 0.0 ; tr_flux_S(:,:,:) = 0.0
+        tr_flux_E(:,:,:) = 0.0 ; tr_flux_W(:,:,:) = 0.0
+      endif
+      tr_flux_3d(:,:,:) = 0.0
+      tr_adj_vert_R(:,:,:) = 0.0 ; tr_adj_vert_L(:,:,:) = 0.0
+
+      !$OMP parallel do default(shared) private(Tr_min_face,Tr_max_face,kLa,kLb,kRa,kRb,Tr_La, &
+      !$OMP                                     Tr_Lb,Tr_Ra,Tr_Rb,Tr_av_L,wt_b,Tr_av_R,h_L,h_R, &
+      !$OMP                                     Tr_flux,Tr_adj_vert,wt_a,vol)
       do j=js,je ; do I=is-1,ie ; if (G%mask2dCu(I,j) > 0.0) then
         ! Determine the fluxes through the zonal faces.
 
@@ -1158,7 +1247,11 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
           kRb = kRa ; if (max_kRho(i+1,j) < nz) kRb = max_kRho(i+1,j)+1
           Tr_La = Tr_min_face ; Tr_Lb = Tr_La ; Tr_Ra = Tr_La ; Tr_Rb = Tr_La
           if (h(i,j,kLa) > h_exclude) Tr_La = Tr(m)%t(i,j,kLa)
-          if (h(i,j,kLb) > h_exclude) Tr_La = Tr(m)%t(i,j,kLb)
+          if ((CS%answer_date <= 20240330) .and. CS%limit_bug) then
+            if (h(i,j,kLb) > h_exclude) Tr_La = Tr(m)%t(i,j,kLb)
+          else
+            if (h(i,j,kLb) > h_exclude) Tr_Lb = Tr(m)%t(i,j,kLb)
+          endif
           if (h(i+1,j,kRa) > h_exclude) Tr_Ra = Tr(m)%t(i+1,j,kRa)
           if (h(i+1,j,kRb) > h_exclude) Tr_Rb = Tr(m)%t(i+1,j,kRb)
           Tr_min_face = min(Tr_min_face, Tr_La, Tr_Lb, Tr_Ra, Tr_Rb)
@@ -1192,12 +1285,20 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
           endif
 
           h_L = hP_Lu(j)%p(I,k) ; h_R = hP_Ru(j)%p(I,k)
-          Tr_flux = I_maxitt * khdt_epi_x(I,j) * (Tr_av_L - Tr_av_R) * &
-            ((2.0 * h_L * h_R) / (h_L + h_R))
-
+          if (CS%answer_date <= 20240330) then
+            Tr_flux = I_maxitt * khdt_epi_x(I,j) * (Tr_av_L - Tr_av_R) * &
+                      ((2.0 * h_L * h_R) / (h_L + h_R))
+          else
+            Tr_flux = I_maxitt * ((2.0 * h_L * h_R) / (h_L + h_R)) * &
+                      khdt_epi_x(I,j) * (Tr_av_L - Tr_av_R)
+          endif
 
           if (deep_wt_Lu(j)%p(I,k) >= 1.0) then
-            tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - Tr_flux
+            if (CS%answer_date <= 20240330) then
+              tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - Tr_flux
+            else
+              tr_flux_E(i,j,kLb) = tr_flux_E(i,j,kLb) + Tr_flux
+            endif
           else
             Tr_adj_vert = 0.0
             wt_b = deep_wt_Lu(j)%p(I,k) ; wt_a = 1.0 - wt_b
@@ -1227,12 +1328,21 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
               endif
             endif
 
-            tr_flux_conv(i,j,kLa) = tr_flux_conv(i,j,kLa) - (wt_a*Tr_flux + Tr_adj_vert)
-            tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - (wt_b*Tr_flux - Tr_adj_vert)
+            if (CS%answer_date <= 20240330) then
+              tr_flux_conv(i,j,kLa) = tr_flux_conv(i,j,kLa) - (wt_a*Tr_flux + Tr_adj_vert)
+              tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - (wt_b*Tr_flux - Tr_adj_vert)
+            else
+              tr_flux_E(i,j,kLa) = tr_flux_E(i,j,kLa) + (wt_a*Tr_flux + Tr_adj_vert)
+              tr_flux_E(i,j,kLb) = tr_flux_E(i,j,kLb) + (wt_b*Tr_flux - Tr_adj_vert)
+            endif
           endif
 
           if (deep_wt_Ru(j)%p(I,k) >= 1.0) then
-            tr_flux_conv(i+1,j,kRb) = tr_flux_conv(i+1,j,kRb) + Tr_flux
+            if (CS%answer_date <= 20240330) then
+              tr_flux_conv(i+1,j,kRb) = tr_flux_conv(i+1,j,kRb) + Tr_flux
+            else
+              tr_flux_W(i+1,j,kRb) = tr_flux_W(i+1,j,kRb) + Tr_flux
+            endif
           else
             Tr_adj_vert = 0.0
             wt_b = deep_wt_Ru(j)%p(I,k) ; wt_a = 1.0 - wt_b
@@ -1262,23 +1372,22 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
               endif
             endif
 
-            tr_flux_conv(i+1,j,kRa) = tr_flux_conv(i+1,j,kRa) + &
-                                            (wt_a*Tr_flux - Tr_adj_vert)
-            tr_flux_conv(i+1,j,kRb) = tr_flux_conv(i+1,j,kRb) + &
-                                            (wt_b*Tr_flux + Tr_adj_vert)
+            if (CS%answer_date <= 20240330) then
+              tr_flux_conv(i+1,j,kRa) = tr_flux_conv(i+1,j,kRa) + (wt_a*Tr_flux - Tr_adj_vert)
+              tr_flux_conv(i+1,j,kRb) = tr_flux_conv(i+1,j,kRb) + (wt_b*Tr_flux + Tr_adj_vert)
+            else
+              tr_flux_W(i+1,j,kRa) = tr_flux_W(i+1,j,kRa) + (wt_a*Tr_flux - Tr_adj_vert)
+              tr_flux_W(i+1,j,kRb) = tr_flux_W(i+1,j,kRb) + (wt_b*Tr_flux + Tr_adj_vert)
+            endif
           endif
           if (associated(Tr(m)%df2d_x)) &
             Tr(m)%df2d_x(I,j) = Tr(m)%df2d_x(I,j) + Tr_flux * Idt
         enddo ! Loop over pairings at faces.
       endif ; enddo ; enddo ! i- & j- loops over zonal faces.
 
-!$OMP parallel do default(none) shared(is,ie,js,je,G,Tr,nkmb,nPv,m,max_kRho,nz,h,h_exclude, &
-!$OMP                                  k0b_Lv,k0b_Rv,deep_wt_Lv,k0a_Lv,deep_wt_Rv,k0a_Rv,   &
-!$OMP                                  hP_Lv,hP_Rv,I_maxitt,khdt_epi_y,Tr_flux_3d,          &
-!$OMP                                  Tr_adj_vert_L,Tr_adj_vert_R,Idt)                     &
-!$OMP                          private(Tr_min_face,Tr_max_face,kLa,kLb,kRa,kRb,             &
-!$OMP                                  Tr_La,Tr_Lb,Tr_Ra,Tr_Rb,Tr_av_L,wt_b,Tr_av_R,        &
-!$OMP                                  h_L,h_R,Tr_flux,Tr_adj_vert,wt_a,vol)
+      !$OMP parallel do default(shared) private(Tr_min_face,Tr_max_face,kLa,kLb,kRa,kRb,             &
+      !$OMP                                  Tr_La,Tr_Lb,Tr_Ra,Tr_Rb,Tr_av_L,wt_b,Tr_av_R,        &
+      !$OMP                                  h_L,h_R,Tr_flux,Tr_adj_vert,wt_a,vol)
       do J=js-1,je ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.0) then
         ! Determine the fluxes through the meridional faces.
 
@@ -1298,7 +1407,11 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
           kRb = kRa ; if (max_kRho(i,j+1) < nz) kRb = max_kRho(i,j+1)+1
           Tr_La = Tr_min_face ; Tr_Lb = Tr_La ; Tr_Ra = Tr_La ; Tr_Rb = Tr_La
           if (h(i,j,kLa) > h_exclude) Tr_La = Tr(m)%t(i,j,kLa)
-          if (h(i,j,kLb) > h_exclude) Tr_La = Tr(m)%t(i,j,kLb)
+          if ((CS%answer_date <= 20240330) .and. CS%limit_bug) then
+            if (h(i,j,kLb) > h_exclude) Tr_La = Tr(m)%t(i,j,kLb)
+          else
+            if (h(i,j,kLb) > h_exclude) Tr_Lb = Tr(m)%t(i,j,kLb)
+          endif
           if (h(i,j+1,kRa) > h_exclude) Tr_Ra = Tr(m)%t(i,j+1,kRa)
           if (h(i,j+1,kRb) > h_exclude) Tr_Rb = Tr(m)%t(i,j+1,kRb)
           Tr_min_face = min(Tr_min_face, Tr_La, Tr_Lb, Tr_Ra, Tr_Rb)
@@ -1392,42 +1505,69 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
             Tr(m)%df2d_y(i,J) = Tr(m)%df2d_y(i,J) + Tr_flux * Idt
         enddo ! Loop over pairings at faces.
       endif ; enddo ; enddo ! i- & j- loops over meridional faces.
-!$OMP parallel do default(none) shared(is,ie,js,je,G,nPv,k0b_Lv,k0b_Rv,deep_wt_Lv,  &
-!$OMP                                  tr_flux_conv,Tr_flux_3d,k0a_Lv,Tr_adj_vert_L,&
-!$OMP                                  deep_wt_Rv,k0a_Rv,Tr_adj_vert_R) &
-!$OMP                          private(kLa,kLb,kRa,kRb,wt_b,wt_a)
-      do i=is,ie ; do J=js-1,je ; if (G%mask2dCv(i,J) > 0.0) then
+
+      !$OMP parallel do default(shared) private(kLa,kLb,kRa,kRb,wt_b,wt_a)
+      do J=js-1,je ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.0) then
         ! The non-stride-1 loop order here is to facilitate openMP threading. However, it might be
         ! suboptimal when openMP threading is not used, at which point it might be better to fuse
-        ! these loope with those that precede it and thereby eliminate the need for three 3-d arrays.
-        do k=1,nPv(i,J)
-          kLb = k0b_Lv(J)%p(i,k); kRb = k0b_Rv(J)%p(i,k)
-          if (deep_wt_Lv(J)%p(i,k) >= 1.0) then
-            tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - Tr_flux_3d(i,J,k)
-          else
-            kLa = k0a_Lv(J)%p(i,k)
-            wt_b = deep_wt_Lv(J)%p(i,k) ; wt_a = 1.0 - wt_b
-            tr_flux_conv(i,j,kLa) = tr_flux_conv(i,j,kLa) - (wt_a*Tr_flux_3d(i,J,k) + Tr_adj_vert_L(i,J,k))
-            tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - (wt_b*Tr_flux_3d(i,J,k) - Tr_adj_vert_L(i,J,k))
-          endif
-          if (deep_wt_Rv(J)%p(i,k) >= 1.0) then
-            tr_flux_conv(i,j+1,kRb) = tr_flux_conv(i,j+1,kRb) + Tr_flux_3d(i,J,k)
-          else
-            kRa = k0a_Rv(J)%p(i,k)
-            wt_b = deep_wt_Rv(J)%p(i,k) ; wt_a = 1.0 - wt_b
-            tr_flux_conv(i,j+1,kRa) = tr_flux_conv(i,j+1,kRa) + &
-                                            (wt_a*Tr_flux_3d(i,J,k) - Tr_adj_vert_R(i,J,k))
-            tr_flux_conv(i,j+1,kRb) = tr_flux_conv(i,j+1,kRb) + &
-                                            (wt_b*Tr_flux_3d(i,J,k) + Tr_adj_vert_R(i,J,k))
-          endif
-        enddo
+        ! this loop with those that precede it and thereby eliminate the need for three 3-d arrays.
+        if (CS%answer_date <= 20240330) then
+          do k=1,nPv(i,J)
+            kLb = k0b_Lv(J)%p(i,k); kRb = k0b_Rv(J)%p(i,k)
+            if (deep_wt_Lv(J)%p(i,k) >= 1.0) then
+              tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - Tr_flux_3d(i,J,k)
+            else
+              kLa = k0a_Lv(J)%p(i,k)
+              wt_b = deep_wt_Lv(J)%p(i,k) ; wt_a = 1.0 - wt_b
+              tr_flux_conv(i,j,kLa) = tr_flux_conv(i,j,kLa) - (wt_a*Tr_flux_3d(i,J,k) + Tr_adj_vert_L(i,J,k))
+              tr_flux_conv(i,j,kLb) = tr_flux_conv(i,j,kLb) - (wt_b*Tr_flux_3d(i,J,k) - Tr_adj_vert_L(i,J,k))
+            endif
+            if (deep_wt_Rv(J)%p(i,k) >= 1.0) then
+              tr_flux_conv(i,j+1,kRb) = tr_flux_conv(i,j+1,kRb) + Tr_flux_3d(i,J,k)
+            else
+              kRa = k0a_Rv(J)%p(i,k)
+              wt_b = deep_wt_Rv(J)%p(i,k) ; wt_a = 1.0 - wt_b
+              tr_flux_conv(i,j+1,kRa) = tr_flux_conv(i,j+1,kRa) + &
+                                              (wt_a*Tr_flux_3d(i,J,k) - Tr_adj_vert_R(i,J,k))
+              tr_flux_conv(i,j+1,kRb) = tr_flux_conv(i,j+1,kRb) + &
+                                              (wt_b*Tr_flux_3d(i,J,k) + Tr_adj_vert_R(i,J,k))
+            endif
+          enddo
+        else
+          do k=1,nPv(i,J)
+            kLb = k0b_Lv(J)%p(i,k); kRb = k0b_Rv(J)%p(i,k)
+            if (deep_wt_Lv(J)%p(i,k) >= 1.0) then
+              tr_flux_N(i,j,kLb) = tr_flux_N(i,j,kLb) + Tr_flux_3d(i,J,k)
+            else
+              kLa = k0a_Lv(J)%p(i,k)
+              wt_b = deep_wt_Lv(J)%p(i,k) ; wt_a = 1.0 - wt_b
+              tr_flux_N(i,j,kLa) = tr_flux_N(i,j,kLa) + (wt_a*Tr_flux_3d(i,J,k) + Tr_adj_vert_L(i,J,k))
+              tr_flux_N(i,j,kLb) = tr_flux_N(i,j,kLb) + (wt_b*Tr_flux_3d(i,J,k) - Tr_adj_vert_L(i,J,k))
+            endif
+            if (deep_wt_Rv(J)%p(i,k) >= 1.0) then
+              tr_flux_S(i,j+1,kRb) = tr_flux_S(i,j+1,kRb) + Tr_flux_3d(i,J,k)
+            else
+              kRa = k0a_Rv(J)%p(i,k)
+              wt_b = deep_wt_Rv(J)%p(i,k) ; wt_a = 1.0 - wt_b
+              tr_flux_S(i,j+1,kRa) = tr_flux_S(i,j+1,kRa) + (wt_a*Tr_flux_3d(i,J,k) - Tr_adj_vert_R(i,J,k))
+              tr_flux_S(i,j+1,kRb) = tr_flux_S(i,j+1,kRb) + (wt_b*Tr_flux_3d(i,J,k) + Tr_adj_vert_R(i,J,k))
+            endif
+          enddo
+        endif
       endif ; enddo ; enddo
+
+      if (CS%answer_date >= 20240331) then
+        !$OMP parallel do default(shared)
+        do k=1,PEmax_kRho ; do j=js,je ; do i=is,ie
+          tr_flux_conv(i,j,k) = ((tr_flux_W(i,j,k) - tr_flux_E(i,j,k)) + &
+                                 (tr_flux_S(i,j,k) - tr_flux_N(i,j,k)))
+        enddo ; enddo ; enddo
+      endif
+
       !$OMP parallel do default(shared)
       do k=1,PEmax_kRho ; do j=js,je ; do i=is,ie
         if ((G%mask2dT(i,j) > 0.0) .and. (h(i,j,k) > 0.0)) then
-          Tr(m)%t(i,j,k) = Tr(m)%t(i,j,k) + tr_flux_conv(i,j,k) / &
-                                            (h(i,j,k)*G%areaT(i,j))
-          tr_flux_conv(i,j,k) = 0.0
+          Tr(m)%t(i,j,k) = Tr(m)%t(i,j,k) + tr_flux_conv(i,j,k) / (h(i,j,k)*G%areaT(i,j))
         endif
       enddo ; enddo ; enddo
 
@@ -1474,6 +1614,7 @@ subroutine tracer_hor_diff_init(Time, G, GV, US, param_file, diag, EOS, diabatic
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_tracer_hor_diff" ! This module's name.
+  integer :: default_answer_date
 
   if (associated(CS)) then
     call MOM_error(WARNING, "tracer_hor_diff_init called with associated control structure.")
@@ -1489,6 +1630,10 @@ subroutine tracer_hor_diff_init(Time, G, GV, US, param_file, diag, EOS, diabatic
   call get_param(param_file, mdl, "KHTR", CS%KhTr, &
                  "The background along-isopycnal tracer diffusivity.", &
                  units="m2 s-1", default=0.0, scale=US%m_to_L**2*US%T_to_s)
+  call get_param(param_file, mdl, "KHTR_USE_EBT_STRUCT", CS%KhTh_use_ebt_struct, &
+                 "If true, uses the equivalent barotropic structure "//&
+                 "as the vertical structure of the tracer diffusivity.",&
+                 default=.false.)
   call get_param(param_file, mdl, "KHTR_SLOPE_CFF", CS%KhTr_Slope_Cff, &
                  "The scaling coefficient for along-isopycnal tracer "//&
                  "diffusivity using a shear-based (Visbeck-like) "//&
@@ -1528,6 +1673,21 @@ subroutine tracer_hor_diff_init(Time, G, GV, US, param_file, diag, EOS, diabatic
                  "If true, then recalculate the neutral surfaces if the \n"//&
                  "diffusive CFL is exceeded. If false, assume that the  \n"//&
                  "positions of the surfaces do not change \n", default=.false.)
+  call get_param(param_file, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
+                 "This sets the default value for the various _ANSWER_DATE parameters.", &
+                 default=99991231, do_not_log=.true.)
+  call get_param(param_file, mdl, "HOR_DIFF_ANSWER_DATE", CS%answer_date, &
+                 "The vintage of the order of arithmetic to use for the tracer diffusion.  "//&
+                 "Values of 20240330 or below recover the answers from the original form of the "//&
+                 "along-isopycnal mixed layer to interior mixing code, while higher values use "//&
+                 "mathematically equivalent expressions that recover rotational symmetry "//&
+                 "when DIFFUSE_ML_TO_INTERIOR is true.", &
+                 default=20240101, do_not_log=.not.CS%Diffuse_ML_interior)
+                 !### Change the default later to default_answer_date.
+  call get_param(param_file, mdl, "HOR_DIFF_LIMIT_BUG", CS%limit_bug, &
+                 "If true and the answer date is 20240330 or below, use a rotational symmetry "//&
+                 "breaking bug when limiting the tracer properties in tracer_epipycnal_ML_diff.", &
+                 default=.true., do_not_log=((.not.CS%Diffuse_ML_interior).or.(CS%answer_date>=20240331)))
   CS%ML_KhTR_scale = 1.0
   if (CS%Diffuse_ML_interior) then
     call get_param(param_file, mdl, "ML_KHTR_SCALE", CS%ML_KhTR_scale, &
@@ -1541,10 +1701,10 @@ subroutine tracer_hor_diff_init(Time, G, GV, US, param_file, diag, EOS, diabatic
                                                     diabatic_CSp, CS%neutral_diffusion_CSp )
   if (CS%use_neutral_diffusion .and. CS%Diffuse_ML_interior) call MOM_error(FATAL, "MOM_tracer_hor_diff: "// &
        "USE_NEUTRAL_DIFFUSION and DIFFUSE_ML_TO_INTERIOR are mutually exclusive!")
-  CS%use_lateral_boundary_diffusion = lateral_boundary_diffusion_init(Time, G, GV, param_file, diag, diabatic_CSp, &
-                                                                CS%lateral_boundary_diffusion_CSp)
-  if (CS%use_lateral_boundary_diffusion .and. CS%Diffuse_ML_interior) call MOM_error(FATAL, "MOM_tracer_hor_diff: "// &
-       "USE_LATERAL_BOUNDARY_DIFFUSION and DIFFUSE_ML_TO_INTERIOR are mutually exclusive!")
+  CS%use_hor_bnd_diffusion = hor_bnd_diffusion_init(Time, G, GV, US, param_file, diag, diabatic_CSp, &
+                                                    CS%hor_bnd_diffusion_CSp)
+  if (CS%use_hor_bnd_diffusion .and. CS%Diffuse_ML_interior) call MOM_error(FATAL, "MOM_tracer_hor_diff: "// &
+       "USE_HORIZONTAL_BOUNDARY_DIFFUSION and DIFFUSE_ML_TO_INTERIOR are mutually exclusive!")
 
   call get_param(param_file, mdl, "DEBUG", CS%debug, default=.false.)
 
@@ -1558,11 +1718,11 @@ subroutine tracer_hor_diff_init(Time, G, GV, US, param_file, diag, EOS, diabatic
   CS%id_KhTr_h = -1
   CS%id_CFL    = -1
 
-  CS%id_KhTr_u = register_diag_field('ocean_model', 'KHTR_u', diag%axesCu1, Time, &
+  CS%id_KhTr_u = register_diag_field('ocean_model', 'KHTR_u', diag%axesCui, Time, &
       'Epipycnal tracer diffusivity at zonal faces of tracer cell', 'm2 s-1', conversion=US%L_to_m**2*US%s_to_T)
-  CS%id_KhTr_v = register_diag_field('ocean_model', 'KHTR_v', diag%axesCv1, Time, &
+  CS%id_KhTr_v = register_diag_field('ocean_model', 'KHTR_v', diag%axesCvi, Time, &
       'Epipycnal tracer diffusivity at meridional faces of tracer cell', 'm2 s-1', conversion=US%L_to_m**2*US%s_to_T)
-  CS%id_KhTr_h = register_diag_field('ocean_model', 'KHTR_h', diag%axesT1, Time, &
+  CS%id_KhTr_h = register_diag_field('ocean_model', 'KHTR_h', diag%axesTi, Time, &
       'Epipycnal tracer diffusivity at tracer cell center', 'm2 s-1', conversion=US%L_to_m**2*US%s_to_T, &
       cmor_field_name='diftrelo',                                                &
       cmor_standard_name= 'ocean_tracer_epineutral_laplacian_diffusivity',       &
@@ -1584,6 +1744,7 @@ subroutine tracer_hor_diff_end(CS)
   type(tracer_hor_diff_CS), pointer :: CS !< module control structure
 
   call neutral_diffusion_end(CS%neutral_diffusion_CSp)
+  call hor_bnd_diffusion_end(CS%hor_bnd_diffusion_CSp)
   if (associated(CS)) deallocate(CS)
 
 end subroutine tracer_hor_diff_end

@@ -11,7 +11,8 @@ use MOM_dyn_horgrid, only : dyn_horgrid_type
 use MOM_error_handler, only : MOM_mesg, MOM_error, FATAL, WARNING, is_root_pe
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
 use MOM_file_parser, only : get_param, log_param, param_file_type, log_version
-use MOM_io, only : close_file, create_file, file_type, fieldtype, file_exists, field_size
+use MOM_io, only : create_MOM_file, file_exists, field_size
+use MOM_io, only : MOM_infra_file, MOM_field
 use MOM_io, only : MOM_read_data, MOM_read_vector, read_variable, stdout
 use MOM_io, only : open_file_to_read, close_file_to_read, SINGLE_FILE, MULTIPLE
 use MOM_io, only : slasher, vardesc, MOM_write_field, var_desc
@@ -95,11 +96,13 @@ subroutine MOM_calculate_grad_Coriolis(dF_dx, dF_dy, G, US)
                                       intent(out)   :: dF_dy !< y-component of grad f [T-1 L-1 ~> s-1 m-1]
   type(unit_scale_type),    optional, intent(in)    :: US !< A dimensional unit scaling type
   ! Local variables
+  character(len=40)  :: mdl = "MOM_calculate_grad_Coriolis" ! This subroutine's name.
   integer :: i,j
   real :: f1, f2 ! Average of adjacent Coriolis parameters [T-1 ~> s-1]
 
+  call callTree_enter(trim(mdl)//"(), MOM_shared_initialization.F90")
   if ((LBOUND(G%CoriolisBu,1) > G%isc-1) .or. &
-      (LBOUND(G%CoriolisBu,2) > G%isc-1)) then
+      (LBOUND(G%CoriolisBu,2) > G%jsc-1)) then
     ! The gradient of the Coriolis parameter can not be calculated with this grid.
     dF_dx(:,:) = 0.0 ; dF_dy(:,:) = 0.0
     return
@@ -114,6 +117,7 @@ subroutine MOM_calculate_grad_Coriolis(dF_dx, dF_dy, G, US)
     dF_dy(i,j) = G%IdyT(i,j) * ( f1 - f2 )
   enddo ; enddo
   call pass_vector(dF_dx, dF_dy, G%Domain, stagger=AGRID)
+  call callTree_leave(trim(mdl)//'()')
 
 end subroutine MOM_calculate_grad_Coriolis
 
@@ -252,8 +256,8 @@ subroutine apply_topography_edits_from_file(D, G, param_file, US)
   call close_file_to_read(ncid, topo_edits_file)
 
   do n = 1, n_edits
-    i = ig(n) - G%isd_global + 2 ! +1 for python indexing and +1 for ig-isd_global+1
-    j = jg(n) - G%jsd_global + 2
+    i = ig(n) - G%idg_offset + 1 ! +1 for python indexing
+    j = jg(n) - G%jdg_offset + 1
     if (i>=G%isc .and. i<=G%iec .and. j>=G%jsc .and. j<=G%jec) then
       if (new_depth(n) /= mask_depth) then
         write(stdout,'(a,3i5,f8.2,a,f8.2,2i4)') &
@@ -1346,9 +1350,9 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
   character(len=40)  :: mdl = "write_ocean_geometry_file"
   type(vardesc),   dimension(:), allocatable :: &
     vars     ! Types with metadata about the variables and their staggering
-  type(fieldtype), dimension(:), allocatable :: &
+  type(MOM_field), dimension(:), allocatable :: &
     fields   ! Opaque types used by MOM_io to store variable metadata information
-  type(file_type) :: IO_handle ! The I/O handle of the fileset
+  type(MOM_infra_file) :: IO_handle ! The I/O handle of the fileset
   integer :: nFlds ! The number of variables in this file
   integer :: file_threading
   logical :: multiple_files
@@ -1412,7 +1416,8 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
   file_threading = SINGLE_FILE
   if (multiple_files) file_threading = MULTIPLE
 
-  call create_file(IO_handle, trim(filepath), vars, nFlds, fields, file_threading, dG=G)
+  call create_MOM_file(IO_handle, trim(filepath), vars, nFlds, fields, &
+      file_threading, dG=G)
 
   call MOM_write_field(IO_handle, fields(1), G%Domain, G%geoLatBu)
   call MOM_write_field(IO_handle, fields(2), G%Domain, G%geoLonBu)
@@ -1445,7 +1450,7 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
     call MOM_write_field(IO_handle, fields(23), G%Domain, G%Dopen_v, scale=US%Z_to_m)
   endif
 
-  call close_file(IO_handle)
+  call IO_handle%close()
 
   deallocate(vars, fields)
 

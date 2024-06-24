@@ -39,14 +39,30 @@ AC_CONFIG_MACRO_DIR([m4])
 srcdir=$srcdir/..
 
 
-# Default to symmetric grid
-# NOTE: --enable is more properly used to add a feature, rather than to select
-#   a compile-time mode, so this is not exactly being used as intended.
-MEM_LAYOUT=${srcdir}/config_src/memory/dynamic_symmetric
-AC_ARG_ENABLE([asymmetric],
-  AS_HELP_STRING([--enable-asymmetric], [Use the asymmetric grid]))
-AS_IF([test "$enable_asymmetric" = yes],
-  [MEM_LAYOUT=${srcdir}/config_src/memory/dynamic_nonsymmetric])
+# Configure the memory layout header
+
+AC_ARG_VAR([MOM_MEMORY],
+  [Path to MOM_memory.h header, describing the field memory layout: dynamic
+   symmetric (default), dynamic asymmetric, or static.]
+)
+
+AS_VAR_IF([MOM_MEMORY], [],
+  [MOM_MEMORY=${srcdir}/config_src/memory/dynamic_symmetric/MOM_memory.h]
+)
+
+# Confirm that MOM_MEMORY is named 'MOM_memory.h'
+AS_IF([test $(basename "${MOM_MEMORY}") == "MOM_memory.h"], [],
+ [AC_MSG_ERROR([MOM_MEMORY header ${MOM_MEMORY} must be named 'MOM_memory.h'])]
+)
+
+# Confirm that the file exists
+AC_CHECK_FILE(["$MOM_MEMORY"], [],
+  [AC_MSG_ERROR([MOM_MEMORY header ${MOM_MEMORY} not found.])]
+)
+
+MOM_MEMORY_DIR=$(AS_DIRNAME(["${MOM_MEMORY}"]))
+AC_SUBST([MOM_MEMORY_DIR])
+
 
 # Default to solo_driver
 DRIVER_DIR=${srcdir}/config_src/drivers/solo_driver
@@ -62,18 +78,6 @@ AS_IF([test "x$with_driver" != "x"],
 # TODO: Rather than point to a pre-configured header file, autoconf could be
 # used to configure a header based on a template.
 #AC_CONFIG_HEADERS(["$MEM_LAYOUT/MOM_memory.h"])
-
-# Select the model framework (default: FMS1)
-# NOTE: We can phase this out after the FMS1 I/O has been removed from FMS and
-#   replace with a detection test.  For now, it is a user-defined switch.
-MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS1
-AC_ARG_WITH([framework],
-  AS_HELP_STRING([--with-framework=fms1|fms2], [Select the model framework]))
-AS_CASE(["$with_framework"],
-  [fms1], [MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS1],
-  [fms2], [MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS2],
-  [MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS1]
-)
 
 
 # Explicitly assume free-form Fortran
@@ -204,7 +208,6 @@ AX_FC_CHECK_LIB([FMS], [fms_init], [fms_mod],
   ]
 )
 
-
 # Verify that FMS is at least 2019.01.02
 # NOTE: 2019.01.02 introduced two changes:
 #   - diag_axis_init supports an optional domain_position argument
@@ -220,27 +223,69 @@ AC_COMPILE_IFELSE(
   ]
 )
 
+# Determine the FMS IO implementation.
+AX_FC_CHECK_MODULE([fms2_io_mod], [
+  MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS2
+],[
+  MODEL_FRAMEWORK=${srcdir}/config_src/infra/FMS1
+])
 
-# Verify that makedep is available
+
+# Python interpreter test
+
+# Declare the Python interpreter variable
+AC_ARG_VAR([PYTHON], [Python interpreter command])
+
+# If PYTHON is set to an empty string, then unset it
+AS_VAR_IF([PYTHON], [], [AS_UNSET([PYTHON])], [])
+
+# Now attempt to find a Python interpreter if PYTHON is unset
+AS_VAR_SET_IF([PYTHON], [
+  AC_PATH_PROGS([PYTHON], ["$PYTHON"], [none])
+], [
+  AC_PATH_PROGS([PYTHON], [python python3 python2], [none])
+])
+AS_VAR_IF([PYTHON], [none], [
+  AC_MSG_ERROR([Python interpreter not found.])
+])
+
+
+# Makedep test
 AC_PATH_PROG([MAKEDEP], [makedep], [${srcdir}/ac/makedep])
 AC_SUBST([MAKEDEP])
 
 
 # Generate source list and configure dependency command
-AC_SUBST([SRC_DIRS],
-    ["${srcdir}/src ${MODEL_FRAMEWORK} ${srcdir}/config_src/external ${DRIVER_DIR} ${MEM_LAYOUT}"]
+AC_SUBST([SRC_DIRS], ["\\
+  ${srcdir}/src \\
+  ${MODEL_FRAMEWORK} \\
+  ${srcdir}/config_src/external \\
+  ${DRIVER_DIR} \\
+  ${MOM_MEMORY_DIR}"]
 )
 AC_CONFIG_COMMANDS(Makefile.dep, [make depend])
 
 
 # POSIX verification tests
 
-# These symbols may be defined as macros, making them inaccessible by Fortran.
-# These three exist in modern BSD and Linux libc, so we just confirm them.
-# But one day, we many need to handle them more carefully.
-AX_FC_CHECK_BIND_C([setjmp], [], [AC_MSG_ERROR([Could not find setjmp.])])
-AX_FC_CHECK_BIND_C([longjmp], [], [AC_MSG_ERROR([Could not find longjmp.])])
-AX_FC_CHECK_BIND_C([siglongjmp], [], [AC_MSG_ERROR([Could not find siglongjmp.])])
+# Symbols in <setjmp.h> may be defined as macros, making them inaccessible by
+# Fortran C bindings.  `sigsetjmp` is known to have an internal symbol in
+# glibc, so we check for this possibility.  For the others, we only check for
+# existence.
+
+# If the need arises, we may want to define these under a standalone macro.
+
+# Validate the setjmp symbol
+AX_FC_CHECK_BIND_C([setjmp],
+  [SETJMP="setjmp"], [SETJMP="setjmp_missing"]
+)
+AC_DEFINE_UNQUOTED([SETJMP_NAME], ["${SETJMP}"])
+
+# Validate the longjmp symbol
+AX_FC_CHECK_BIND_C([longjmp],
+  [LONGJMP="longjmp"], [LONGJMP="longjmp_missing"]
+)
+AC_DEFINE_UNQUOTED([LONGJMP_NAME], ["${LONGJMP}"])
 
 # Determine the sigsetjmp symbol.  If missing, then point to sigsetjmp_missing.
 #
@@ -255,6 +300,13 @@ for sigsetjmp_fn in sigsetjmp __sigsetjmp; do
   ])
 done
 AC_DEFINE_UNQUOTED([SIGSETJMP_NAME], ["${SIGSETJMP}"])
+
+# Validate the siglongjmp symbol
+AX_FC_CHECK_BIND_C([siglongjmp],
+  [SIGLONGJMP="siglongjmp"], [SETJMP="siglongjmp_missing"]
+)
+AC_DEFINE_UNQUOTED([SIGLONGJMP_NAME], ["${SIGLONGJMP}"])
+
 
 # Verify the size of nonlocal jump buffer structs
 # NOTE: This requires C compiler, but can it be done with a Fortran compiler?

@@ -17,6 +17,7 @@ use MOM_error_handler, only : stdout, stdlog, MOM_error
 use MOM_io, only : SINGLE_FILE
 use MOM_interp_infra, only : init_extern_field, get_external_field_info
 use MOM_interp_infra, only : time_interp_extern
+use MOM_interpolate, only : external_field
 use MOM_remapping,    only : remappingSchemesDoc
 use MOM_time_manager, only : time_type, real_to_time, get_date
 use MOM_time_manager, only : operator(+), operator(>=), operator(/=)
@@ -80,8 +81,8 @@ end type ptr_mpp_domain
 !> A structure containing integer handles for bias adjustment of tracers
 type :: INC_CS
   integer :: fldno = 0 !< The number of tracers
-  integer :: T_id !< The integer handle for the temperature file
-  integer :: S_id !< The integer handle for the salinity file
+  type(external_field) :: T  !< The handle for the temperature file
+  type(external_field) :: S  !< The handle for the salinity file
 end type INC_CS
 
 !> Control structure that contains a transpose of the ocean state across ensemble members.
@@ -118,7 +119,7 @@ type, public :: ODA_CS ; private
   logical :: use_basin_mask !< If true, use a basin file to delineate weakly coupled ocean basins
   logical :: do_bias_adjustment !< If true, use spatio-temporally varying climatological tendency
                                 !! adjustment for Temperature and Salinity
-  real :: bias_adjustment_multiplier !< A scaling for the bias adjustment
+  real :: bias_adjustment_multiplier !< A scaling for the bias adjustment [nondim]
   integer :: assim_method !< Method: NO_ASSIM,EAKF_ASSIM or OI_ASSIM
   integer :: ensemble_size !< Size of the ensemble
   integer :: ensemble_id = 0 !< id of the current ensemble member
@@ -181,11 +182,7 @@ subroutine init_oda(Time, G, GV, US, diag_CS, CS)
   character(len=80) :: basin_var
   character(len=80) :: remap_scheme
   character(len=80) :: bias_correction_file, inc_file
-  logical :: answers_2018  ! If true, use the order of arithmetic and expressions that recover the
-                           ! answers from the end of 2018.  Otherwise, use updated and more robust
-                           ! forms of the same expressions.
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
-  logical :: default_2018_answers ! The default setting for the various 2018_ANSWERS flags.
 
   if (associated(CS)) call MOM_error(FATAL, 'Calling oda_init with associated control structure')
   allocate(CS)
@@ -252,22 +249,12 @@ subroutine init_oda(Time, G, GV, US, diag_CS, CS)
   call get_param(PF, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
                  "This sets the default value for the various _ANSWER_DATE parameters.", &
                  default=99991231)
-  call get_param(PF, mdl, "DEFAULT_2018_ANSWERS", default_2018_answers, &
-                 "This sets the default value for the various _2018_ANSWERS parameters.", &
-                 default=(default_answer_date<20190101))
-  call get_param(PF, mdl, "ODA_2018_ANSWERS", answers_2018, &
-                 "If true, use the order of arithmetic and expressions that recover the "//&
-                 "answers from original version of the ODA driver.  Otherwise, use updated and "//&
-                 "more robust forms of the same expressions.", default=default_2018_answers)
-  ! Revise inconsistent default answer dates.
-  if (answers_2018 .and. (default_answer_date >= 20190101)) default_answer_date = 20181231
-  if (.not.answers_2018 .and. (default_answer_date < 20190101)) default_answer_date = 20190101
   call get_param(PF, mdl, "ODA_ANSWER_DATE", CS%answer_date, &
                "The vintage of the order of arithmetic and expressions used by the ODA driver "//&
                "Values below 20190101 recover the answers from the end of 2018, while higher "//&
-               "values use updated and more robust forms of the same expressions.  "//&
-               "If both ODA_2018_ANSWERS and ODA_ANSWER_DATE are specified, the "//&
-               "latter takes precedence.", default=default_answer_date)
+               "values use updated and more robust forms of the same expressions.", &
+               default=default_answer_date, do_not_log=.not.GV%Boussinesq)
+  if (.not.GV%Boussinesq) CS%answer_date = max(CS%answer_date, 20230701)
   inputdir = slasher(inputdir)
 
   select case(lowercase(trim(assim_method)))
@@ -304,7 +291,7 @@ subroutine init_oda(Time, G, GV, US, diag_CS, CS)
   CS%G => G
   allocate(CS%Grid)
   ! params NIHALO_ODA, NJHALO_ODA set the DA halo size
-  call MOM_domains_init(CS%Grid%Domain,PF,param_suffix='_ODA')
+  call MOM_domains_init(CS%Grid%Domain, PF, param_suffix='_ODA', US=CS%US)
   allocate(HI)
   call hor_index_init(CS%Grid%Domain, HI, PF)
   call verticalGridInit( PF, CS%GV, CS%US )
@@ -391,11 +378,11 @@ subroutine init_oda(Time, G, GV, US, diag_CS, CS)
                 "tendency adjustments", default='temp_salt_adjustment.nc')
 
     inc_file = trim(inputdir) // trim(bias_correction_file)
-    CS%INC_CS%T_id = init_extern_field(inc_file, "temp_increment", &
+    CS%INC_CS%T = init_extern_field(inc_file, "temp_increment", &
           correct_leap_year_inconsistency=.true.,verbose=.true.,domain=G%Domain%mpp_domain)
-    CS%INC_CS%S_id = init_extern_field(inc_file, "salt_increment", &
+    CS%INC_CS%S = init_extern_field(inc_file, "salt_increment", &
           correct_leap_year_inconsistency=.true.,verbose=.true.,domain=G%Domain%mpp_domain)
-    call get_external_field_info(CS%INC_CS%T_id,size=fld_sz)
+    call get_external_field_info(CS%INC_CS%T, size=fld_sz)
     CS%INC_CS%fldno = 2
     if (CS%nk /= fld_sz(3)) call MOM_error(FATAL,'Increment levels /= ODA levels')
 
@@ -578,9 +565,9 @@ subroutine get_bias_correction_tracer(Time, US, CS)
 
 
   call cpu_clock_begin(id_clock_bias_adjustment)
-  call horiz_interp_and_extrap_tracer(CS%INC_CS%T_id, Time, CS%G, T_bias, &
+  call horiz_interp_and_extrap_tracer(CS%INC_CS%T, Time, CS%G, T_bias, &
             valid_flag, z_in, z_edges_in, missing_value, scale=US%degC_to_C*US%s_to_T, spongeOngrid=.true.)
-  call horiz_interp_and_extrap_tracer(CS%INC_CS%S_id, Time, CS%G, S_bias, &
+  call horiz_interp_and_extrap_tracer(CS%INC_CS%S, Time, CS%G, S_bias, &
             valid_flag, z_in, z_edges_in, missing_value, scale=US%ppt_to_S*US%s_to_T, spongeOngrid=.true.)
 
   ! This should be replaced to use mask_z instead of the following lines
@@ -747,13 +734,17 @@ subroutine apply_oda_tracer_increments(dt, Time_end, G, GV, tv, h, CS)
 
 end subroutine apply_oda_tracer_increments
 
+!> Set up the grid of thicknesses at tracer points throughout the global domain
   subroutine set_up_global_tgrid(T_grid, CS, G)
     type(grid_type), pointer :: T_grid !< global tracer grid
     type(ODA_CS), pointer, intent(in) :: CS !< A pointer to DA control structure.
     type(ocean_grid_type), pointer :: G !< domain and grid information for ocean model
 
     ! local variables
-    real, dimension(:,:), allocatable :: global2D, global2D_old
+    real, dimension(:,:), allocatable :: &
+      global2D, &  ! A layer thickness in the entire global domain [H ~> m or kg m-2]
+      global2D_old ! The thickness of the layer above the one in global2D in the entire
+                   ! global domain [H ~> m or kg m-2]
     integer :: i, j, k
 
     !    get global grid information from ocean_model
@@ -782,6 +773,8 @@ end subroutine apply_oda_tracer_increments
     do k = 1, CS%nk
       call global_field(G%Domain%mpp_domain, CS%h(:,:,k), global2D)
       do i=1,CS%ni ; do j=1,CS%nj
+        ! ###Does the next line need to be revised?  Perhaps it should be
+        ! if ( global2D(i,j) > 1.0*GV%H_to_m ) then
         if ( global2D(i,j) > 1 ) then
            T_grid%mask(i,j,k) = 1.0
         endif

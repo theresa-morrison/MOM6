@@ -57,7 +57,7 @@ subroutine sloshing_initialize_thickness ( h, depth_tot, G, GV, US, param_file, 
   type(verticalGrid_type), intent(in)  :: GV          !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)  :: US          !< A dimensional unit scaling type
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
-                           intent(out) :: h           !< The thickness that is being initialized [H ~> m or kg m-2].
+                           intent(out) :: h           !< The thickness that is being initialized [Z ~> m]
   real, dimension(SZI_(G),SZJ_(G)), &
                            intent(in)  :: depth_tot   !< The nominal total depth of the ocean [Z ~> m]
   type(param_file_type),   intent(in)  :: param_file  !< A structure to parse for model parameter values.
@@ -160,7 +160,7 @@ subroutine sloshing_initialize_thickness ( h, depth_tot, G, GV, US, param_file, 
 
     ! 4. Define layers
     do k = 1,nz
-      h(i,j,k) = GV%Z_to_H * (z_inter(k) - z_inter(k+1))
+      h(i,j,k) = z_inter(k) - z_inter(k+1)
     enddo
 
   enddo ; enddo
@@ -179,7 +179,7 @@ subroutine sloshing_initialize_temperature_salinity ( T, S, h, G, GV, US, param_
   type(verticalGrid_type),                   intent(in)  :: GV !< The ocean's vertical grid structure.
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(out) :: T  !< Potential temperature [C ~> degC].
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(out) :: S  !< Salinity [S ~> ppt].
-  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)  :: h  !< Layer thickness [H ~> m or kg m-2].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)  :: h  !< Layer thickness [Z ~> m].
   type(unit_scale_type),                     intent(in)  :: US !< A dimensional unit scaling type
   type(param_file_type),                     intent(in)  :: param_file !< A structure to parse
                                                                !! for model parameter values.
@@ -201,17 +201,17 @@ subroutine sloshing_initialize_temperature_salinity ( T, S, h, G, GV, US, param_
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
   call get_param(param_file, mdl, "S_REF", S_ref, 'Reference value for salinity', &
-                 default=35.0, units='1e-3', scale=US%ppt_to_S, do_not_log=just_read)
+                 default=35.0, units="ppt", scale=US%ppt_to_S, do_not_log=just_read)
   call get_param(param_file, mdl, "T_REF", T_ref, 'Reference value for temperature', &
                  units='degC', scale=US%degC_to_C, fail_if_missing=.not.just_read, do_not_log=just_read)
 
   ! The default is to assume an increase by 2 ppt for the salinity and a uniform temperature.
   call get_param(param_file, mdl, "S_RANGE", S_range, 'Initial salinity range.', &
-                 units='1e-3', default=2.0, scale=US%ppt_to_S, do_not_log=just_read)
+                 units="ppt", default=2.0, scale=US%ppt_to_S, do_not_log=just_read)
   call get_param(param_file, mdl, "T_RANGE", T_range, 'Initial temperature range', &
                  units='degC', default=0.0, scale=US%degC_to_C, do_not_log=just_read)
   call get_param(param_file, mdl, "INITIAL_SSS", S_surf, "Initial surface salinity", &
-                 units="1e-3", default=34.0, scale=US%ppt_to_S, do_not_log=just_read)
+                 units="ppt", default=34.0, scale=US%ppt_to_S, do_not_log=just_read)
   call get_param(param_file, mdl, "SLOSHING_T_PERT", T_pert, &
                  'A mid-column temperature perturbation in the sloshing test case', &
                  units='degC', default=1.0, scale=US%degC_to_C, do_not_log=just_read)

@@ -3,19 +3,21 @@ module MOM_tracer_initialization_from_Z
 
 ! This file is part of MOM6. See LICENSE.md for the license.
 
-use MOM_debugging, only : hchksum
-use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
-use MOM_cpu_clock, only : CLOCK_ROUTINE, CLOCK_LOOP
-use MOM_domains, only : pass_var
+use MOM_debugging,     only : hchksum
+use MOM_cpu_clock,     only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
+use MOM_cpu_clock,     only : CLOCK_ROUTINE, CLOCK_LOOP
+use MOM_domains,       only : pass_var
 use MOM_error_handler, only : MOM_mesg, MOM_error, FATAL, WARNING
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
-use MOM_file_parser, only : get_param, param_file_type, log_version
-use MOM_grid, only : ocean_grid_type
+use MOM_file_parser,   only : get_param, param_file_type, log_version
+use MOM_grid,          only : ocean_grid_type
 use MOM_horizontal_regridding, only : myStats, horiz_interp_and_extrap_tracer
-use MOM_remapping, only : remapping_CS, initialize_remapping
-use MOM_unit_scaling, only : unit_scale_type
-use MOM_verticalGrid, only : verticalGrid_type
-use MOM_ALE, only : ALE_remap_scalar
+use MOM_interface_heights, only : dz_to_thickness_simple
+use MOM_regridding,    only : set_dz_neglect
+use MOM_remapping,     only : remapping_CS, initialize_remapping
+use MOM_unit_scaling,  only : unit_scale_type
+use MOM_verticalGrid,  only : verticalGrid_type
+use MOM_ALE,           only : ALE_remap_scalar
 
 implicit none ; private
 
@@ -35,12 +37,13 @@ contains
 !> Initializes a tracer from a z-space data file, including any lateral regridding that is needed.
 subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_nam, &
                           src_var_unit_conversion, src_var_record, homogenize, &
-                          useALEremapping, remappingScheme, src_var_gridspec )
+                          useALEremapping, remappingScheme, src_var_gridspec, h_in_Z_units )
   type(ocean_grid_type),      intent(inout) :: G   !< Ocean grid structure.
   type(verticalGrid_type),    intent(in)    :: GV  !< Ocean vertical grid structure.
   type(unit_scale_type),      intent(in)    :: US  !< A dimensional unit scaling type
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
-                              intent(in)    :: h   !< Layer thickness [H ~> m or kg m-2].
+                              intent(in)    :: h   !< Layer thicknesses, in [H ~> m or kg m-2] or
+                                                   !! [Z ~> m] depending on the value of h_in_Z_units.
   real, dimension(:,:,:),     pointer       :: tr  !< Pointer to array to be initialized [CU ~> conc]
   type(param_file_type),      intent(in)    :: PF  !< parameter file
   character(len=*),           intent(in)    :: src_file !< source filename
@@ -53,12 +56,18 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
   character(len=*), optional, intent(in)    :: remappingScheme !< remapping scheme to use.
   character(len=*), optional, intent(in)    :: src_var_gridspec !< Source variable name in a gridspec file.
                                                                 !! This is not implemented yet.
+  logical,          optional, intent(in)    :: h_in_Z_units !< If present and true, the input grid
+                                                            !! thicknesses are in the units of height
+                                                            !! ([Z ~> m]) instead of the usual units of
+                                                            !! thicknesses ([H ~> m or kg m-2])
+
   ! Local variables
   real :: land_fill = 0.0  ! A value to use to replace missing values [CU ~> conc]
   real :: convert ! A conversion factor into the model's internal units [CU conc-1 ~> 1]
   integer            :: recnum
   character(len=64)  :: remapScheme
   logical            :: homog, useALE
+  logical            :: h_is_in_Z_units
 
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
@@ -75,26 +84,25 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
   real, allocatable, dimension(:), target :: z_in       ! Cell center depths for input data [Z ~> m]
 
   ! Local variables for ALE remapping
-  real, dimension(:,:,:), allocatable :: hSrc ! Source thicknesses [H ~> m or kg m-2].
+  real, dimension(:,:,:), allocatable :: dzSrc ! Source thicknesses in height units [Z ~> m]
+  real, dimension(:,:,:), allocatable :: hSrc  ! Source thicknesses [H ~> m or kg m-2]
   real, dimension(:), allocatable :: h1 ! A 1-d column of source thicknesses [Z ~> m].
   real :: zTopOfCell, zBottomOfCell, z_bathy  ! Heights [Z ~> m].
   type(remapping_CS) :: remapCS ! Remapping parameters and work arrays
+  type(verticalGrid_type) :: GV_loc ! A temporary vertical grid structure
 
   real :: missing_value ! A value indicating that there is no valid input data at this point [CU ~> conc]
+  real :: dz_neglect              ! A negligibly small vertical layer extent used in
+                                  ! remapping cell reconstructions [Z ~> m]
+  real :: dz_neglect_edge         ! A negligibly small vertical layer extent used in
+                                  ! remapping edge value calculations [Z ~> m]
   integer :: nPoints    ! The number of valid input data points in a column
   integer :: id_clock_routine, id_clock_ALE
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
-  logical :: default_2018_answers ! The default setting for the various 2018_ANSWERS flags.
-  logical :: remap_answers_2018   ! If true, use the order of arithmetic and expressions that
-                                  ! recover the remapping answers from 2018.  If false, use more
-                                  ! robust forms of the same remapping expressions.
-  integer :: default_remap_ans_date ! The default setting for remap_answer_date
   integer :: remap_answer_date    ! The vintage of the order of arithmetic and expressions to use
                                   ! for remapping.  Values below 20190101 recover the remapping
                                   ! answers from 2018, while higher values use more robust
                                   ! forms of the same remapping expressions.
-  logical :: hor_regrid_answers_2018
-  integer :: default_hor_reg_ans_date ! The default setting for hor_regrid_answer_date
   integer :: hor_regrid_answer_date  ! The vintage of the order of arithmetic and expressions to use
                                   ! for horizontal regridding.  Values below 20190101 recover the
                                   ! answers from 2018, while higher values use expressions that have
@@ -122,40 +130,22 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
   call get_param(PF, mdl, "DEFAULT_ANSWER_DATE", default_answer_date, &
                  "This sets the default value for the various _ANSWER_DATE parameters.", &
                  default=99991231)
-  call get_param(PF, mdl, "DEFAULT_2018_ANSWERS", default_2018_answers, &
-                 "This sets the default value for the various _2018_ANSWERS parameters.", &
-                 default=(default_answer_date<20190101))
   if (useALE) then
-    call get_param(PF, mdl, "REMAPPING_2018_ANSWERS", remap_answers_2018, &
-                 "If true, use the order of arithmetic and expressions that recover the "//&
-                 "answers from the end of 2018.  Otherwise, use updated and more robust "//&
-                 "forms of the same expressions.", default=default_2018_answers)
-    ! Revise inconsistent default answer dates for remapping.
-    default_remap_ans_date = default_answer_date
-    if (remap_answers_2018 .and. (default_remap_ans_date >= 20190101)) default_remap_ans_date = 20181231
-    if (.not.remap_answers_2018 .and. (default_remap_ans_date < 20190101)) default_remap_ans_date = 20190101
     call get_param(PF, mdl, "REMAPPING_ANSWER_DATE", remap_answer_date, &
                  "The vintage of the expressions and order of arithmetic to use for remapping.  "//&
                  "Values below 20190101 result in the use of older, less accurate expressions "//&
                  "that were in use at the end of 2018.  Higher values result in the use of more "//&
-                 "robust and accurate forms of mathematically equivalent expressions.  "//&
-                 "If both REMAPPING_2018_ANSWERS and REMAPPING_ANSWER_DATE are specified, the "//&
-                 "latter takes precedence.", default=default_remap_ans_date)
+                 "robust and accurate forms of mathematically equivalent expressions.", &
+                 default=default_answer_date, do_not_log=.not.GV%Boussinesq)
+    if (.not.GV%Boussinesq) remap_answer_date = max(remap_answer_date, 20230701)
   endif
-  call get_param(PF, mdl, "HOR_REGRID_2018_ANSWERS", hor_regrid_answers_2018, &
-                 "If true, use the order of arithmetic for horizonal regridding that recovers "//&
-                 "the answers from the end of 2018.  Otherwise, use rotationally symmetric "//&
-                 "forms of the same expressions.", default=default_2018_answers)
-  ! Revise inconsistent default answer dates for horizontal regridding.
-  default_hor_reg_ans_date = default_answer_date
-  if (hor_regrid_answers_2018 .and. (default_hor_reg_ans_date >= 20190101)) default_hor_reg_ans_date = 20181231
-  if (.not.hor_regrid_answers_2018 .and. (default_hor_reg_ans_date < 20190101)) default_hor_reg_ans_date = 20190101
   call get_param(PF, mdl, "HOR_REGRID_ANSWER_DATE", hor_regrid_answer_date, &
                  "The vintage of the order of arithmetic for horizontal regridding.  "//&
                  "Dates before 20190101 give the same answers as the code did in late 2018, "//&
                  "while later versions add parentheses for rotational symmetry.  "//&
-                 "If both HOR_REGRID_2018_ANSWERS and HOR_REGRID_ANSWER_DATE are specified, the "//&
-                 "latter takes precedence.", default=default_hor_reg_ans_date)
+                 "Dates after 20230101 use reproducing sums for global averages.", &
+                 default=default_answer_date, do_not_log=.not.GV%Boussinesq)
+  if (.not.GV%Boussinesq) hor_regrid_answer_date = max(hor_regrid_answer_date, 20230701)
 
   if (PRESENT(homogenize)) homog=homogenize
   if (PRESENT(useALEremapping)) useALE=useALEremapping
@@ -164,6 +154,8 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
   if (PRESENT(src_var_record)) recnum = src_var_record
   convert = 1.0
   if (PRESENT(src_var_unit_conversion)) convert = src_var_unit_conversion
+
+  h_is_in_Z_units = .false. ; if (present(h_in_Z_units)) h_is_in_Z_units = h_in_Z_units
 
   call horiz_interp_and_extrap_tracer(src_file, src_var_nam, recnum, &
             G, tr_z, mask_z, z_in, z_edges_in, missing_value, &
@@ -179,6 +171,7 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
     call cpu_clock_begin(id_clock_ALE)
     ! First we reserve a work space for reconstructions of the source data
     allocate( h1(kd) )
+    allocate( dzSrc(isd:ied,jsd:jed,kd) )
     allocate( hSrc(isd:ied,jsd:jed,kd) )
     ! Set parameters for reconstructions
     call initialize_remapping( remapCS, remapScheme, boundary_extrapolation=.false., answer_date=remap_answer_date )
@@ -203,16 +196,30 @@ subroutine MOM_initialize_tracer_from_Z(h, tr, G, GV, US, PF, src_file, src_var_
       else
         tr(i,j,:) = 0.
       endif ! mask2dT
-      hSrc(i,j,:) = GV%Z_to_H * h1(:)
+      dzSrc(i,j,:) = h1(:)
     enddo ; enddo
 
-    call ALE_remap_scalar(remapCS, G, GV, kd, hSrc, tr_z, h, tr, all_cells=.false., answer_date=remap_answer_date )
+    if (h_is_in_Z_units) then
+      ! Because h is in units of [Z ~> m], dzSrc is already in the right units, but we need to
+      ! specify negligible thickness values with the right units.
+      dz_neglect = set_dz_neglect(GV, US, remap_answer_date, dz_neglect_edge)
+      call ALE_remap_scalar(remapCS, G, GV, kd, dzSrc, tr_z, h, tr, all_cells=.false., answer_date=remap_answer_date, &
+                            H_neglect=dz_neglect, H_neglect_edge=dz_neglect_edge)
+    else
+      ! Equation of state data is not available, so a simpler rescaling will have to suffice,
+      ! but it might be problematic in non-Boussinesq mode.
+      GV_loc = GV ; GV_loc%ke = kd
+      call dz_to_thickness_simple(dzSrc, hSrc, G, GV_loc, US)
+
+      call ALE_remap_scalar(remapCS, G, GV, kd, hSrc, tr_z, h, tr, all_cells=.false., answer_date=remap_answer_date )
+    endif
 
     deallocate( hSrc )
+    deallocate( dzSrc )
     deallocate( h1 )
 
     do k=1,nz
-      call myStats(tr(:,:,k), missing_value, is, ie, js, je, k, 'Tracer from ALE()')
+      call myStats(tr(:,:,k), missing_value, G, k, 'Tracer from ALE()')
     enddo
     call cpu_clock_end(id_clock_ALE)
   endif ! useALEremapping
