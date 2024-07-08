@@ -175,6 +175,8 @@ type, public :: diabatic_CS ; private
   real    :: dz_subML_N2             !< The distance over which to calculate a diagnostic of the
                                      !! average stratification at the base of the mixed layer [Z ~> m].
   real    :: MLD_En_vals(3)          !< Energy values for energy mixed layer diagnostics [R Z3 T-2 ~> J m-2]
+  real    :: ref_p_mld = 0.0         !< A referece pressure for density used in a difference mixed based
+                                     !! MLD calculation [R L2 T-2 ~> Pa].
 
   !>@{ Diagnostic IDs
   integer :: id_ea       = -1, id_eb       = -1 ! used by layer diabatic
@@ -183,6 +185,7 @@ type, public :: diabatic_CS ; private
   integer :: id_Tdif     = -1, id_Sdif     = -1, id_Tadv   = -1, id_Sadv     = -1
   ! These are handles to diagnostics related to the mixed layer properties.
   integer :: id_MLD_003 = -1, id_MLD_0125 = -1, id_MLD_user = -1, id_mlotstsq = -1
+  integer :: id_MLD_003_zr = -1
   integer :: id_MLD_EN1 = -1, id_MLD_EN2  = -1, id_MLD_EN3  = -1, id_subMLN2  = -1
 
   ! These are handles to diagnostics that are only available in non-ALE layered mode.
@@ -479,13 +482,16 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
   call enable_averages(dt, Time_end, CS%diag)
   if (CS%id_MLD_003 > 0 .or. CS%id_subMLN2 > 0 .or. CS%id_mlotstsq > 0) then
     call diagnoseMLDbyDensityDifference(CS%id_MLD_003, h, tv, 0.03*US%kg_m3_to_R, G, GV, US, CS%diag, &
-                                        id_N2subML=CS%id_subMLN2, id_MLDsq=CS%id_mlotstsq, dz_subML=CS%dz_subML_N2)
+                                        id_N2subML=CS%id_subMLN2, id_MLDsq=CS%id_mlotstsq, dz_subML=CS%dz_subML_N2, &
+                                        ref_P_MLD=CS%ref_p_mld, id_ref_z=CS%id_MLD_003_zr)
   endif
   if (CS%id_MLD_0125 > 0) then
-    call diagnoseMLDbyDensityDifference(CS%id_MLD_0125, h, tv, 0.125*US%kg_m3_to_R, G, GV, US, CS%diag)
+    call diagnoseMLDbyDensityDifference(CS%id_MLD_0125, h, tv, 0.125*US%kg_m3_to_R, G, GV, US, CS%diag, &
+                                        ref_P_MLD=CS%ref_p_mld)
   endif
   if (CS%id_MLD_user > 0) then
-    call diagnoseMLDbyDensityDifference(CS%id_MLD_user, h, tv, CS%MLDdensityDifference, G, GV, US, CS%diag)
+    call diagnoseMLDbyDensityDifference(CS%id_MLD_user, h, tv, CS%MLDdensityDifference, G, GV, US, CS%diag, &
+                                        ref_P_MLD=CS%ref_p_mld)
   endif
   if ((CS%id_MLD_EN1 > 0) .or. (CS%id_MLD_EN2 > 0) .or. (CS%id_MLD_EN3 > 0)) then
     call diagnoseMLDbyEnergy((/CS%id_MLD_EN1, CS%id_MLD_EN2, CS%id_MLD_EN3/),&
@@ -3217,6 +3223,8 @@ subroutine diabatic_driver_init(Time, G, GV, US, param_file, useALEalgorithm, di
         'Mixed layer depth (delta rho = 0.03)', units='m', conversion=US%Z_to_m, &
         cmor_field_name='mlotst', cmor_long_name='Ocean Mixed Layer Thickness Defined by Sigma T', &
         cmor_standard_name='ocean_mixed_layer_thickness_defined_by_sigma_t')
+    CS%id_MLD_003_zr = register_diag_field('ocean_model', 'MLD_003_refZ', diag%axesT1, Time, &
+        'Depth of reference density for MLD (delta rho = 0.03)', units='m', conversion=US%Z_to_m)
     CS%id_mlotstsq = register_diag_field('ocean_model', 'mlotstsq', diag%axesT1, Time, &
         long_name='Square of Ocean Mixed Layer Thickness Defined by Sigma T', &
         standard_name='square_of_ocean_mixed_layer_thickness_defined_by_sigma_t', &
@@ -3248,6 +3256,13 @@ subroutine diabatic_driver_init(Time, G, GV, US, param_file, useALEalgorithm, di
         'Squared buoyancy frequency below mixed layer', units='s-2', conversion=US%s_to_T**2)
     CS%id_MLD_user = register_diag_field('ocean_model', 'MLD_user', diag%axesT1, Time, &
         'Mixed layer depth (used defined)', units='m', conversion=US%Z_to_m)
+    if (CS%id_MLD_003 > 0 .or. CS%id_MLD_0125 > 0 .or. CS%id_MLD_0125 > 0) then
+      call get_param(param_file, mdl, "PREF_FOR_MLD", CS%ref_p_mld, &
+           "Refernced pressure used to calculate the potential density used to find the mixed layer depth "//&
+           "based on a density difference.", &
+           units='Pa', default=0.0, scale=US%Pa_to_RL2_T2)
+                                     !! MLD calculation [R L2 T-2 ~> Pa].
+    endif
   endif
   call get_param(param_file, mdl, "DIAG_MLD_DENSITY_DIFF", CS%MLDdensityDifference, &
                  "The density difference used to determine a diagnostic mixed "//&
