@@ -752,7 +752,7 @@ subroutine diagnoseMLDbyDensityDifference(id_MLD, h, tv, densityDiff, G, GV, US,
   if (present(ref_h_mld)) hRef_MLD(:) = ref_h_mld
   if (present(ref_h_mld)) then
     H_to_RL2_T2 = GV%H_to_RZ * GV%g_Earth
-    pRef_MLD(:) = (0.5*H_to_RL2_T2)*ref_h_mld
+    pRef_MLD(:) = H_to_RL2_T2*ref_h_mld
   endif
   z_ref_diag(:,:) = 0.
   !thresh = 0.0011
