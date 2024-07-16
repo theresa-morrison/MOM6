@@ -6,7 +6,7 @@ module MOM
 ! Infrastructure modules
 use MOM_array_transform,      only : rotate_array, rotate_vector
 use MOM_debugging,            only : MOM_debugging_init, hchksum, uvchksum
-use MOM_debugging,            only : check_redundant
+use MOM_debugging,            only : check_redundant, query_debugging_checks
 use MOM_checksum_packages,    only : MOM_thermo_chksum, MOM_state_chksum
 use MOM_checksum_packages,    only : MOM_accel_chksum, MOM_surface_chksum
 use MOM_coms,                 only : num_PEs
@@ -555,6 +555,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
                                        ! multiple dynamic timesteps.
   logical :: do_dyn     ! If true, dynamics are updated with this call.
   logical :: do_thermo  ! If true, thermodynamics and remapping may be applied with this call.
+  logical :: debug_redundant ! If true, check redundant values on PE boundaries when debugging.
   logical :: nonblocking_p_surf_update ! A flag to indicate whether surface properties
                         ! can use nonblocking halo updates
   logical :: cycle_start ! If true, do calculations that are only done at the start of
@@ -610,6 +611,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
   call cpu_clock_begin(id_clock_other)
 
   if (CS%debug) then
+    call query_debugging_checks(do_redundant=debug_redundant)
     call MOM_state_chksum("Beginning of step_MOM ", u, v, h, CS%uh, CS%vh, G, GV, US)
   endif
 
@@ -788,9 +790,11 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
   if (CS%debug) then
     if (cycle_start) &
       call MOM_state_chksum("Before steps ", u, v, h, CS%uh, CS%vh, G, GV, US)
-    if (cycle_start) call check_redundant("Before steps ", u, v, G, unscale=US%L_T_to_m_s)
+    if (cycle_start .and. debug_redundant) &
+      call check_redundant("Before steps ", u, v, G, unscale=US%L_T_to_m_s)
     if (do_dyn) call MOM_mech_forcing_chksum("Before steps", forces, G, US, haloshift=0)
-    if (do_dyn) call check_redundant("Before steps ", forces%taux, forces%tauy, G, &
+    if (do_dyn .and. debug_redundant) &
+      call check_redundant("Before steps ", forces%taux, forces%tauy, G, &
                                      unscale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
   endif
   call cpu_clock_end(id_clock_other)
@@ -1297,7 +1301,7 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
   if ((CS%thickness_diffuse .or. CS%interface_filter) .and. &
       .not.CS%thickness_diffuse_first) then
 
-    if (CS%debug) call hchksum(h,"Pre-thickness_diffuse h", G%HI, haloshift=0, scale=GV%H_to_MKS)
+    if (CS%debug) call hchksum(h,"Pre-thickness_diffuse h", G%HI, haloshift=0, unscale=GV%H_to_MKS)
 
     if (CS%thickness_diffuse) then
       call cpu_clock_begin(id_clock_thick_diff)
@@ -1306,7 +1310,7 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
       call thickness_diffuse(h, CS%uhtr, CS%vhtr, CS%tv, dt, G, GV, US, &
                              CS%MEKE, CS%VarMix, CS%CDp, CS%thickness_diffuse_CSp)
 
-      if (CS%debug) call hchksum(h,"Post-thickness_diffuse h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      if (CS%debug) call hchksum(h,"Post-thickness_diffuse h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
       call cpu_clock_end(id_clock_thick_diff)
       call pass_var(h, G%Domain, clock=id_clock_pass, halo=max(2,CS%cont_stencil))
       if (showCallTree) call callTree_waypoint("finished thickness_diffuse (step_MOM)")
@@ -1327,9 +1331,9 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
   ! apply the submesoscale mixed layer restratification parameterization
   if (CS%mixedlayer_restrat) then
     if (CS%debug) then
-      call hchksum(h,"Pre-mixedlayer_restrat h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      call hchksum(h,"Pre-mixedlayer_restrat h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
       call uvchksum("Pre-mixedlayer_restrat uhtr", &
-                    CS%uhtr, CS%vhtr, G%HI, haloshift=0, scale=GV%H_to_MKS*US%L_to_m**2)
+                    CS%uhtr, CS%vhtr, G%HI, haloshift=0, unscale=GV%H_to_MKS*US%L_to_m**2)
     endif
     call cpu_clock_begin(id_clock_ml_restrat)
     call mixedlayer_restrat(h, CS%uhtr, CS%vhtr, CS%tv, forces, dt, CS%visc%MLD, CS%visc%h_ML, &
@@ -1337,9 +1341,9 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
     call cpu_clock_end(id_clock_ml_restrat)
     call pass_var(h, G%Domain, clock=id_clock_pass, halo=max(2,CS%cont_stencil))
     if (CS%debug) then
-      call hchksum(h,"Post-mixedlayer_restrat h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      call hchksum(h,"Post-mixedlayer_restrat h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
       call uvchksum("Post-mixedlayer_restrat [uv]htr", &
-                    CS%uhtr, CS%vhtr, G%HI, haloshift=0, scale=GV%H_to_MKS*US%L_to_m**2)
+                    CS%uhtr, CS%vhtr, G%HI, haloshift=0, unscale=GV%H_to_MKS*US%L_to_m**2)
     endif
   endif
 
@@ -1410,15 +1414,15 @@ subroutine step_MOM_tracer_dyn(CS, G, GV, US, h, Time_local)
 
   if (CS%debug) then
     call cpu_clock_begin(id_clock_other)
-    call hchksum(h,"Pre-advection h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+    call hchksum(h,"Pre-advection h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
     call uvchksum("Pre-advection uhtr", CS%uhtr, CS%vhtr, G%HI, &
-                  haloshift=0, scale=GV%H_to_MKS*US%L_to_m**2)
-    if (associated(CS%tv%T)) call hchksum(CS%tv%T, "Pre-advection T", G%HI, haloshift=1, scale=US%C_to_degC)
-    if (associated(CS%tv%S)) call hchksum(CS%tv%S, "Pre-advection S", G%HI, haloshift=1, scale=US%S_to_ppt)
+                  haloshift=0, unscale=GV%H_to_MKS*US%L_to_m**2)
+    if (associated(CS%tv%T)) call hchksum(CS%tv%T, "Pre-advection T", G%HI, haloshift=1, unscale=US%C_to_degC)
+    if (associated(CS%tv%S)) call hchksum(CS%tv%S, "Pre-advection S", G%HI, haloshift=1, unscale=US%S_to_ppt)
     if (associated(CS%tv%frazil)) call hchksum(CS%tv%frazil, "Pre-advection frazil", G%HI, haloshift=0, &
-                                               scale=US%Q_to_J_kg*US%RZ_to_kg_m2)
+                                               unscale=US%Q_to_J_kg*US%RZ_to_kg_m2)
     if (associated(CS%tv%salt_deficit)) call hchksum(CS%tv%salt_deficit, &
-                   "Pre-advection salt deficit", G%HI, haloshift=0, scale=US%S_to_ppt*US%RZ_to_kg_m2)
+                   "Pre-advection salt deficit", G%HI, haloshift=0, unscale=US%S_to_ppt*US%RZ_to_kg_m2)
   ! call MOM_thermo_chksum("Pre-advection ", CS%tv, G, US)
     call cpu_clock_end(id_clock_other)
   endif
@@ -1537,6 +1541,7 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
                                                ! velocity points [H ~> m or kg m-2]
   logical :: PCM_cell(SZI_(G),SZJ_(G),SZK_(GV)) ! If true, PCM remapping should be used in a cell.
   logical :: use_ice_shelf ! Needed for selecting the right ALE interface.
+  logical :: debug_redundant ! If true, check redundant values on PE boundaries when debugging.
   logical :: showCallTree
   type(group_pass_type) :: pass_T_S, pass_T_S_h, pass_uv_T_S_h
   integer :: dynamics_stencil  ! The computational stencil for the calculations
@@ -1547,6 +1552,7 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
   showCallTree = callTree_showQuery()
   if (showCallTree) call callTree_enter("step_MOM_thermo(), MOM.F90")
+  if (CS%debug) call query_debugging_checks(do_redundant=debug_redundant)
 
   use_ice_shelf = .false.
   if (associated(CS%frac_shelf_h)) use_ice_shelf = .true.
@@ -1593,13 +1599,14 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
   call cpu_clock_begin(id_clock_thermo)
   if (.not.CS%adiabatic) then
     if (CS%debug) then
-      call uvchksum("Pre-diabatic [uv]", u, v, G%HI, haloshift=2, scale=US%L_T_to_m_s)
-      call hchksum(h,"Pre-diabatic h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      call uvchksum("Pre-diabatic [uv]", u, v, G%HI, haloshift=2, unscale=US%L_T_to_m_s)
+      call hchksum(h,"Pre-diabatic h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
       call uvchksum("Pre-diabatic [uv]h", CS%uhtr, CS%vhtr, G%HI, &
-                    haloshift=0, scale=GV%H_to_MKS*US%L_to_m**2)
+                    haloshift=0, unscale=GV%H_to_MKS*US%L_to_m**2)
     ! call MOM_state_chksum("Pre-diabatic ", u, v, h, CS%uhtr, CS%vhtr, G, GV, vel_scale=1.0)
       call MOM_thermo_chksum("Pre-diabatic ", tv, G, US, haloshift=0)
-      call check_redundant("Pre-diabatic ", u, v, G, unscale=US%L_T_to_m_s)
+      if (debug_redundant) &
+        call check_redundant("Pre-diabatic ", u, v, G, unscale=US%L_T_to_m_s)
       call MOM_forcing_chksum("Pre-diabatic", fluxes, G, US, haloshift=0)
     endif
 
@@ -1634,9 +1641,10 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
       if (CS%debug) then
         call MOM_state_chksum("Pre-ALE ", u, v, h, CS%uh, CS%vh, G, GV, US, omit_corners=.true.)
-        call hchksum(tv%T,"Pre-ALE T", G%HI, haloshift=1, omit_corners=.true., scale=US%C_to_degC)
-        call hchksum(tv%S,"Pre-ALE S", G%HI, haloshift=1, omit_corners=.true., scale=US%S_to_ppt)
-        call check_redundant("Pre-ALE ", u, v, G, unscale=US%L_T_to_m_s)
+        call hchksum(tv%T,"Pre-ALE T", G%HI, haloshift=1, omit_corners=.true., unscale=US%C_to_degC)
+        call hchksum(tv%S,"Pre-ALE S", G%HI, haloshift=1, omit_corners=.true., unscale=US%S_to_ppt)
+        if (debug_redundant) &
+          call check_redundant("Pre-ALE ", u, v, G, unscale=US%L_T_to_m_s)
       endif
       call cpu_clock_begin(id_clock_ALE)
 
@@ -1720,9 +1728,10 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
     if (CS%debug .and. CS%use_ALE_algorithm) then
       call MOM_state_chksum("Post-ALE ", u, v, h, CS%uh, CS%vh, G, GV, US)
-      call hchksum(tv%T, "Post-ALE T", G%HI, haloshift=1, scale=US%C_to_degC)
-      call hchksum(tv%S, "Post-ALE S", G%HI, haloshift=1, scale=US%S_to_ppt)
-      call check_redundant("Post-ALE ", u, v, G, unscale=US%L_T_to_m_s)
+      call hchksum(tv%T, "Post-ALE T", G%HI, haloshift=1, unscale=US%C_to_degC)
+      call hchksum(tv%S, "Post-ALE S", G%HI, haloshift=1, unscale=US%S_to_ppt)
+      if (debug_redundant) &
+        call check_redundant("Post-ALE ", u, v, G, unscale=US%L_T_to_m_s)
     endif
 
     ! Whenever thickness changes let the diag manager know, target grids
@@ -1734,20 +1743,21 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
     call postALE_tracer_diagnostics(CS%tracer_Reg, G, GV, CS%diag, dtdia)
 
     if (CS%debug) then
-      call uvchksum("Post-diabatic u", u, v, G%HI, haloshift=2, scale=US%L_T_to_m_s)
-      call hchksum(h, "Post-diabatic h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      call uvchksum("Post-diabatic u", u, v, G%HI, haloshift=2, unscale=US%L_T_to_m_s)
+      call hchksum(h, "Post-diabatic h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
       call uvchksum("Post-diabatic [uv]h", CS%uhtr, CS%vhtr, G%HI, &
-                    haloshift=0, scale=GV%H_to_MKS*US%L_to_m**2)
+                    haloshift=0, unscale=GV%H_to_MKS*US%L_to_m**2)
     ! call MOM_state_chksum("Post-diabatic ", u, v, &
     !                       h, CS%uhtr, CS%vhtr, G, GV, haloshift=1)
-      if (associated(tv%T)) call hchksum(tv%T, "Post-diabatic T", G%HI, haloshift=1, scale=US%C_to_degC)
-      if (associated(tv%S)) call hchksum(tv%S, "Post-diabatic S", G%HI, haloshift=1, scale=US%S_to_ppt)
+      if (associated(tv%T)) call hchksum(tv%T, "Post-diabatic T", G%HI, haloshift=1, unscale=US%C_to_degC)
+      if (associated(tv%S)) call hchksum(tv%S, "Post-diabatic S", G%HI, haloshift=1, unscale=US%S_to_ppt)
       if (associated(tv%frazil)) call hchksum(tv%frazil, "Post-diabatic frazil", G%HI, haloshift=0, &
-                                              scale=US%Q_to_J_kg*US%RZ_to_kg_m2)
+                                              unscale=US%Q_to_J_kg*US%RZ_to_kg_m2)
       if (associated(tv%salt_deficit)) call hchksum(tv%salt_deficit, &
-                               "Post-diabatic salt deficit", G%HI, haloshift=0, scale=US%RZ_to_kg_m2)
+                               "Post-diabatic salt deficit", G%HI, haloshift=0, unscale=US%RZ_to_kg_m2)
     ! call MOM_thermo_chksum("Post-diabatic ", tv, G, US)
-      call check_redundant("Post-diabatic ", u, v, G, unscale=US%L_T_to_m_s)
+      if (debug_redundant) &
+        call check_redundant("Post-diabatic ", u, v, G, unscale=US%L_T_to_m_s)
     endif
     call disable_averaging(CS%diag)
 
@@ -1765,8 +1775,8 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
       call create_group_pass(pass_T_S, tv%S, G%Domain, To_All+Omit_Corners, halo=dynamics_stencil)
       call do_group_pass(pass_T_S, G%Domain, clock=id_clock_pass)
       if (CS%debug) then
-        if (associated(tv%T)) call hchksum(tv%T, "Post-diabatic T", G%HI, haloshift=1, scale=US%C_to_degC)
-        if (associated(tv%S)) call hchksum(tv%S, "Post-diabatic S", G%HI, haloshift=1, scale=US%S_to_ppt)
+        if (associated(tv%T)) call hchksum(tv%T, "Post-diabatic T", G%HI, haloshift=1, unscale=US%C_to_degC)
+        if (associated(tv%S)) call hchksum(tv%S, "Post-diabatic S", G%HI, haloshift=1, unscale=US%S_to_ppt)
       endif
 
       ! Update derived thermodynamic quantities.
@@ -3031,7 +3041,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
 
   if (use_ice_shelf .and. CS%debug) then
     call hchksum(CS%frac_shelf_h, "MOM:frac_shelf_h", G%HI, haloshift=0)
-    call hchksum(CS%mass_shelf, "MOM:mass_shelf", G%HI, haloshift=0,scale=US%RZ_to_kg_m2)
+    call hchksum(CS%mass_shelf, "MOM:mass_shelf", G%HI, haloshift=0, unscale=US%RZ_to_kg_m2)
   endif
 
   call cpu_clock_end(id_clock_MOM_init)
@@ -3070,8 +3080,8 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     ! \todo This block exists for legacy reasons and we should phase it out of
     ! all examples. !###
     if (CS%debug) then
-      call uvchksum("Pre ALE adjust init cond [uv]", CS%u, CS%v, G%HI, haloshift=1)
-      call hchksum(CS%h,"Pre ALE adjust init cond h", G%HI, haloshift=1, scale=GV%H_to_MKS)
+      call uvchksum("Pre ALE adjust init cond [uv]", CS%u, CS%v, G%HI, haloshift=1, unscale=US%L_T_to_m_s)
+      call hchksum(CS%h,"Pre ALE adjust init cond h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
     endif
     call callTree_waypoint("Calling adjustGridForIntegrity() to remap initial conditions (initialize_MOM)")
     call adjustGridForIntegrity(CS%ALE_CSp, G, GV, CS%h )
@@ -3128,11 +3138,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     call cpu_clock_end(id_clock_pass_init)
 
     if (CS%debug) then
-      call uvchksum("Post ALE adjust init cond [uv]", CS%u, CS%v, G%HI, haloshift=1)
-      call hchksum(CS%h, "Post ALE adjust init cond h", G%HI, haloshift=2, scale=GV%H_to_MKS)
+      call uvchksum("Post ALE adjust init cond [uv]", CS%u, CS%v, G%HI, haloshift=1, unscale=US%L_T_to_m_s)
+      call hchksum(CS%h, "Post ALE adjust init cond h", G%HI, haloshift=2, unscale=GV%H_to_MKS)
       if (use_temperature) then
-        call hchksum(CS%tv%T, "Post ALE adjust init cond T", G%HI, haloshift=2, scale=US%C_to_degC)
-        call hchksum(CS%tv%S, "Post ALE adjust init cond S", G%HI, haloshift=2, scale=US%S_to_ppt)
+        call hchksum(CS%tv%T, "Post ALE adjust init cond T", G%HI, haloshift=2, unscale=US%C_to_degC)
+        call hchksum(CS%tv%S, "Post ALE adjust init cond S", G%HI, haloshift=2, unscale=US%S_to_ppt)
       endif
     endif
   endif
@@ -4130,7 +4140,7 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, on_PE_only)
     heat = CS%US%Q_to_J_kg*CS%tv%C_p * &
            global_mass_integral(CS%h, CS%G, CS%GV, CS%tv%T, on_PE_only=on_PE_only, tmp_scale=CS%US%C_to_degC)
   if (present(salt)) &
-    salt = 1.0e-3 * global_mass_integral(CS%h, CS%G, CS%GV, CS%tv%S, on_PE_only=on_PE_only, scale=CS%US%S_to_ppt)
+    salt = 1.0e-3 * global_mass_integral(CS%h, CS%G, CS%GV, CS%tv%S, on_PE_only=on_PE_only, unscale=CS%US%S_to_ppt)
 
 end subroutine get_ocean_stocks
 
