@@ -610,6 +610,9 @@ subroutine call_tracer_column_fns(h_old, h_new, ea, eb, fluxes, mld, dt, G, GV, 
       if (US%QRZ_T_to_W_m2 /= 1.0) call MOM_error(FATAL, "MOM_generic_tracer_column_physics "//&
             "has not been written to permit dimensionsal rescaling.  Set all 4 of the "//&
             "[QRZT]_RESCALE_POWER parameters to 0.")
+
+      !call MOM_generic_get_photoacclimation_MLD(h_old, tv, CS%MOM_generic_tracer_CSp, G, GV, US)
+
       call MOM_generic_tracer_column_physics(h_old, h_new, ea, eb, fluxes, mld, dt, &
                                      G, GV, US, CS%MOM_generic_tracer_CSp, tv, optics)
     endif
@@ -876,6 +879,33 @@ subroutine call_tracer_surface_state(sfc_state, h, G, GV, US, CS)
     call MOM_generic_tracer_surface_state(sfc_state, h, G, GV, CS%MOM_generic_tracer_CSp)
 
 end subroutine call_tracer_surface_state
+
+!subroutine MOM_generic_get_photoacclimation_MLD(h_old, tv, CS, G, GV, US)
+!  type(MOM_generic_tracer_CS), pointer, intent(inout) :: CS
+!  type(ocean_grid_type),   intent(in) :: G     !< The ocean's grid structure
+!  type(verticalGrid_type), intent(in) :: GV    !< The ocean's vertical grid structure
+!  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
+!                           intent(in) :: h_old !< Layer thickness before entrainment [H ~> m or kg m-2].
+!  type(unit_scale_type),   intent(in) :: US    !< A dimensional unit scaling type
+!  type(thermo_var_ptrs),   intent(in) :: tv    !< A structure pointing to various thermodynamic variables
+!
+!  real, dimension(SZI_(G),SZJ_(G)) :: mld_pha
+!
+!    if (CS%mld_pha_fixed) then
+!      mld_pha(:,:) = CS%mld_pha_val
+!    else
+!      if (CS%mld_pha_use_delta_rho) then
+!       ! -1 is to not save the MLD, and so the CS%diag is never used
+!         call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, MLD_out=mld_pha)
+!                                           ! add href here
+!      elseif (CS%mld_pha_use_delta_eng) then
+!        call diagnoseMLDbyEnergy(-1, h_old, tv, G, GV, US, CS%mld_pha_deng, CS%diag, MLD_out=mld_pha)
+!      endif
+!      ! Do average over time?
+!    endif
+!    CS%mld_pha(:,:) = mld_pha
+! 
+!end subroutine MOM_generic_get_photoacclimation_MLD
 
 subroutine tracer_flow_control_end(CS)
   type(tracer_flow_control_CS), pointer :: CS    !< The control structure returned by a

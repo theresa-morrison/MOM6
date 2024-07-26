@@ -14,7 +14,7 @@ use MOM_diabatic_aux,        only : diabatic_aux_init, diabatic_aux_end, diabati
 use MOM_diabatic_aux,        only : make_frazil, adjust_salt, differential_diffuse_T_S, triDiagTS
 use MOM_diabatic_aux,        only : triDiagTS_Eulerian, find_uv_at_h
 use MOM_diabatic_aux,        only : applyBoundaryFluxesInOut, set_pen_shortwave
-use MOM_diabatic_aux,        only : diagnoseMLDbyDensityDifference, diagnoseMLDbyEnergy
+use MOM_diagnose_mld,        only : diagnoseMLDbyDensityDifference, diagnoseMLDbyEnergy
 use MOM_diag_mediator,       only : post_data, register_diag_field, safe_alloc_ptr
 use MOM_diag_mediator,       only : post_product_sum_u, post_product_sum_v
 use MOM_diag_mediator,       only : diag_ctrl, time_type, diag_update_remap_grids
@@ -1076,6 +1076,7 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   endif  ! (CS%mix_boundary_tracers)
 
   ! For passive tracers, the changes in thickness due to boundary fluxes has yet to be applied
+  ! call MOM_generic_tracer_photoacclimation_depth(h_orig, tv, CS%tracer_flow_CSp, G, GV, US)
   call call_tracer_column_fns(h_orig, h, ent_s(:,:,1:nz), ent_s(:,:,2:nz+1), fluxes, BLD, dt, &
                               G, GV, US, tv, CS%optics, CS%tracer_flow_CSp, CS%debug, &
                               KPP_CSp=CS%KPP_CSp, &
