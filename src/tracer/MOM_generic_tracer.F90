@@ -619,8 +619,7 @@ contains
     else
       if (CS%mld_pha_use_delta_rho) then
        ! -1 is to not save the MLD, and so the CS%diag is never used
-         call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, MLD_out=mld_pha)
-                                           ! add href here
+        call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, ref_h_mld=CS%mld_pha_href, MLD_out=mld_pha)
       elseif (CS%mld_pha_use_delta_eng) then
         call diagnoseMLDbyEnergy((/-1, -1, -1/), h_old, tv, G, GV, US, (/CS%mld_pha_deng, CS%mld_pha_deng, CS%mld_pha_deng/), CS%diag, MLD_out=mld_pha)
       endif
@@ -637,7 +636,8 @@ contains
       call generic_tracer_source(tv%T, tv%S, rho_dzt, dzt, dz_ml, G%isd, G%jsd, 1, dt, &
                G%areaT, get_diag_time_end(CS%diag), &
                optics%nbands, optics%max_wavelength_band, optics%sw_pen_band, optics%opacity_band, &
-               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state)
+               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state, &
+               photo_acc_dpth=mld_pha)
     else
       ! tv%internal_heat is a null pointer unless DO_GEOTHERMAL = True,
       ! so we have to check and only do the scaling if it is associated.
