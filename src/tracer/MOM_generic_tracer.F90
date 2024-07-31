@@ -31,6 +31,7 @@ module MOM_generic_tracer
 
   use MOM_ALE_sponge, only : set_up_ALE_sponge_field, ALE_sponge_CS
   use MOM_coms, only : EFP_type, max_across_PEs, min_across_PEs, PE_here
+  use MOM_diagnose_mld,  only : diagnoseMLDbyDensityDifference, diagnoseMLDbyEnergy
   use MOM_diag_mediator, only : post_data, register_diag_field, safe_alloc_ptr
   use MOM_diag_mediator, only : diag_ctrl, get_diag_time_end
   use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, is_root_pe
@@ -82,6 +83,16 @@ module MOM_generic_tracer
                                    !! concentration units [conc]
     logical :: tracers_may_reinit  !< If true, tracers may go through the
                                    !! initialization code if they are not found in the restart files.
+
+    !real, allocatable, dimension(:,:) :: mld_pha
+    logical :: mld_pha_fixed = .True.           !< If true, use a fixed value for photoacclimation MLD
+    real    :: mld_pha_val = 0.0                !< The value of fixed photoacclimation MLD
+    logical :: mld_pha_use_delta_rho = .False.  !< If true, use a density diference to find the MLD
+    real    :: mld_pha_href = 0.0               !< The reference depth for density difference based MLD
+    real    :: mld_pha_drho = 0.03              !< The density thershold for a density difference based MLD 
+    logical :: mld_pha_use_delta_eng = .False.  !< If true, use an energy diference to find the MLD
+    real    :: mld_pha_deng = 25.0              !< The energy threshold for an energy d ifference based MLD
+    real    :: mld_pha_timescale  = 259200.0    !< The timescale for the photoacclimation MLD
 
     type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                                                !! regulate the timing of diagnostic output.
@@ -423,6 +434,36 @@ contains
     enddo
     !! end section to re-initialize generic tracers
 
+    call get_param(param_file, "MOM", "PHA_MLD_FIXED", CS%mld_pha_fixed, &
+                 "If true, use a fixed value for the photoacclimation mixed layer depth within the "//&
+                 "generic tracer update. This MLD is only used for photoacclimation.", default=.true.)
+    if (CS%mld_pha_fixed) then
+      call get_param(param_file, "MOM", "PHA_MLD_VAL", CS%mld_pha_val, &
+                   "The depth of photoacclimation if fixed depth is used [m].", &
+                    units='m', default=0.0, scale=US%m_to_Z)
+    else
+      call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_RHO", CS%mld_pha_use_delta_rho, &
+                   "If true, use a density difference to find the photoacclimation mixed layer depth "//&
+                   "within the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
+      call get_param(param_file, "MOM", "PHA_MLD_HREF", CS%mld_pha_href, &
+                   "The reference depth for a density difference based photoacclimation MLD [m].",  &
+                    units='m', default=0.0, scale=US%m_to_Z, do_not_log=.not.CS%mld_pha_use_delta_rho)
+      call get_param(param_file, "MOM", "PHA_MLD_DRHO", CS%mld_pha_drho, &
+                   "The density difference for a density difference based photoacclimation MLD [kg m-3].", &
+                    units='kg/m3', default=0.03, scale=US%kg_m3_to_R, do_not_log=.not.CS%mld_pha_use_delta_rho)
+
+      call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_ENG", CS%mld_pha_use_delta_eng, &
+                   "If true, use an energy difference to find the photoacclimation mixed layer depth "//&
+                   "with the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
+      call get_param(param_file, "MOM", "PHA_MLD_DENG", CS%mld_pha_deng, &
+                   "The energy for an energy difference based photoacclimation MLD.", default=25.0, &
+                   units='J/m2',scale=US%W_m2_to_RZ3_T3*US%s_to_T, do_not_log=.not.CS%mld_pha_use_delta_eng)
+
+      call get_param(param_file, "MOM", "PHA_MLD_TIMESCALE", CS%mld_pha_timescale, &
+                   "The timescale for the photoacclimation MLD averaging. [s]", &
+                   units="s", default=US%T_to_s*259200.0, scale=US%s_to_T, do_not_log=CS%mld_pha_fixed)
+    endif
+
 
     !Now we can reset the grid mask, axes and time to their true values
     !Note that grid_tmask must be set correctly on the data domain boundary
@@ -507,6 +548,7 @@ contains
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: rho_dzt ! Layer mass per unit area [kg m-2]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: dzt     ! Layer vertical extents [m]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: h_work  ! A work array of thicknesses [H ~> m or kg m-2]
+    real, dimension(SZI_(G),SZJ_(G)) :: mld_pha          ! 
     integer :: i, j, k, isc, iec, jsc, jec, nk
 
     isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; nk = GV%ke
@@ -572,6 +614,16 @@ contains
     enddo ; enddo
     sosga = global_area_mean(surface_field, G, unscale=US%S_to_ppt)
 
+    if (CS%mld_pha_fixed) then
+      mld_pha(:,:) = CS%mld_pha_val
+    else
+      if (CS%mld_pha_use_delta_rho) then
+        call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, ref_h_mld=CS%mld_pha_href, MLD_out=mld_pha)
+      elseif (CS%mld_pha_use_delta_eng) then
+        call diagnoseMLDbyEnergy((/-1, -1, -1/), h_old, tv, G, GV, US, (/CS%mld_pha_deng, CS%mld_pha_deng, CS%mld_pha_deng/), CS%diag, MLD_out=mld_pha)
+      endif
+    endif
+
     !
     !Calculate tendencies (i.e., field changes at dt) from the sources / sinks
     !
@@ -582,7 +634,8 @@ contains
       call generic_tracer_source(tv%T, tv%S, rho_dzt, dzt, dz_ml, G%isd, G%jsd, 1, dt, &
                G%areaT, get_diag_time_end(CS%diag), &
                optics%nbands, optics%max_wavelength_band, optics%sw_pen_band, optics%opacity_band, &
-               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state)
+               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state, &
+               photo_acc_dpth=mld_pha)
     else
       ! tv%internal_heat is a null pointer unless DO_GEOTHERMAL = True,
       ! so we have to check and only do the scaling if it is associated.
@@ -593,14 +646,16 @@ contains
                sw_pen_band=G%US%QRZ_T_to_W_m2*optics%sw_pen_band(:,:,:), &
                opacity_band=G%US%m_to_Z*optics%opacity_band(:,:,:,:), &
                internal_heat=G%US%RZ_to_kg_m2*US%C_to_degC*tv%internal_heat(:,:), &
-               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state)
+               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state, &
+               photo_acc_dpth=mld_pha*US%Z_to_m)
       else
         call generic_tracer_source(US%C_to_degC*tv%T, US%S_to_ppt*tv%S, rho_dzt, dzt, dz_ml, G%isd, G%jsd, 1, dt, &
                G%US%L_to_m**2*G%areaT(:,:), get_diag_time_end(CS%diag), &
                optics%nbands, optics%max_wavelength_band, &
                sw_pen_band=G%US%QRZ_T_to_W_m2*optics%sw_pen_band(:,:,:), &
                opacity_band=G%US%m_to_Z*optics%opacity_band(:,:,:,:), &
-               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state)
+               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, eqn_of_state=tv%eqn_of_state, &
+               photo_acc_dpth=mld_pha*US%Z_to_m)
       endif
     endif
 
