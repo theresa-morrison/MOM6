@@ -618,7 +618,7 @@ contains
       mld_pha(:,:) = CS%mld_pha_val
     else
       if (CS%mld_pha_use_delta_rho) then
-        call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, ref_h_mld=CS%mld_pha_href, MLD_out=mld_pha)
+        call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, CS%mld_pha_href, id_ref_z=-1, id_ref_rho=-1, MLD_out=mld_pha)
       elseif (CS%mld_pha_use_delta_eng) then
         call diagnoseMLDbyEnergy((/-1, -1, -1/), h_old, tv, G, GV, US, (/CS%mld_pha_deng, CS%mld_pha_deng, CS%mld_pha_deng/), CS%diag, MLD_out=mld_pha)
       endif
