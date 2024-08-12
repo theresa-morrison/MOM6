@@ -92,7 +92,6 @@ module MOM_generic_tracer
     real    :: mld_pha_drho = 0.03              !< The density thershold for a density difference based MLD 
     logical :: mld_pha_use_delta_eng = .False.  !< If true, use an energy diference to find the MLD
     real    :: mld_pha_deng = 25.0              !< The energy threshold for an energy d ifference based MLD
-    real    :: mld_pha_timescale  = 259200.0    !< The timescale for the photoacclimation MLD
 
     type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                                                !! regulate the timing of diagnostic output.
@@ -459,9 +458,6 @@ contains
                    "The energy for an energy difference based photoacclimation MLD.", default=25.0, &
                    units='J/m2',scale=US%W_m2_to_RZ3_T3*US%s_to_T, do_not_log=.not.CS%mld_pha_use_delta_eng)
 
-      call get_param(param_file, "MOM", "PHA_MLD_TIMESCALE", CS%mld_pha_timescale, &
-                   "The timescale for the photoacclimation MLD averaging. [s]", &
-                   units="s", default=US%T_to_s*259200.0, scale=US%s_to_T, do_not_log=CS%mld_pha_fixed)
     endif
 
 
