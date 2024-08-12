@@ -275,6 +275,8 @@ subroutine diagnoseMLDbyEnergy(id_MLD, h, tv, G, GV, US, Mixing_Energy, diagPtr,
   type(thermo_var_ptrs),   intent(in) :: tv          !< Structure containing pointers to any
                                                      !! available thermodynamic fields.
   type(diag_ctrl),         pointer    :: diagPtr     !< Diagnostics structure
+  real, dimension(SZI_(G),SZJ_(G)), &
+              optional, intent(inout) :: MLD_out  !< Send MLD to other routines [Z ~> m]
 
   ! Local variables
   real, dimension(SZI_(G),SZJ_(G),3) :: MLD  ! Diagnosed mixed layer depth [Z ~> m].
