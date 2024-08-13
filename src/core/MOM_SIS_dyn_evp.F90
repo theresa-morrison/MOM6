@@ -35,8 +35,8 @@ use MOM_diag_mediator, only : disable_averaging, post_data, safe_alloc_ptr
 !use SIS2_ice_thm,      only : get_SIS2_thermo_coefs
 
 use MOM_grid, only : ocean_grid_type
-use MOM_forcing_type, only : mech_forcing
-use MOM_forcing_type,  only : SIS_C_EVP_state
+!use MOM_forcing_type, only : mech_forcing
+!use MOM_forcing_type,  only : SIS_C_EVP_state
 use MOM_SIS_C_dyn_CS_type, only : SIS_C_dyn_CS
 
 use MOM_debugging,     only : hchksum, uvchksum
@@ -47,10 +47,79 @@ implicit none ; private
 
 #include <SIS2_memory.h>
 
-public :: EVP_step_loop
+public :: EVP_step_loop, SIS_C_EVP_state
 
 contains
 
+!> The control structure with the state that is used and updated in the EVP loop
+type, public :: SIS_C_EVP_state
+  type(SIS_C_dyn_CS), pointer     :: SIS_C_dyn_CSp => NULL()
+  real ::  dt_slow 
+  real, allocatable, dimension(:,:) :: ci  !< Sea ice concentration [nondim]
+  real, allocatable, dimension(:,:) :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
+  real, allocatable, dimension(:,:) :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
+  real, allocatable, dimension(:,:) :: mice  !< Mass per unit ocean area of sea ice [R Z ~> kg m-2]
+  
+  real, allocatable, dimension(:,:) :: Cor_u
+  real, allocatable, dimension(:,:) :: Cor_v
+  
+  real, allocatable, dimension(:,:) :: &  
+    fxat  !< Zonal air stress on ice [R Z L T-2 ~> Pa]
+    fxoc  !<
+    fxlf  !<
+    fxic  !<
+    fxic_d
+    fxic_t
+    fxic_s
+  
+  real, allocatable, dimension(:,:) :: &  
+    fyat  !< Meridional air stress on ice [R Z L T-2 ~> Pa]
+    fyoc  !<
+    fylf  !<
+    fyic  !<
+    fyic_d
+    fyic_t
+    fyic_s
+
+  real, allocatable, dimension(:,:) :: &
+    pres_mice, & ! The ice internal pressure per unit column mass [L2 T-2 ~> N m kg-1].
+    diag_val, & ! A temporary diagnostic array.
+    del_sh_min_pr     ! When multiplied by pres_mice, this gives the minimum
+                ! value of del_sh that is used in the calculation of zeta [T-1 ~> s-1].
+                ! This is set based on considerations of numerical stability,
+                ! and varies with the grid spacing.  
+
+  real, allocatable, dimension(:,:) :: &
+    ui_min_trunc, &  ! The range of v-velocities beyond which the velocities
+    ui_max_trunc, &  ! are truncated [L T-1 ~> m s-1], or 0 for land cells
+    mi_u, &  ! The total ice and snow mass interpolated to u points [R Z ~> kg m-2].
+    f2dt_u, &! The squared effective Coriolis parameter at u-points times a
+             ! time step [T-1 ~> s-1].
+    PFu, &   ! Zonal hydrostatic pressure driven acceleration [L T-2 ~> m s-2].
+    I1_f2dt2_u  ! 1 / ( 1 + f^2 dt^2) at u-points [nondim].
+             
+  real, allocatable, dimension(:,:) :: &
+    vi_min_trunc, &  ! The range of v-velocities beyond which the velocities
+    vi_max_trunc, &  ! are truncated [L T-1 ~> m s-1], or 0 for land cells.
+    mi_v, &  ! The total ice and snow mass interpolated to v points [R Z ~> kg m-2].
+    f2dt_v, &! The squared effective Coriolis parameter at v-points times a
+             ! time step [T-1 ~> s-1].
+    PFv, &   !  hydrostatic pressure driven acceleration [L T-2 ~> m s-2].
+    I1_f2dt2_v  ! 1 / ( 1 + f^2 dt^2) at v-points [nondim].
+    
+  real, allocatable, dimension(:,:) :: &
+    azon, bzon, & !  _zon & _mer are the values of the Coriolis force which
+    czon, dzon, & ! are applied to the neighboring values of vi & ui,
+    amer, bmer, & ! respectively to get the barotropic inertial rotation,
+    cmer, dmer    ! in units of [T-1 ~> s-1].  azon and amer couple the same pair of
+                  ! velocities, but with the influence going in opposite
+                  ! directions.
+                  
+  real, allocatable, dimension(:,:) :: &
+    mi_ratio_A_q    ! A ratio of the masses interpolated to the faces around a
+             ! vorticity point that ranges between (4 mi_min/mi_max) and 1,
+             ! divided by the sum of the ocean areas around a point [L-2 ~> m-2].                              
+end type SIS_C_EVP_state
 ! subroutine EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
 !                     fxat, fyat, fxoc, fyoc, pres_mice, diag_val, del_sh_min_pr, &
 !                     ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc, &
@@ -59,7 +128,7 @@ contains
 !                     mi_ratio_A_q,  &
 !                     G, US, CS)
 ! The EVP function from the SIS2 model
-subroutine EVP_step_loop(forces, G, uo, vo, PFu, PFv, fxoc, fyoc)
+subroutine EVP_step_loop(EVPT, G, uo, vo, PFu, PFv, fxoc, fyoc)
 ! In need from sea-ice: ci, ui, vi, mice, pres_mice, diag_val (?), del_sh_min_pr (?),
 !                       ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc,
 !                       mi_u, f2dt_u, I1_f2dt2_u, mi_v, f2dt_v, I1_f2dt2_v, 
@@ -69,7 +138,7 @@ subroutine EVP_step_loop(forces, G, uo, vo, PFu, PFv, fxoc, fyoc)
 ! Out: pass to SIS2: ui, vi
 ! Out: pass to bt_step: fxoc, fyoc
   
-  type(mech_forcing) , intent(in) :: forces
+  type(SIS_C_EVP_state) , intent(in) :: EVPT
  
   type(ocean_grid_type),  intent(   in) :: G       !< The ocean's grid structure.  
                     

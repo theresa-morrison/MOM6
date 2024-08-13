@@ -32,6 +32,8 @@ use MOM_variables, only : BT_cont_type, alloc_bt_cont_type
 use MOM_verticalGrid, only : verticalGrid_type
 use MOM_variables, only : accel_diag_ptrs
 
+use MOM_SIS_dyn_evp, only : EVP_step_loop, SIS_C_EVP_state
+
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -291,6 +293,7 @@ type, public :: barotropic_CS ; private
   type(hor_index_type), pointer :: debug_BT_HI => NULL() !< debugging copy of horizontal index_type
   type(SAL_CS), pointer :: SAL_CSp => NULL() !< Control structure for SAL
   type(harmonic_analysis_CS), pointer :: HA_CSp => NULL() !< Control structure for harmonic analysis
+  type(SIS_C_EVP_state) :: EVPT !! the info for the sea-ice
   logical :: module_is_initialized = .false.  !< If true, module has been initialized
 
   integer :: isdw !< The lower i-memory limit for the wide halo arrays.
@@ -2192,6 +2195,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
  
 ! TJM 
 ! The EVP function from the SIS2 model
+  call EVP_step_loop(CS%EVPT, G, uo, vo, PFu, PFv, fxoc, fyoc)
 !  call EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
 !                    fxat, fyat, fxoc, fyoc, pres_mice, diag_val, del_sh_min_pr, &
 !                    ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc, &
@@ -2207,11 +2211,6 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 ! need new version from btstep: uo, vo, PFu, PFv (PF ~ sea level) 
 ! Out: pass to SIS2: ui, vi
 ! Out: pass to bt_step: fxoc, fyoc
-
-
-
-
-
 
   if (apply_OBCs) then
     ! Correct the accelerations at OBC velocity points, but only in the
