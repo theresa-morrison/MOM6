@@ -84,12 +84,11 @@ module MOM_generic_tracer
     logical :: tracers_may_reinit  !< If true, tracers may go through the
                                    !! initialization code if they are not found in the restart files.
 
-    !real, allocatable, dimension(:,:) :: mld_pha
-    logical :: mld_pha_fixed = .True.           !< If true, use a fixed value for photoacclimation MLD
+    logical :: mld_pha_calc = .False.           !< If true, use a fixed value for photoacclimation MLD
     real    :: mld_pha_val = 0.0                !< The value of fixed photoacclimation MLD
     logical :: mld_pha_use_delta_rho = .False.  !< If true, use a density diference to find the MLD
     real    :: mld_pha_href = 0.0               !< The reference depth for density difference based MLD
-    real    :: mld_pha_drho = 0.03              !< The density thershold for a density difference based MLD 
+    real    :: mld_pha_drho = 0.03              !< The density thershold for a density difference based MLD
     logical :: mld_pha_use_delta_eng = .False.  !< If true, use an energy diference to find the MLD
     real    :: mld_pha_deng = 25.0              !< The energy threshold for an energy d ifference based MLD
 
@@ -433,10 +432,11 @@ contains
     enddo
     !! end section to re-initialize generic tracers
 
-    call get_param(param_file, "MOM", "PHA_MLD_FIXED", CS%mld_pha_fixed, &
-                 "If true, use a fixed value for the photoacclimation mixed layer depth within the "//&
-                 "generic tracer update. This MLD is only used for photoacclimation.", default=.true.)
-    if (CS%mld_pha_fixed) then
+    call get_param(param_file, "MOM", "PHA_MLD_CALC", CS%mld_pha_calc, &
+                 "If false, use a fixed value for the photoacclimation mixed layer depth within the "//&
+                 "generic tracer update. This MLD is only used for photoacclimation. This variable should "//&
+                 "be set to true if using COBALTv3 for the BGC.", default=.false.)
+    if (.not.CS%mld_pha_calc) then
       call get_param(param_file, "MOM", "PHA_MLD_VAL", CS%mld_pha_val, &
                    "The depth of photoacclimation if fixed depth is used [m].", &
                     units='m', default=0.0, scale=US%m_to_Z)
@@ -544,7 +544,8 @@ contains
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: rho_dzt ! Layer mass per unit area [kg m-2]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: dzt     ! Layer vertical extents [m]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: h_work  ! A work array of thicknesses [H ~> m or kg m-2]
-    real, dimension(SZI_(G),SZJ_(G)) :: mld_pha          ! 
+    real, dimension(SZI_(G),SZJ_(G)) :: mld_pha          ! The mixed layer depth calculated for photoacclimation
+                                                         ! that is used in COBALTv3
     integer :: i, j, k, isc, iec, jsc, jec, nk
 
     isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; nk = GV%ke
@@ -610,7 +611,8 @@ contains
     enddo ; enddo
     sosga = global_area_mean(surface_field, G, unscale=US%S_to_ppt)
 
-    if (CS%mld_pha_fixed) then
+    mld_pha(:,:) = 0.0          
+    if (.not.CS%mld_pha_calc) then
       mld_pha(:,:) = CS%mld_pha_val
     else
       if (CS%mld_pha_use_delta_rho) then
