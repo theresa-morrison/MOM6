@@ -436,28 +436,36 @@ contains
                  "If false, use a fixed value for the photoacclimation mixed layer depth within the "//&
                  "generic tracer update. This MLD is only used for photoacclimation. This variable should "//&
                  "be set to true if using COBALTv3 for the BGC.", default=.false.)
-    if (.not.CS%mld_pha_calc) then
-      call get_param(param_file, "MOM", "PHA_MLD_VAL", CS%mld_pha_val, &
-                   "The depth of photoacclimation if fixed depth is used [m].", &
-                    units='m', default=0.0, scale=US%m_to_Z)
-    else
+    if (CS%mld_pha_calc) then
       call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_RHO", CS%mld_pha_use_delta_rho, &
                    "If true, use a density difference to find the photoacclimation mixed layer depth "//&
                    "within the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
-      call get_param(param_file, "MOM", "PHA_MLD_HREF", CS%mld_pha_href, &
-                   "The reference depth for a density difference based photoacclimation MLD [m].",  &
-                    units='m', default=0.0, scale=US%m_to_Z, do_not_log=.not.CS%mld_pha_use_delta_rho)
-      call get_param(param_file, "MOM", "PHA_MLD_DRHO", CS%mld_pha_drho, &
-                   "The density difference for a density difference based photoacclimation MLD [kg m-3].", &
-                    units='kg/m3', default=0.03, scale=US%kg_m3_to_R, do_not_log=.not.CS%mld_pha_use_delta_rho)
-
       call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_ENG", CS%mld_pha_use_delta_eng, &
                    "If true, use an energy difference to find the photoacclimation mixed layer depth "//&
                    "with the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
-      call get_param(param_file, "MOM", "PHA_MLD_DENG", CS%mld_pha_deng, &
-                   "The energy for an energy difference based photoacclimation MLD.", default=25.0, &
-                   units='J/m2',scale=US%W_m2_to_RZ3_T3*US%s_to_T, do_not_log=.not.CS%mld_pha_use_delta_eng)
-
+      if (CS%mld_pha_use_delta_rho .and. CS%mld_pha_use_delta_eng) then
+        call MOM_error(FATAL, "PHA_MLD_CALC is set to true and PHA_MLD_USE_DELTA_RHO and PHA_MLD_USE_DELTA_ENG "// &
+                              "are both true. Choose only one option for the calculated photoacclimation MLD!")
+      elseif ((.not.CS%mld_pha_use_delta_rho) .and. (.not.CS%mld_pha_use_delta_eng)) then
+        call MOM_error(FATAL, "PHA_MLD_CALC is set to true but PHA_MLD_USE_DELTA_RHO and PHA_MLD_USE_DELTA_ENG "// &
+                              "are both false. Choose an option for the calculated photoacclimation MLD!")
+      endif
+      if (CS%mld_pha_use_delta_rho) then
+        call get_param(param_file, "MOM", "PHA_MLD_HREF", CS%mld_pha_href, &
+                     "The reference depth for a density difference based photoacclimation MLD [m].",  &
+                      units='m', default=0.0, scale=US%m_to_Z, do_not_log=.not.CS%mld_pha_use_delta_rho)
+        call get_param(param_file, "MOM", "PHA_MLD_DRHO", CS%mld_pha_drho, &
+                     "The density difference for a density difference based photoacclimation MLD [kg m-3].", &
+                      units='kg/m3', default=0.03, scale=US%kg_m3_to_R, do_not_log=.not.CS%mld_pha_use_delta_rho)
+      elseif (CS%mld_pha_use_delta_eng) then
+        call get_param(param_file, "MOM", "PHA_MLD_DENG", CS%mld_pha_deng, &
+                     "The energy for an energy difference based photoacclimation MLD.", default=25.0, &
+                     units='J/m2',scale=US%W_m2_to_RZ3_T3*US%s_to_T, do_not_log=.not.CS%mld_pha_use_delta_eng)
+      endif
+    else
+      call get_param(param_file, "MOM", "PHA_MLD_VAL", CS%mld_pha_val, &
+                   "The depth of photoacclimation if fixed depth is used [m].", &
+                    units='m', default=0.0, scale=US%m_to_Z)
     endif
 
 
