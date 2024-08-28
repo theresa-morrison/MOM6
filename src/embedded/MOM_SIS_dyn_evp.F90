@@ -48,7 +48,7 @@ implicit none ; private
 #include <SIS2_memory.h>
 
 public :: EVP_step_loop, SIS_C_EVP_state
-public :: direct_copy_to_EVPT 
+public :: direct_copy_to_EVPT, direct_copy_from_EVPT  
  
 !> The control structure with the state that is used and updated in the EVP loop
 type :: SIS_C_EVP_state

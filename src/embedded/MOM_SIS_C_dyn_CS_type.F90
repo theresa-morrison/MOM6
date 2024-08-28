@@ -3,7 +3,6 @@ module MOM_SIS_C_dyn_CS_type
 
 use MOM_time_manager,  only : time_type
 use SIS_diag_mediator, only : SIS_diag_ctrl
-
 implicit none ; private
 
 #include <SIS2_memory.h>
@@ -41,6 +40,9 @@ type, public :: SIS_C_dyn_CS ; ! private
   logical :: CFL_check_its    !< If true, check the CFL number for every iteration
                               !! of the rheology solver; otherwise only check the
                               !! final velocities that are used for transport.
+  logical :: do_embedded      !< If true,
+  logical :: embedded_setup   !< If true,
+  logical :: embedded_finish  !< If true,
   logical :: debug            !< If true, write verbose checksums for debugging purposes.
   logical :: debug_EVP        !< If true, write out verbose debugging data for each of
                               !! the steps within the EVP solver.
@@ -120,6 +122,7 @@ type, public :: SIS_C_dyn_CS ; ! private
   integer :: id_sigi_hifreq = -1, id_sigii_hifreq = -1
   integer :: id_stren_hifreq = -1, id_ci_hifreq = -1
   integer :: id_siu = -1, id_siv = -1, id_sispeed = -1 ! SIMIP diagnostics
+  integer :: id_ui_east = -1, id_vi_north= -1
   !!@}
 end type SIS_C_dyn_CS
 
