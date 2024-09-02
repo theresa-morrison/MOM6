@@ -41,7 +41,7 @@ use user_revise_forcing,  only : user_alter_forcing, user_revise_forcing_init
 use user_revise_forcing,  only : user_revise_forcing_CS
 
 use MOM_barotropic,       only : Barotropic_CS
-use MOM_SIS_dyn_evp,      only : SIS_C_EVP_state
+use MOM_SIS_dyn_types,    only : SIS_dyn_state_2d
 
 use iso_fortran_env, only : int64
 
@@ -212,7 +212,7 @@ type, public :: ice_ocean_boundary_type
                                       !! This flag may be set by the flux-exchange code, based on what
                                       !! the sea-ice model is providing.  Otherwise, the value from
                                       !! the surface_forcing_CS is used.
-  type(SIS_C_EVP_state), pointer :: EVPT => NULL() !! the info for the sea-ice
+  type(SIS_dyn_state_2d), pointer ::IceDS2d => NULL() !! the info for the sea-ice
 end type ice_ocean_boundary_type
 
 integer :: id_clock_forcing !< A CPU time clock

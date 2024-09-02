@@ -37,7 +37,7 @@ use MOM_SIS_hor_grid,      only : SIS_hor_grid_type
 use MOM_grid, only : ocean_grid_type
 !use MOM_forcing_type, only : mech_forcing
 !use MOM_forcing_type,  only : SIS_C_EVP_state
-use MOM_SIS_C_dyn_CS_type, only : SIS_C_dyn_CS
+use MOM_SIS_dyn_types, only : SIS_C_dyn_CS
 
 use MOM_debugging,     only : hchksum, uvchksum
 

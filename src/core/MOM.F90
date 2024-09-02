@@ -81,6 +81,9 @@ use MOM_dynamics_split_RK2,    only : MOM_dyn_split_RK2_CS, remap_dyn_split_rk2_
 use MOM_dynamics_split_RK2b,   only : step_MOM_dyn_split_RK2b, register_restarts_dyn_split_RK2b
 use MOM_dynamics_split_RK2b,   only : initialize_dyn_split_RK2b, end_dyn_split_RK2b
 use MOM_dynamics_split_RK2b,   only : MOM_dyn_split_RK2b_CS, remap_dyn_split_RK2b_aux_vars
+use MOM_dynamics_split_RK2e,   only : step_MOM_dyn_split_RK2e !, register_restarts_dyn_split_RK2b
+!use MOM_dynamics_split_RK2e,   only : initialize_dyn_split_RK2b, end_dyn_split_RK2b
+!use MOM_dynamics_split_RK2e,   only : MOM_dyn_split_RK2b_CS, remap_dyn_split_RK2b_aux_vars
 use MOM_dynamics_unsplit_RK2,  only : step_MOM_dyn_unsplit_RK2, register_restarts_dyn_unsplit_RK2
 use MOM_dynamics_unsplit_RK2,  only : initialize_dyn_unsplit_RK2, end_dyn_unsplit_RK2
 use MOM_dynamics_unsplit_RK2,  only : MOM_dyn_unsplit_RK2_CS
@@ -171,6 +174,9 @@ use MOM_offline_main,          only : offline_advection_layer, offline_transport
 use MOM_ice_shelf,             only : ice_shelf_CS, ice_shelf_query, initialize_ice_shelf
 use MOM_particles_mod,         only : particles, particles_init, particles_run, particles_save_restart, particles_end
 use MOM_particles_mod,         only : particles_to_k_space, particles_to_z_space
+
+use MOM_SIS_dyn_types, only : SIS_dyn_state_2d
+
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -499,7 +505,7 @@ contains
 !! advect_tracer and tracer_hordiff.  Vertical mixing and possibly remapping
 !! occur inside of diabatic.
 subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS, &
-                    Waves, do_dynamics, do_thermodynamics, start_cycle, &
+                    Waves, seaice, do_dynamics, do_thermodynamics, start_cycle, &
                     end_cycle, cycle_length, reset_therm)
   type(mech_forcing), target, intent(inout) :: forces_in !< A structure with the driving mechanical forces
   type(forcing), target, intent(inout) :: fluxes_in  !< A structure with pointers to themodynamic,
@@ -510,6 +516,8 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
   type(MOM_control_struct), intent(inout), target :: CS   !< control structure from initialize_MOM
   type(Wave_parameters_CS), &
             optional, pointer       :: Waves         !< An optional pointer to a wave property CS
+  type(SIS_dyn_state_2d), &
+            optional, pointer       :: seaice        !< the merged sea ice state
   logical,  optional, intent(in)    :: do_dynamics   !< Present and false, do not do updates due
                                                      !! to the dynamics.
   logical,  optional, intent(in)    :: do_thermodynamics  !< Present and false, do not do updates due
@@ -918,7 +926,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
 
       call step_MOM_dynamics(forces, CS%p_surf_begin, CS%p_surf_end, dt, &
                              dt_therm_here, bbl_time_int, CS, &
-                             Time_local, Waves=Waves)
+                             Time_local, Waves=Waves, seaice=seaice)
 
       !===========================================================================
       ! This is the start of the tracer advection part of the algorithm.
@@ -1108,7 +1116,7 @@ end subroutine step_MOM
 
 !> Time step the ocean dynamics, including the momentum and continuity equations
 subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
-                             bbl_time_int, CS, Time_local, Waves)
+                             bbl_time_int, CS, Time_local, Waves, seaice)
   type(mech_forcing), intent(in)    :: forces     !< A structure with the driving mechanical forces
   real, dimension(:,:), pointer     :: p_surf_begin !< A pointer (perhaps NULL) to the surface
                                                   !! pressure at the beginning of this dynamic
@@ -1127,6 +1135,7 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
   type(wave_parameters_CS), &
             optional, pointer       :: Waves      !< Container for wave related parameters; the
                                                   !! fields in Waves are intent in here.
+  type(SIS_dyn_state_2d),  optional, pointer       :: seaice        !< the merged sea ice state
 
   ! local variables
   type(ocean_grid_type),   pointer :: G => NULL()  ! pointer to a structure containing
@@ -1249,6 +1258,11 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
                   p_surf_begin, p_surf_end, CS%uh, CS%vh, CS%uhtr, CS%vhtr, &
                   CS%eta_av_bc, G, GV, US, CS%dyn_split_RK2b_CSp, calc_dtbt, CS%VarMix, &
                   CS%MEKE, CS%thickness_diffuse_CSp, CS%pbv, waves=waves)
+    elseif (CS%use_embedded_ice) then
+      call step_MOM_dyn_split_RK2e(u, v, h, CS%tv, CS%visc, Time_local, dt, forces, &
+                  p_surf_begin, p_surf_end, CS%uh, CS%vh, CS%uhtr, CS%vhtr, &
+                  CS%eta_av_bc, G, GV, US, CS%dyn_split_RK2_CSp, calc_dtbt, CS%VarMix, &
+                  CS%MEKE, CS%thickness_diffuse_CSp, CS%pbv, waves=waves, seaice=seaice)
     else
       call step_MOM_dyn_split_RK2(u, v, h, CS%tv, CS%visc, Time_local, dt, forces, &
                   p_surf_begin, p_surf_end, CS%uh, CS%vh, CS%uhtr, CS%vhtr, &

@@ -60,6 +60,8 @@ use MOM_wave_interface, only: wave_parameters_CS, MOM_wave_interface_init
 use MOM_wave_interface, only: Update_Surface_Waves
 use iso_fortran_env, only : int64
 
+use MOM_SIS_dyn_types, only : SIS_dyn_state_2d
+
 #include <MOM_memory.h>
 
 #ifdef _USE_GENERIC_TRACER
@@ -217,6 +219,8 @@ type, public :: ocean_state_type ; private
     forcing_CSp => NULL()     !< A pointer to the MOM forcing control structure
   type(diag_ctrl), pointer :: &
     diag => NULL()            !< A pointer to the diagnostic regulatory structure
+  type(SIS_dyn_state_2d), pointer :: &
+    seaice => NULL()
 end type ocean_state_type
 
 contains
@@ -533,8 +537,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     if (OS%icebergs_alter_ocean) &
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
                           OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
-    !if (OS%embedded_seaice) &
-    !  call convert_IOB_to_EVPT(Ice_ocean_boundary, OS%MOM_CSp%dyn_split_RK2_CSp%barotropic_CSp)
+    if (OS%embedded_seaice) &
+      call extract_merged_ice_from_IOB(Ice_ocean_boundary, TJC) ! where will this be put?
   endif
 
   if (do_thermo) then
@@ -600,7 +604,7 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     ! The call sequence is being orchestrated from outside of update_ocean_model.
     if (present(cycle_length)) then
       call step_MOM(OS%forces, OS%fluxes, OS%sfc_state, Time1, dt_coupling, OS%MOM_CSp, &
-                  Waves=OS%Waves, do_dynamics=do_dyn, do_thermodynamics=do_thermo, &
+                  Waves=OS%Waves, seaice=OS%seaice, do_dynamics=do_dyn, do_thermodynamics=do_thermo, &
                   start_cycle=start_cycle, end_cycle=end_cycle, cycle_length=OS%US%s_to_T*cycle_length, &
                   reset_therm=Ocn_fluxes_used)
     else

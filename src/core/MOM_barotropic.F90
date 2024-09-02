@@ -441,7 +441,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   eta_PF_in, U_Cor, V_Cor, accel_layer_u, accel_layer_v, &
                   eta_out, uhbtav, vhbtav, G, GV, US, CS, &
                   visc_rem_u, visc_rem_v, SpV_avg, ADp, OBC, BT_cont, eta_PF_start, &
-                  taux_bot, tauy_bot, uh0, vh0, u_uh0, v_vh0, etaav)
+                  taux_bot, tauy_bot, uh0, vh0, u_uh0, v_vh0, etaav, &
+                  taux_surf, tauy_surf)
   type(ocean_grid_type),                   intent(inout) :: G       !< The ocean's grid structure.
   type(verticalGrid_type),                   intent(in)  :: GV      !< The ocean's vertical grid structure.
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
@@ -518,6 +519,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                                                                     !! vh0 [L T-1 ~> m s-1]
   real, dimension(SZI_(G),SZJ_(G)), optional, intent(out) :: etaav        !< The free surface height or column mass
                                                          !! averaged over the barotropic integration [H ~> m or kg m-2].
+  real, dimension(SZIB_(G),SZJ_(G)), optional, intent(in) :: taux_surf
+  real, dimension(SZI_(G),SZJB_(G)), optional, intent(in) :: tauy_surf
 
   ! Local variables
   real :: ubt_Cor(SZIB_(G),SZJ_(G)) ! The barotropic velocities that had been
@@ -1334,7 +1337,11 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       endif
     endif
 
-    BT_force_u(I,j) = forces%taux(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
+    if (present(taux_surf)) then
+      BT_force_u(I,j) = taux_surf(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
+    else
+      BT_force_u(I,j) = forces%taux(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
+    endif
   else
     BT_force_u(I,j) = 0.0
   endif ; enddo ; enddo
@@ -1360,7 +1367,11 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       endif
     endif
 
-    BT_force_v(i,J) = forces%tauy(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
+    if (present(tauy_surf)) then
+      BT_force_v(i,J) = tauy_surf(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
+    else
+      BT_force_v(i,J) = forces%tauy(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
+    endif
   else
     BT_force_v(i,J) = 0.0
   endif ; enddo ; enddo
